@@ -1,0 +1,53 @@
+# Rust checks. Commands remain visible and skip until the project manifest exists.
+
+name: rust (workflow_call)
+
+on:
+  workflow_call:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: "2026.9.13"
+          install_args: "--locked"
+          cache: false
+
+      - name: Check Rust formatting
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Build
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo build --workspace --locked
+
+      - name: Test
+        if: hashFiles('Cargo.toml') != ''
+        run: mise run test
+
+      - name: Skip until Rust manifest exists
+        if: hashFiles('Cargo.toml') == ''
+        run: echo "Cargo.toml not present yet; skipping Rust checks."

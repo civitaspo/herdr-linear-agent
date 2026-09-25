@@ -1,0 +1,55 @@
+[tools]
+rust = { version = "1.98.0", components = ["clippy", "rustfmt"] }
+"aqua:koalaman/shellcheck" = "0.11.0"
+"aqua:suzuki-shunsuke/disable-checkout-persist-credentials" = "1.0.0"
+"aqua:suzuki-shunsuke/ghalint" = "1.5.6"
+"aqua:suzuki-shunsuke/pinact" = "4.1.1"
+
+[tasks.lint]
+description = "Run repository and Rust lint checks"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -d scripts ]; then
+  find scripts -type f -name '*.sh' -print0 | xargs -0 -r shellcheck
+fi
+
+if [ -d .github/workflows ]; then
+  ghalint run
+  pinact run --check --verify-comment
+fi
+
+if [ -f Cargo.toml ]; then
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+else
+  echo "Cargo.toml not present yet; skipping Rust lint checks."
+fi
+"""
+
+[tasks.test]
+description = "Run the Rust test suite"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -f Cargo.toml ]; then
+  cargo test --workspace --locked
+else
+  echo "Cargo.toml not present yet; skipping Rust tests."
+fi
+"""
+
+[tasks.build]
+description = "Build the Rust workspace"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -f Cargo.toml ]; then
+  cargo build --workspace --locked
+else
+  echo "Cargo.toml not present yet; skipping Rust build."
+fi
+"""

@@ -1,0 +1,96 @@
+# Pull request autofix. Used from workflow_call_pr.yml.
+
+name: autofix (workflow_call)
+
+on:
+  workflow_call:
+    secrets:
+      SECUREFIX_CLIENT_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  autofix:
+    name: autofix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      SECUREFIX_CLIENT_APP_ID: ${{ vars.SECUREFIX_CLIENT_APP_ID }}
+      SECUREFIX_SERVER_REPOSITORY: ${{ vars.SECUREFIX_SERVER_REPOSITORY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: "2026.9.13"
+          install_args: "--locked"
+          cache: false
+
+      - name: Fix action pins
+        env:
+          PINACT_GITHUB_TOKEN: ${{ github.token }}
+        run: pinact run --verify-comment
+
+      - name: Disable checkout credentials
+        run: disable-checkout-persist-credentials
+
+      - name: ShellCheck shell scripts
+        if: hashFiles('scripts/**/*.sh') != ''
+        run: find scripts -type f -name '*.sh' -print0 | xargs -0 -r shellcheck
+
+      - name: Run ghalint
+        run: ghalint run
+
+      - name: Detect automated fixes
+        id: fixes
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git diff --name-only
+
+      - name: Check Securefix configuration
+        if: steps.fixes.outputs.changed == 'true'
+        id: securefix-config
+        env:
+          CLIENT_APP_ID: ${{ env.SECUREFIX_CLIENT_APP_ID }}
+          CLIENT_PRIVATE_KEY: ${{ secrets.SECUREFIX_CLIENT_PRIVATE_KEY }}
+          SERVER_REPOSITORY: ${{ env.SECUREFIX_SERVER_REPOSITORY }}
+        run: |
+          if [[ -n "${CLIENT_APP_ID}" && -n "${CLIENT_PRIVATE_KEY}" && "${SERVER_REPOSITORY}" == "securefix-server" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Request Securefix commit
+        if: steps.fixes.outputs.changed == 'true' && steps.securefix-config.outputs.configured == 'true'
+        uses: csm-actions/securefix-action@1b770a7af0ec5e04517295b4e14c4b451359d550 # v0.6.3
+        with:
+          action: client
+          app_id: ${{ env.SECUREFIX_CLIENT_APP_ID }}
+          app_private_key: ${{ secrets.SECUREFIX_CLIENT_PRIVATE_KEY }}
+          commit_message: "ci: apply automated fixes"
+          server_repository: ${{ env.SECUREFIX_SERVER_REPOSITORY }}
+
+      - name: Require Securefix configuration
+        if: steps.fixes.outputs.changed == 'true' && steps.securefix-config.outputs.configured != 'true'
+        run: |
+          echo "Automated fixes are needed, but Securefix client configuration is incomplete." >&2
+          echo "Configure SECUREFIX_CLIENT_APP_ID, SECUREFIX_SERVER_REPOSITORY=securefix-server, and SECUREFIX_CLIENT_PRIVATE_KEY." >&2
+          exit 1
