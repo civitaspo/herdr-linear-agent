@@ -1,0 +1,280 @@
+//! The command line. People use Herdr actions and Linear; the commands here
+//! are for the plugin manifest, the ticker and the agents it starts, so every
+//! name is spelled out in full.
+
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
+
+use crate::actions::{self, Action};
+use crate::commands::{self, WorkerStart};
+use crate::files::read_text_arg;
+use crate::paths::{Ctx, Env};
+use crate::runner::RealRunner;
+use crate::{progress, ticker};
+
+#[derive(Parser)]
+#[command(name = "herdr-linear-agent", version = crate::VERSION, about = "Run a coordinator and per-repository workers for Linear issues delegated to this agent")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// The plugin's startup hook: starts the ticker detached and exits.
+    Startup,
+    /// A Herdr action.
+    Action { action: Action },
+    /// Manage the background ticker.
+    Ticker {
+        #[command(subcommand)]
+        command: TickerCommand,
+    },
+    /// Print the coordinator sheet.
+    Skill {
+        /// The issue key to fill into the commands.
+        key: Option<String>,
+    },
+    /// Print a run's digest: issue, conversation, catalog, profiles, workers and inbox.
+    Context { key: String },
+    /// Mark inbox items as handled.
+    Inbox {
+        #[command(subcommand)]
+        command: InboxCommand,
+    },
+    /// Replace the plan shown in the Linear session.
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+    /// Post a progress note to the Linear session.
+    Say(TextArgs),
+    /// Ask a person a question in the Linear session.
+    Ask {
+        #[command(flatten)]
+        text: TextArgs,
+        /// A choice, as `label=value`; repeatable.
+        #[arg(long = "option", value_parser = parse_option)]
+        options: Vec<(String, String)>,
+    },
+    /// Post the final summary and move the issue to review.
+    Finish(TextArgs),
+    /// Start, prompt or restart workers.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
+    /// Report a worker's progress from its own pane.
+    Report(ReportArgs),
+}
+
+#[derive(Subcommand)]
+enum TickerCommand {
+    /// Start the ticker unless one of this version is running.
+    Start,
+    /// Ask the running ticker to exit.
+    Stop,
+    /// Show whether a ticker is running.
+    Status,
+    /// Run the loop in the foreground (the detached process runs this).
+    Run,
+}
+
+#[derive(Subcommand)]
+enum InboxCommand {
+    Done {
+        key: String,
+        ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    Set {
+        key: String,
+        /// A Markdown checklist; `-` reads standard input.
+        #[arg(long)]
+        file: String,
+    },
+}
+
+#[derive(Args)]
+struct TextArgs {
+    key: String,
+    /// The text; `-` reads standard input.
+    #[arg(long)]
+    text_file: String,
+}
+
+#[derive(Subcommand)]
+enum WorkerCommand {
+    /// Start a worker in a new worktree of a catalog repository.
+    Start {
+        key: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        title: String,
+        /// The task; `-` reads standard input.
+        #[arg(long)]
+        task_file: String,
+    },
+    /// Send a worker a follow-up.
+    Prompt {
+        key: String,
+        id: String,
+        #[arg(long)]
+        text_file: String,
+    },
+    /// Start a worker again in its worktree, optionally with another profile.
+    Restart {
+        key: String,
+        id: String,
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct ReportArgs {
+    /// Rough progress of the whole task, 0 to 100.
+    #[arg(long, conflicts_with = "unknown")]
+    percent: Option<u8>,
+    /// The scope is not clear yet.
+    #[arg(long)]
+    unknown: bool,
+    /// Two to four words, for example `Testing changes` or `Waiting for you`.
+    #[arg(long)]
+    activity: String,
+}
+
+fn parse_option(text: &str) -> Result<(String, String), String> {
+    commands::parse_option(text).map_err(|e| e.to_string())
+}
+
+pub fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let env = Env::from_process()?;
+    let runner = RealRunner;
+    let ctx = Ctx {
+        env: &env,
+        runner: &runner,
+        detached_ticker: true,
+    };
+    match cli.command {
+        Command::Startup => ticker::start(&ctx),
+        Command::Action { action } => actions::run(&ctx, action),
+        Command::Ticker { command } => match command {
+            TickerCommand::Start => ticker::start(&ctx),
+            TickerCommand::Stop => ticker::stop(&ctx.state_dir()),
+            TickerCommand::Status => {
+                println!("{}", ticker::describe(&ctx.state_dir()));
+                Ok(())
+            }
+            TickerCommand::Run => ticker::run(&ctx),
+        },
+        Command::Skill { key } => commands::skill(key.as_deref()),
+        Command::Context { key } => commands::context(&ctx, &key),
+        Command::Inbox {
+            command: InboxCommand::Done { key, ids, all },
+        } => commands::inbox_done(&ctx, &key, &ids, all),
+        Command::Plan {
+            command: PlanCommand::Set { key, file },
+        } => commands::plan_set(&ctx, &key, &read_text_arg(&file)?),
+        Command::Say(args) => commands::say(&ctx, &args.key, &read_text_arg(&args.text_file)?),
+        Command::Ask { text, options } => {
+            commands::ask(&ctx, &text.key, &read_text_arg(&text.text_file)?, &options)
+        }
+        Command::Finish(args) => {
+            commands::finish(&ctx, &args.key, &read_text_arg(&args.text_file)?)
+        }
+        Command::Worker { command } => match command {
+            WorkerCommand::Start {
+                key,
+                repo,
+                profile,
+                title,
+                task_file,
+            } => commands::worker_start(
+                &ctx,
+                &key,
+                &WorkerStart {
+                    repo,
+                    profile,
+                    title,
+                    task: read_text_arg(&task_file)?,
+                },
+            )
+            .map(|_| ()),
+            WorkerCommand::Prompt { key, id, text_file } => {
+                commands::worker_prompt(&ctx, &key, &id, &read_text_arg(&text_file)?)
+            }
+            WorkerCommand::Restart { key, id, profile } => {
+                commands::worker_restart(&ctx, &key, &id, profile.as_deref()).map(|_| ())
+            }
+        },
+        Command::Report(args) => {
+            progress::report(&ctx, args.percent.filter(|_| !args.unknown), &args.activity)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_manifest_names_this_version_and_only_existing_actions() {
+        let manifest: toml::Value = toml::from_str(include_str!("../herdr-plugin.toml")).unwrap();
+        assert_eq!(manifest["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+        for action in manifest["actions"].as_array().unwrap() {
+            let command: Vec<&str> = action["command"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            let mut argv = vec!["hla"];
+            argv.extend(&command[1..]);
+            assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
+            assert_eq!(command[2], action["id"].as_str().unwrap());
+        }
+    }
+
+    #[test]
+    fn the_command_line_is_consistent() {
+        Cli::command().debug_assert();
+        let parsed = Cli::try_parse_from([
+            "hla",
+            "ask",
+            "DATA-1",
+            "--text-file",
+            "-",
+            "--option",
+            "Yes=yes",
+            "--option",
+            "No",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Command::Ask { ref options, .. } if options.len() == 2));
+        assert!(Cli::try_parse_from(["hla", "action", "open-issue"]).is_ok());
+        assert!(Cli::try_parse_from(["hla", "action", "logout"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "hla",
+                "worker",
+                "start",
+                "DATA-1",
+                "--repo",
+                "api",
+                "--profile",
+                "standard",
+                "--title",
+                "T",
+                "--task-file",
+                "-"
+            ])
+            .is_ok()
+        );
+    }
+}
