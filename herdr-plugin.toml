@@ -1,0 +1,60 @@
+id = "herdr-linear-agent"
+name = "Linear Agent"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Run a coordinator and per-repository workers for Linear issues delegated to this agent."
+platforms = ["macos"]
+
+[[build]]
+# Downloads the release binary; falls back to `cargo build --release --locked`.
+command = ["sh", "scripts/install.sh"]
+
+[[startup]]
+command = ["target/release/herdr-linear-agent", "startup"]
+
+[[actions]]
+id = "login"
+title = "Linear Agent: log in to Linear"
+contexts = ["global"]
+command = ["target/release/herdr-linear-agent", "action", "login"]
+
+[[actions]]
+id = "status"
+title = "Linear Agent: status"
+contexts = ["global", "workspace"]
+command = ["target/release/herdr-linear-agent", "action", "status"]
+
+[[actions]]
+id = "open-issue"
+title = "Linear Agent: open this run's issue"
+contexts = ["pane"]
+command = ["target/release/herdr-linear-agent", "action", "open-issue"]
+
+[[actions]]
+id = "focus-run"
+title = "Linear Agent: focus the run of a Linear issue"
+contexts = ["global"]
+command = ["target/release/herdr-linear-agent", "action", "focus-run"]
+
+[[actions]]
+id = "pause"
+title = "Linear Agent: stop taking new issues"
+contexts = ["global"]
+command = ["target/release/herdr-linear-agent", "action", "pause"]
+
+[[actions]]
+id = "resume"
+title = "Linear Agent: take new issues again"
+contexts = ["global"]
+command = ["target/release/herdr-linear-agent", "action", "resume"]
+
+[[actions]]
+id = "doctor"
+title = "Linear Agent: check setup"
+contexts = ["global"]
+command = ["target/release/herdr-linear-agent", "action", "doctor"]
+
+[[link_handlers]]
+id = "linear-issue"
+pattern = "^https://linear\\.app/[^/]+/issue/[A-Z][A-Z0-9]*-[0-9]+"
+action = "focus-run"

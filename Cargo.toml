@@ -1,0 +1,33 @@
+[package]
+name = "herdr-linear-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "A Herdr plugin that runs a coordinator and per-repository workers for Linear issues delegated to its app user"
+repository = "https://github.com/civitaspo/herdr-linear-agent"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
+httparse = "1"
+jiff = "0.2"
+libc = "0.2"
+oauth2 = { version = "5", default-features = false, features = ["reqwest-blocking", "rustls-tls", "timing-resistant-secret-traits"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+zeroize = { version = "1", features = ["alloc"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+security-framework = { version = "3", default-features = false }
+security-framework-sys = "2"
+
+[dev-dependencies]
+tempfile = "3"
