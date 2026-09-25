@@ -1,0 +1,28 @@
+name: Release Tag
+
+on:
+  pull_request:
+    types:
+      - closed
+  workflow_dispatch:
+    inputs:
+      merge_sha:
+        description: Commit SHA to tag (defaults to main HEAD when empty)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-tag-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    permissions:
+      contents: write
+    uses: civitaspo/securefix-server/.github/workflows/reusable-release-tag.yml@32b3c519409da9ea39b3e674d7a69450af231766 # v0.1.2
+    with:
+      merge_sha: ${{ inputs.merge_sha }}
+    secrets:
+      SECUREFIX_CLIENT_PRIVATE_KEY: ${{ secrets.SECUREFIX_CLIENT_PRIVATE_KEY }}

@@ -39,3 +39,7 @@ The Rust tasks skip project commands until `Cargo.toml` exists.
 - Use Securefix for automated workflow fixes and signed machine commits.
 - Keep GPG keys, machine-user tokens, server app keys, and other strong credentials only in `civitaspo/securefix-server`.
 - See [docs/securefix.md](docs/securefix.md) for the client/server setup.
+
+## Release
+
+Releases are prepared by the **Release PR** workflow (git-cliff and Securefix on `release/next`). A human squash-merges `chore(release): vX.Y.Z`; **Release Tag** creates the annotated tag and asks `civitaspo/securefix-server` to publish the GitHub Release. Do not edit `CHANGELOG.md` on feature pull requests. See [docs/releasing.md](docs/releasing.md).

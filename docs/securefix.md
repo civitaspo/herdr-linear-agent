@@ -28,7 +28,7 @@ Strong credentials such as the server app private key, the `civitaspo-bot` appro
 - `CI` is the top-level pull request workflow. Its autofix job runs `pinact`, `ghalint`, and checkout-credential checks. If those tools change files, Securefix requests a signed commit through the server.
 - `Approve Request` handles trusted pull request events and `/approve` comments from `civitaspo`. Its trusted actor and `allowed_committers` set is `civitaspo`, `cursoragent`, `renovate[bot]`, `dependabot[bot]`, and `civitaspo-securefix-server[bot]`.
 - The server Securefix workflow must allow the client workflow name `CI`.
-- This repository has no release workflow yet. If a CSM release flow is added, the server must also allow `Release PR` and the release allowlists must be updated.
+- `Release PR`, `Release PR Sync`, and `Release Tag` call the reusable release workflows on `civitaspo/securefix-server`. The server allows the Securefix client workflow name `Release PR`, lists this repository in `release-clients.yaml` (`publish: github-release`), and protects its tags through `repo-settings/tags-allowlist.json`. See [releasing.md](releasing.md).
 
 No workflow uses `secrets: inherit`; the client private key is passed explicitly to the reusable workflow that needs it.
 
