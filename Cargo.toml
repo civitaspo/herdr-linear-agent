@@ -30,4 +30,4 @@ security-framework = { version = "3", default-features = false }
 security-framework-sys = "2"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "=3.27.0"
