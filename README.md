@@ -1,6 +1,7 @@
 # herdr-linear-agent
 
 [![CI](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/pull_request.yml/badge.svg)](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/pull_request.yml)
+[![Release](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/release-tag.yml/badge.svg)](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/release-tag.yml)
 
 herdr-linear-agent is a [Herdr](https://github.com/herdrdev/herdr) plugin that picks up Linear issues delegated to its Linear app user and works on them with AI coding agents running in Herdr panes.
 
@@ -8,7 +9,7 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 
 ## Status
 
-The repository is being set up. No release is available yet.
+The implementation has not started yet. Pre-releases are used to test the release flow. See [docs/releasing.md](docs/releasing.md).
 
 ## License
 

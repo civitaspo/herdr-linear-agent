@@ -1,0 +1,29 @@
+name: Release PR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Explicit release version without the leading v, for example 0.0.1-pre.1 (empty = compute with git-cliff)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: civitaspo/securefix-server/.github/workflows/reusable-release-pr.yml@32b3c519409da9ea39b3e674d7a69450af231766 # v0.1.2
+    with:
+      version: ${{ inputs.version }}
+    secrets:
+      SECUREFIX_CLIENT_PRIVATE_KEY: ${{ secrets.SECUREFIX_CLIENT_PRIVATE_KEY }}
