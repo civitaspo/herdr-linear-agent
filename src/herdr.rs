@@ -171,7 +171,7 @@ pub fn ready_state(state: &str) -> bool {
     matches!(state, "idle" | "done")
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Created {
     pub workspace_id: String,
     pub tab_id: String,

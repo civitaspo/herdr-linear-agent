@@ -54,7 +54,7 @@ pub enum Action {
 pub fn run(ctx: &Ctx, action: Action) -> Result<()> {
     let result = match action {
         Action::Login => login(ctx),
-        Action::Status => status(ctx),
+        Action::Status => Ok(status_text(ctx)),
         Action::OpenIssue => open_issue(ctx),
         Action::FocusRun => focus_run(ctx),
         Action::Pause => pause(ctx, true),
@@ -167,10 +167,6 @@ pub fn status_text(ctx: &Ctx) -> String {
         ));
     }
     lines.join("\n")
-}
-
-fn status(ctx: &Ctx) -> Result<String> {
-    Ok(status_text(ctx))
 }
 
 fn pause(ctx: &Ctx, paused: bool) -> Result<String> {

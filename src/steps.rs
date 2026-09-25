@@ -440,7 +440,7 @@ pub fn routing_results(t: &Tick, children: &mut HashMap<String, Child>) {
         };
         let outcome = if finished {
             children.remove(&run.key);
-            let text = std::fs::read_to_string(routing::output_path(&job)).unwrap_or_default();
+            let text = std::fs::read_to_string(&job.output).unwrap_or_default();
             Some((routing::parse_output(&text), "agent"))
         } else if files::seconds_since(&job.started, t.now) >= timeout {
             match children.remove(&run.key) {

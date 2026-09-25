@@ -5,7 +5,7 @@
 //! The routing agent may only return a size from a fixed enum, so whatever the
 //! issue text says, the profile it leads to stays within the config's rules.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -243,10 +243,6 @@ pub fn kill(pid: u32) {
     }
 }
 
-pub fn output_path(job: &RoutingJob) -> PathBuf {
-    PathBuf::from(&job.output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +412,7 @@ mod tests {
         let (job, mut child) = spawn(&profile, dir.path(), &issue, Some(&path)).unwrap();
         child.wait().unwrap();
         assert_eq!(
-            parse_output(&std::fs::read_to_string(output_path(&job)).unwrap()),
+            parse_output(&std::fs::read_to_string(&job.output).unwrap()),
             Size::XS
         );
         assert!(!process_alive(0));

@@ -231,9 +231,17 @@ mod tests {
     #[test]
     fn the_manifest_names_this_version_and_only_existing_actions() {
         let manifest: toml::Value = toml::from_str(include_str!("../herdr-plugin.toml")).unwrap();
-        assert_eq!(manifest["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            manifest["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
         for action in manifest["actions"].as_array().unwrap() {
-            let command: Vec<&str> = action["command"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            let command: Vec<&str> = action["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
             let mut argv = vec!["hla"];
             argv.extend(&command[1..]);
             assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");

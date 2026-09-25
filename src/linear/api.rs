@@ -229,7 +229,7 @@ pub struct RunQuery {
     pub cursor: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IssueStatus {
     pub updated_at: String,
     pub state_type: String,

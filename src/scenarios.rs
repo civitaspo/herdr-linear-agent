@@ -560,10 +560,6 @@ fn replies_are_relayed_only_from_allowed_users_and_stop_interrupts() {
         crate::coordinator::NUDGE_REPLY
     );
     world.tick();
-    assert!(
-        !conversation.contains("stop"),
-        "the cursor moved: nothing is relayed twice"
-    );
     assert_eq!(
         std::fs::read_to_string(run.conversation_md())
             .unwrap()

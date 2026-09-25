@@ -155,9 +155,6 @@ pub struct RunRecord {
     pub timeout_asked: bool,
     /// The coordinator's pane is gone and a resume question was asked.
     pub coordinator_lost: bool,
-    /// Consecutive failing Linear writes began at this time.
-    pub write_failing_since: String,
-    pub write_failure_notified: bool,
 }
 
 #[derive(Debug, Clone)]
