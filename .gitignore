@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# macOS metadata
+.DS_Store
+
+# Editor metadata
+.idea/
+.vscode/
