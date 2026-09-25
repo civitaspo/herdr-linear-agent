@@ -21,9 +21,10 @@ mod steps;
 mod ticker;
 mod worker;
 
-/// Crate version plus a build identifier (short git hash and build time), so a
-/// rebuilt binary always differs from the one a running ticker was started from.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HLA_BUILD_ID"));
+/// The release version plus a build identifier (short git hash and build
+/// time), so a rebuilt binary always differs from the one a running ticker was
+/// started from.
+pub const VERSION: &str = concat!(env!("HLA_RELEASE_VERSION"), "+", env!("HLA_BUILD_ID"));
 
 /// A Herdr server that was not started from a login shell hands its plugins a
 /// minimal `PATH`, so `git` or an agent CLI may be missing for the ticker

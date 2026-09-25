@@ -7,7 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // No rerun-if-changed lines on purpose: cargo then reruns this script whenever
 // any file in the package changes, so a rebuilt binary always gets a new build
 // id and `ticker start` replaces a ticker that runs an older build.
+//
+// The release version comes from `.release-version`, which the Release PR
+// workflow writes; Cargo.toml's version is not bumped by releases.
 fn main() {
+    let release = std::fs::read_to_string(".release-version").expect(".release-version is missing");
+    println!("cargo:rustc-env=HLA_RELEASE_VERSION={}", release.trim());
     let hash = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

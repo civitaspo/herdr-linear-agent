@@ -229,12 +229,8 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn the_manifest_names_this_version_and_only_existing_actions() {
+    fn the_manifest_names_only_existing_actions() {
         let manifest: toml::Value = toml::from_str(include_str!("../herdr-plugin.toml")).unwrap();
-        assert_eq!(
-            manifest["version"].as_str(),
-            Some(env!("CARGO_PKG_VERSION"))
-        );
         for action in manifest["actions"].as_array().unwrap() {
             let command: Vec<&str> = action["command"]
                 .as_array()

@@ -11,7 +11,11 @@ This repository uses the shared Securefix client release flow hosted in [`civita
 5. **Release Tag** creates the annotated tag `vX.Y.Z` on the merge commit and creates a `release-request-*` label on `civitaspo/securefix-server`.
 6. The server **Release** workflow checks `release-clients.yaml` and publishes a GitHub Release.
 
-The workflows in `.github/workflows/release-*.yml` are thin wrappers around the server's reusable workflows, pinned to a commit SHA.
+The workflows in `.github/workflows/release-*.yml` are thin wrappers around the server's reusable workflows, pinned to a commit SHA, except **Release Assets**.
+
+**Release Assets** runs when a release is published (or by hand with a tag). It builds the binary for Apple silicon and Intel Macs at the tag, checks that it reports the tag's version, and uploads `herdr-linear-agent-<arch>-apple-darwin` and `SHA256SUMS` to the release with the workflow's own token. `scripts/install.sh`, the plugin's build step, downloads the binary that matches `.release-version` and falls back to `cargo build --release --locked`.
+
+`.release-version` is the release version: the binary reports it (`herdr-linear-agent --version`). The versions in `Cargo.toml` and `herdr-plugin.toml` are not bumped by releases.
 
 ## Versions
 
