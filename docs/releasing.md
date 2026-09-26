@@ -13,7 +13,7 @@ This repository uses the shared Securefix client release flow hosted in [`civita
 
 The workflows in `.github/workflows/release-*.yml` are thin wrappers around the server's reusable workflows, pinned to a commit SHA, except **Release Assets**.
 
-**Release Assets** runs when a release is published (or by hand with a tag). It builds the binary for Apple silicon and Intel Macs at the tag, checks that it reports the tag's version, and uploads `herdr-linear-agent-<arch>-apple-darwin` and `SHA256SUMS` to the release with the workflow's own token. `scripts/install.sh`, the plugin's build step, downloads the binary that matches `.release-version` and falls back to `cargo build --release --locked`.
+**Release Assets** runs when a release is published (or by hand with a tag). It builds the binary at the tag for macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`) and for Linux as static musl binaries (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`), checks that it reports the tag's version, and uploads `herdr-linear-agent-<target>` with its `herdr-linear-agent-<target>.sha256` to the release with the workflow's own token. `scripts/install.sh`, the plugin's build step, downloads the binary that matches `.release-version` and falls back to `cargo build --release --locked`.
 
 `.release-version` is the release version: the binary reports it (`herdr-linear-agent --version`). The versions in `Cargo.toml` and `herdr-plugin.toml` are not bumped by releases.
 

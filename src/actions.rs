@@ -211,7 +211,7 @@ fn open_issue(ctx: &Ctx) -> Result<String> {
     let record = run.record()?;
     let out = ctx
         .runner
-        .run(&Cmd::new("/usr/bin/open", Duration::from_secs(10)).arg(&record.url))?;
+        .run(&Cmd::new(crate::files::OPEN_COMMAND, Duration::from_secs(10)).arg(&record.url))?;
     if !out.success() {
         bail!("could not open {}: {}", record.url, out.error_text());
     }

@@ -1,5 +1,6 @@
-# Attaches the macOS binaries that scripts/install.sh downloads to a published
-# GitHub Release. The release itself is created by civitaspo/securefix-server.
+# Attaches the macOS and Linux binaries that scripts/install.sh downloads to a
+# published GitHub Release. The release itself is created by
+# civitaspo/securefix-server.
 
 name: Release Assets
 
@@ -22,13 +23,26 @@ defaults:
 
 jobs:
   assets:
-    name: assets
-    runs-on: macos-latest
+    name: assets (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     permissions:
       contents: write
     timeout-minutes: 30
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TARGET: ${{ matrix.target }}
 
     steps:
       - name: Check out the release tag
@@ -44,23 +58,29 @@ jobs:
           install_args: "--locked"
           cache: false
 
-      - name: Build both architectures
+      - name: Install the musl toolchain
+        if: runner.os == 'Linux'
         run: |
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --locked --target "$TARGET"
           mkdir -p dist
-          for arch in aarch64 x86_64; do
-            cargo build --release --locked --target "$arch-apple-darwin"
-            cp "target/$arch-apple-darwin/release/herdr-linear-agent" "dist/herdr-linear-agent-$arch-apple-darwin"
-          done
-          cd dist
-          shasum -a 256 herdr-linear-agent-* > SHA256SUMS
-          cat SHA256SUMS
+          asset="herdr-linear-agent-$TARGET"
+          cp "target/$TARGET/release/herdr-linear-agent" "dist/$asset"
+          (cd dist && shasum -a 256 "$asset" > "$asset.sha256" && cat "$asset.sha256")
 
       - name: Check the reported version
+        # The x86_64 macOS binary cannot run on the Apple silicon runner.
+        if: matrix.target != 'x86_64-apple-darwin'
         run: |
           version=$(tr -d '[:space:]' < .release-version)
           [ "v$version" = "$TAG" ] || { echo ".release-version is $version, the tag is $TAG" >&2; exit 1; }
-          reported=$(dist/herdr-linear-agent-aarch64-apple-darwin --version)
+          reported=$("dist/herdr-linear-agent-$TARGET" --version)
           case "$reported" in
             "herdr-linear-agent $version+"*) echo "$reported" ;;
             *) echo "unexpected version: $reported" >&2; exit 1 ;;

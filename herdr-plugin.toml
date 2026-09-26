@@ -3,7 +3,7 @@ name = "Linear Agent"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
 description = "Run a coordinator and per-repository workers for Linear issues delegated to this agent."
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 [[build]]
 # Downloads the release binary; falls back to `cargo build --release --locked`.

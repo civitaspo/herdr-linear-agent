@@ -29,5 +29,8 @@ core-foundation = "0.10"
 security-framework = { version = "3", default-features = false }
 security-framework-sys = "2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5", default-features = false, features = ["rt-async-io-crypto-rust"] }
+
 [dev-dependencies]
 tempfile = "=3.27.0"

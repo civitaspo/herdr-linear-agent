@@ -15,7 +15,8 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 
 ## Requirements
 
-- macOS and Herdr 0.9.1 or later
+- macOS or Linux, and Herdr 0.9.1 or later
+- On Linux: a Secret Service provider (GNOME Keyring, KWallet) for the token, and `xdg-open`
 - The agent CLIs your profiles use (`claude`, `codex`, `cursor-agent`, ...) and `git`
 - A Linear workspace where you can install an OAuth application (workspace admin)
 
@@ -30,7 +31,7 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 
    The build step downloads the release binary, or builds from source with `cargo` when there is none.
 3. **Write the config** at `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` (default `~/.config/herdr-linear-agent/config.toml`). See [Configuration](#configuration).
-4. **Log in:** run the Herdr action **Linear Agent: log in to Linear**. It opens the browser, stores the token in the macOS Keychain (service `dev.herdr-linear-agent.linear.oauth.v1`) and checks that it acts as the app user.
+4. **Log in:** run the Herdr action **Linear Agent: log in to Linear**. It opens the browser, stores the token in the macOS Keychain or, on Linux, the Secret Service (service `dev.herdr-linear-agent.linear.oauth.v1`), and checks that it acts as the app user. The browser must run on the same machine: Linear redirects to `127.0.0.1`.
 5. **Check the setup:** run **Linear Agent: check setup**.
 6. **Delegate an issue** in one of the configured teams to the app user.
 
@@ -128,7 +129,7 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 
 | Action | What it does |
 | --- | --- |
-| Linear Agent: log in to Linear | Authorizes the app in the browser and stores the token in the Keychain |
+| Linear Agent: log in to Linear | Authorizes the app in the browser and stores the token in the Keychain or Secret Service |
 | Linear Agent: status | Lists the runs, their coordinators and workers |
 | Linear Agent: open this run's issue | Opens the issue of the focused pane's run in the browser |
 | Linear Agent: focus the run of a Linear issue | Ctrl-click a Linear issue link to focus its run |
@@ -145,7 +146,7 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 | `$XDG_STATE_HOME/herdr-linear-agent/ticker.log` | The ticker's log |
 | `<worktree>/.herdr-linear-agent/<ISSUE-KEY>-<id>/` | A worker's brief and report, excluded from git |
 
-`$XDG_STATE_HOME` defaults to `~/.local/state`, also on macOS.
+`$XDG_STATE_HOME` defaults to `~/.local/state` on Linux and macOS alike.
 
 ## Working with other plugins
 
@@ -155,7 +156,7 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 ## Security notes
 
 - Agents run as your user. The allow-list the plugin writes for Claude Code and the rules in the coordinator sheet are guidance, not a sandbox: an agent can run any command your shell can.
-- The plugin has no subcommand that prints the token. The Keychain may ask for confirmation when a rebuilt binary reads it.
+- The plugin has no subcommand that prints the token. The macOS Keychain may ask for confirmation when a rebuilt binary reads it; a locked Secret Service collection asks to be unlocked.
 - The issue text, reports and comments are treated as data. Only replies from `allowed_user_ids` reach the coordinator as instructions.
 
 ## Status

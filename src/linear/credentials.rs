@@ -5,34 +5,35 @@
 //! lifecycle transitions under one in-process mutex and one user-owned
 //! advisory lock, and never includes secret material in public diagnostics.
 //!
-//! The production store is compiled only on macOS.  Linux and other hosts
-//! return [`CredentialError::UnsupportedPlatform`] before reading a path,
-//! environment variable, or keychain item.
+//! The production store is the macOS Keychain on macOS and the Secret Service
+//! (GNOME Keyring, KWallet) on Linux. Other hosts return
+//! [`CredentialError::UnsupportedPlatform`] before reading a path,
+//! environment variable, or secret.
 //!
 //! Ported from Nagi (`crates/nagi/src/linear/credentials.rs` at `ee7d657`).
-//! The Keychain service is `dev.herdr-linear-agent.linear.oauth.v1`, and the
-//! advisory lock file lives in `$XDG_STATE_HOME/herdr-linear-agent/`.
+//! The secret's service name is `dev.herdr-linear-agent.linear.oauth.v1`, and
+//! the advisory lock file lives in `$XDG_STATE_HOME/herdr-linear-agent/`.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::linear::oauth::{self, OAuthConfig};
 use crate::linear::oauth::{OAuthError, TokenBundle};
 use crate::linear::{ApiError, VerifiedReadOutcome};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use oauth2::reqwest::blocking::{Body, Client, ClientBuilder, Response};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use oauth2::reqwest::header::CONTENT_TYPE;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use oauth2::reqwest::redirect::Policy;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use oauth2::url::form_urlencoded::Serializer;
 use serde::{Deserialize, Deserializer, Serialize, Serializer as SerdeSerializer};
 use std::fmt;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::{self, Read};
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::sync::MutexGuard;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
@@ -47,22 +48,22 @@ const MAX_CLIENT_ID_BYTES: usize = 4 * 1024;
 const MAX_VIEWER_ID_BYTES: usize = 4 * 1024;
 const MILLIS_PER_SECOND: i64 = 1_000;
 const REPLAY_GRACE_MILLIS: i64 = 30 * 60 * MILLIS_PER_SECOND;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const REFRESH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const TOKEN_ENDPOINT: &str = "https://api.linear.app/oauth/token";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const REVOKE_ENDPOINT: &str = "https://api.linear.app/oauth/revoke";
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 static PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn process_lock() -> &'static Mutex<()> {
     PROCESS_LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -70,13 +71,10 @@ fn process_lock() -> &'static Mutex<()> {
 /// Coarse failures returned by the credential lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialError {
-    /// This host does not provide the macOS file-based Keychain backend.
+    /// This host has neither the macOS Keychain nor the Secret Service.
     #[cfg_attr(
-        target_os = "macos",
-        expect(
-            dead_code,
-            reason = "constructed only on hosts without the macOS Keychain"
-        )
+        any(target_os = "macos", target_os = "linux"),
+        expect(dead_code, reason = "constructed only on unsupported hosts")
     )]
     UnsupportedPlatform,
     /// The local OAuth configuration is invalid.
@@ -467,11 +465,11 @@ impl fmt::Debug for ProviderResponse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderTransportError {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     ClientConfiguration,
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, target_os = "macos", target_os = "linux"))]
     NoResponse,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     ResponseTooLarge,
 }
 
@@ -484,20 +482,20 @@ trait ProviderTransport {
     fn revoke(&mut self, refresh_token: &str) -> Result<ProviderResponse, ProviderTransportError>;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct SecretBody {
     bytes: Zeroizing<Vec<u8>>,
     offset: usize,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl SecretBody {
     fn new(bytes: Zeroizing<Vec<u8>>) -> Self {
         Self { bytes, offset: 0 }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Read for SecretBody {
     fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
         let remaining = self.bytes.len().saturating_sub(self.offset);
@@ -511,12 +509,12 @@ impl Read for SecretBody {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct HttpsProviderTransport {
     client: Client,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl HttpsProviderTransport {
     fn new() -> Result<Self, ProviderTransportError> {
         let client = ClientBuilder::new()
@@ -548,14 +546,14 @@ impl HttpsProviderTransport {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl fmt::Debug for HttpsProviderTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("HttpsProviderTransport([configured])")
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl ProviderTransport for HttpsProviderTransport {
     fn refresh(
         &mut self,
@@ -577,7 +575,7 @@ impl ProviderTransport for HttpsProviderTransport {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_provider_response(response: Response) -> Result<ProviderResponse, ProviderTransportError> {
     let status = response.status().as_u16();
     let mut body = Zeroizing::new(Vec::with_capacity(MAX_PROVIDER_RESPONSE_BYTES.min(4096)));
@@ -593,7 +591,7 @@ fn read_provider_response(response: Response) -> Result<ProviderResponse, Provid
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreError {
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, target_os = "macos", target_os = "linux"))]
     Unavailable,
     #[cfg(test)]
     Uncertain,
@@ -757,18 +755,96 @@ mod keychain {
 }
 
 #[cfg(target_os = "macos")]
-use keychain::KeychainStore;
+fn platform_store() -> Result<Box<dyn CredentialStore>, CredentialError> {
+    Ok(Box::new(
+        keychain::KeychainStore::production().map_err(|_| CredentialError::Storage)?,
+    ))
+}
+
+/// Generic secret in the user's default Secret Service collection (GNOME
+/// Keyring, KWallet), with the same service name the macOS Keychain item uses.
+#[cfg(target_os = "linux")]
+mod secret_store {
+    use super::*;
+    use secret_service::EncryptionType;
+    use secret_service::blocking::{Item, SecretService};
+    use std::collections::HashMap;
+
+    const SERVICE: &str = "dev.herdr-linear-agent.linear.oauth.v1";
+    const ACCOUNT: &str = "default";
+    const LABEL: &str = "herdr-linear-agent Linear OAuth credential";
+
+    pub struct SecretServiceStore;
+
+    fn attributes() -> HashMap<&'static str, &'static str> {
+        HashMap::from([("service", SERVICE), ("account", ACCOUNT)])
+    }
+
+    // Error details stay out of logs and public errors, as for the Keychain.
+    fn connect() -> Result<SecretService<'static>, StoreError> {
+        SecretService::connect(EncryptionType::Dh).map_err(|_| StoreError::Unavailable)
+    }
+
+    fn items<'a>(service: &'a SecretService<'a>) -> Result<Vec<Item<'a>>, StoreError> {
+        let found = service
+            .search_items(attributes())
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(found.unlocked.into_iter().chain(found.locked).collect())
+    }
+
+    impl CredentialStore for SecretServiceStore {
+        fn read(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+            let service = connect()?;
+            let Some(item) = items(&service)?.into_iter().next() else {
+                return Ok(None);
+            };
+            item.unlock().map_err(|_| StoreError::Unavailable)?;
+            item.get_secret()
+                .map(|secret| Some(Zeroizing::new(secret)))
+                .map_err(|_| StoreError::Unavailable)
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+            let service = connect()?;
+            let collection = service
+                .get_default_collection()
+                .map_err(|_| StoreError::Unavailable)?;
+            collection.unlock().map_err(|_| StoreError::Unavailable)?;
+            collection
+                .create_item(LABEL, attributes(), bytes, true, "application/octet-stream")
+                .map(|_| ())
+                .map_err(|_| StoreError::Unavailable)
+        }
+
+        fn delete(&mut self) -> Result<(), StoreError> {
+            let service = connect()?;
+            for item in items(&service)? {
+                item.delete().map_err(|_| StoreError::Unavailable)?;
+            }
+            Ok(())
+        }
+
+        fn verify_absent(&mut self) -> Result<bool, StoreError> {
+            Ok(self.read()?.is_none())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_store() -> Result<Box<dyn CredentialStore>, CredentialError> {
+    Ok(Box::new(secret_store::SecretServiceStore))
+}
 
 trait WallClock {
     /// Returns the current Unix epoch time in milliseconds.
     fn now(&self) -> Result<i64, CredentialError>;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct SystemWallClock;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl WallClock for SystemWallClock {
     fn now(&self) -> Result<i64, CredentialError> {
         std::time::SystemTime::now()
@@ -786,22 +862,22 @@ trait CriticalSection {
     fn lock(&self) -> Result<Box<dyn LockGuard>, CredentialError>;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct ProcessAndFileGuard {
     _process: MutexGuard<'static, ()>,
     _file: std::fs::File,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl LockGuard for ProcessAndFileGuard {}
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug)]
 struct SystemCriticalSection {
     lock_path: PathBuf,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CriticalSection for SystemCriticalSection {
     fn lock(&self) -> Result<Box<dyn LockGuard>, CredentialError> {
         let process = process_lock()
@@ -818,7 +894,7 @@ impl CriticalSection for SystemCriticalSection {
 
 /// The lock file's directory must exist, be a real directory owned by this
 /// user, and not be writable by group or others.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn check_lock_directory(path: &std::path::Path) -> Result<(), io::Error> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -838,7 +914,7 @@ fn check_lock_directory(path: &std::path::Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn open_advisory_lock(path: &std::path::Path) -> Result<std::fs::File, io::Error> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -882,12 +958,12 @@ trait AuthorizationProvider {
     fn authorize(&mut self) -> Result<TokenBundle, OAuthError>;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct ProductionAuthorization {
     config: OAuthConfig,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl AuthorizationProvider for ProductionAuthorization {
     fn authorize(&mut self) -> Result<TokenBundle, OAuthError> {
         oauth::authorize_production(&self.config)
@@ -921,14 +997,14 @@ impl fmt::Debug for CredentialManager {
 }
 
 impl CredentialManager {
-    /// Constructs the production macOS manager. `lock_path` is the advisory
+    /// Constructs the production manager. `lock_path` is the advisory
     /// lock file, `$XDG_STATE_HOME/herdr-linear-agent/credentials.lock`.
     pub fn production(
         client_id: impl Into<String>,
         callback_port: u16,
         lock_path: PathBuf,
     ) -> Result<Self, CredentialError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let client_id = client_id.into();
             let client_id = bounded_client_id(&client_id)?;
@@ -936,17 +1012,16 @@ impl CredentialManager {
                 .map_err(|_| CredentialError::Configuration)?;
             let transport =
                 HttpsProviderTransport::new().map_err(|_| CredentialError::Configuration)?;
-            let store = KeychainStore::production().map_err(|_| CredentialError::Storage)?;
             Ok(Self {
                 client_id,
-                store: Box::new(store),
+                store: platform_store()?,
                 transport: Some(Box::new(transport)),
                 clock: Box::new(SystemWallClock),
                 critical_section: Box::new(SystemCriticalSection { lock_path }),
                 authorizer: Some(Box::new(ProductionAuthorization { config })),
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (client_id, callback_port, lock_path);
             Err(CredentialError::UnsupportedPlatform)
@@ -957,19 +1032,18 @@ impl CredentialManager {
     /// installs no network-capable transport, because status is intentionally
     /// side-effect free.
     pub fn production_status(lock_path: PathBuf) -> Result<Self, CredentialError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let store = KeychainStore::production().map_err(|_| CredentialError::Storage)?;
             Ok(Self {
                 client_id: String::new(),
-                store: Box::new(store),
+                store: platform_store()?,
                 transport: None,
                 clock: Box::new(SystemWallClock),
                 critical_section: Box::new(SystemCriticalSection { lock_path }),
                 authorizer: None,
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = lock_path;
             Err(CredentialError::UnsupportedPlatform)
@@ -1476,7 +1550,7 @@ fn refresh_failure_error(envelope: &CredentialEnvelope) -> CredentialError {
 
 fn map_store_error(error: StoreError) -> CredentialError {
     match error {
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(any(test, target_os = "macos", target_os = "linux"))]
         StoreError::Unavailable => CredentialError::Storage,
         #[cfg(test)]
         StoreError::Uncertain => CredentialError::StorageUncertain,
