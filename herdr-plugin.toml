@@ -56,5 +56,6 @@ command = ["target/release/herdr-linear-agent", "action", "doctor"]
 
 [[link_handlers]]
 id = "linear-issue"
+title = "herdr-linear-agent: focus the run of this issue"
 pattern = "^https://linear\\.app/[^/]+/issue/[A-Z][A-Z0-9]*-[0-9]+"
 action = "focus-run"

@@ -243,6 +243,13 @@ mod tests {
             assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
             assert_eq!(command[2], action["id"].as_str().unwrap());
         }
+        // Herdr refuses a manifest whose link handler has no title (0.9.1).
+        for handler in manifest["link_handlers"].as_array().unwrap() {
+            assert!(
+                handler["title"].as_str().is_some_and(|t| !t.is_empty()),
+                "{handler}"
+            );
+        }
     }
 
     #[test]
