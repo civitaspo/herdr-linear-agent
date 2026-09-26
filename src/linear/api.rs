@@ -47,6 +47,13 @@ const ISSUE_QUERY: &str = r#"query HlaIssue($id: String!) {
   }
 }"#;
 
+/// The app's recent sessions. Linear creates one when an issue is delegated
+/// to the app (with the agent session webhook category enabled).
+const SESSIONS_QUERY: &str = r#"query HlaSessions {
+  viewer { id app isMe }
+  agentSessions(first: 50) { nodes { id status createdAt issue { id } appUser { id } } }
+}"#;
+
 const SESSION_CREATE: &str = r#"mutation HlaSessionCreate($issueId: String!) {
   agentSessionCreateOnIssue(input: { issueId: $issueId }) { success agentSession { id } }
 }"#;
@@ -345,7 +352,22 @@ impl<T: Transport> Linear<T> {
     }
 
     /// Creates an Agent Session on the issue and returns its ID.
-    pub fn create_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
+    /// The issue's newest open session of this app: the one Linear created on
+    /// delegation, or one the plugin created earlier. Otherwise a new one.
+    pub fn open_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
+        let data = self.read("HlaSessions", SESSIONS_QUERY, json!({}))?;
+        let viewer = text(field(&data, "viewer")?, "id")?;
+        let found = nodes(field(&data, "agentSessions")?)
+            .filter(|s| s["issue"]["id"] == issue_id && s["appUser"]["id"] == viewer.as_str())
+            .filter(|s| s["status"] != "complete")
+            .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+        match found {
+            Some(session) => text(session, "id"),
+            None => self.create_session(issue_id),
+        }
+    }
+
+    fn create_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
         let result = self.write(
             "HlaSessionCreate",
             SESSION_CREATE,
@@ -549,6 +571,9 @@ pub mod fake {
     pub struct FakeSession {
         pub id: String,
         pub issue_id: String,
+        /// `pending` when created; tests set other states.
+        pub status: String,
+        pub created_at: String,
         /// Activity records in the shape the API returns, oldest first.
         pub activities: Vec<Value>,
         pub plan: Option<Value>,
@@ -586,6 +611,8 @@ pub mod fake {
         pub fail_next: Option<ApiError>,
         /// The next write takes effect but its response is lost, once.
         pub lose_next_response: bool,
+        /// Sessions fail as for an app without the agent session webhook category.
+        pub sessions_disabled: bool,
         clock: i64,
     }
 
@@ -667,6 +694,25 @@ pub mod fake {
                 .expect("fake session")
         }
 
+        fn new_session(&mut self, issue_id: String) -> String {
+            let id = format!("session-{}", self.sessions.len() + 1);
+            let created_at = self.tick_clock();
+            self.sessions.push(FakeSession {
+                id: id.clone(),
+                issue_id,
+                status: "pending".into(),
+                created_at,
+                ..FakeSession::default()
+            });
+            id
+        }
+
+        /// The session Linear creates by itself when the issue is delegated.
+        pub fn delegate_session(&mut self, identifier: &str) -> String {
+            let issue_id = self.issue(identifier)["id"].as_str().unwrap().to_string();
+            self.new_session(issue_id)
+        }
+
         /// A person's message in the issue's session.
         pub fn add_prompt(
             &mut self,
@@ -744,17 +790,25 @@ pub mod fake {
                         .ok_or(ApiError::Graphql("Entity not found".into()))?;
                     Ok(json!({ "viewer": viewer(), "issue": issue }))
                 }
+                "HlaSessions" | "HlaSessionCreate" if self.sessions_disabled => {
+                    Err(ApiError::Graphql(
+                        "Agent sessions are not enabled for this application.".into(),
+                    ))
+                }
+                "HlaSessions" => {
+                    let nodes: Vec<Value> = self
+                        .sessions
+                        .iter()
+                        .map(|s| json!({ "id": s.id, "status": s.status, "createdAt": s.created_at, "issue": { "id": s.issue_id }, "appUser": { "id": APP_USER } }))
+                        .collect();
+                    Ok(json!({ "viewer": viewer(), "agentSessions": { "nodes": nodes } }))
+                }
                 "HlaSessionCreate" => {
                     let issue_id = self.issue(variables["issueId"].as_str().unwrap_or(""))["id"]
                         .as_str()
                         .unwrap()
                         .to_string();
-                    let id = format!("session-{}", self.sessions.len() + 1);
-                    self.sessions.push(FakeSession {
-                        id: id.clone(),
-                        issue_id,
-                        ..FakeSession::default()
-                    });
+                    let id = self.new_session(issue_id);
                     Ok(
                         json!({ "agentSessionCreateOnIssue": { "success": true, "agentSession": { "id": id } } }),
                     )
@@ -942,7 +996,7 @@ mod tests {
         let mut fake = FakeLinear::default();
         let issue = fake.add_issue("DATA-1", "DATA", "First");
         let mut linear = Linear::new(fake);
-        let session = linear.create_session(&issue).unwrap();
+        let session = linear.open_session(&issue).unwrap();
         let thought = Activity::new(Content::Thought {
             body: "Picked up".into(),
         });

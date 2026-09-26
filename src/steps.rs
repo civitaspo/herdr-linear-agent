@@ -265,6 +265,17 @@ pub fn intake(
     for issue in issues {
         if let Ok(run) = Run::load(&runs_dir, &issue.identifier) {
             let record = run.record()?;
+            // A claim cut short (no coordinator decided yet) is finished now.
+            if record.status == Status::Active
+                && record.coordinator.profile.is_empty()
+                && record.routing.is_none()
+            {
+                let detail = linear.issue(&issue.id)?;
+                if let Err(error) = finish_claim(t, linear, &run, &detail, routing_children) {
+                    t.fail(&run, error);
+                }
+                continue;
+            }
             if record.status != Status::Active {
                 run.update(|r| {
                     r.status = Status::Active;
@@ -346,15 +357,38 @@ fn claim(
     )?;
     t.log.line(&format!("{}: picked up", run.key));
     outbox::push(&run, thought(format!("Picked up {}.", run.key)))?;
-    let session = linear.create_session(&detail.id)?;
-    run.update(|r| r.session_id = session)?;
+    finish_claim(t, linear, &run, &detail, routing_children)
+}
+
+/// Attaches the session (the one Linear created on delegation, or a new
+/// one), moves the issue to a started state and decides the coordinator. A
+/// session that cannot be opened yet is retried when the outbox is sent; it
+/// never holds up the rest of the claim.
+fn finish_claim(
+    t: &Tick,
+    linear: &mut LinearClient,
+    run: &Run,
+    detail: &IssueDetail,
+    routing_children: &mut HashMap<String, Child>,
+) -> Result<()> {
+    if run.record()?.session_id.is_empty() {
+        match linear.open_session(&detail.id) {
+            Ok(session) => {
+                run.update(|r| r.session_id = session)?;
+            }
+            Err(error) => t.log.line(&format!(
+                "{}: could not open the session yet: {error}",
+                run.key
+            )),
+        }
+    }
     outbox::push(
-        &run,
+        run,
         Op::IssueState {
             target: StateTarget::Started,
         },
     )?;
-    route(t, &run, &detail, routing_children)
+    route(t, run, detail, routing_children)
 }
 
 /// Decides the size from the estimate or a size label, or starts the routing
@@ -1228,7 +1262,7 @@ pub fn flush(
             continue;
         }
         let session = if record.session_id.is_empty() {
-            match linear.create_session(&record.issue_id) {
+            match linear.open_session(&record.issue_id) {
                 Ok(id) => {
                     let _ = run.update(|r| r.session_id = id.clone());
                     id

@@ -868,3 +868,49 @@ fn context_shows_the_digest_and_marks_items_seen() {
     commands::inbox_done(&world.ctx(), "DATA-1", &[], true).unwrap();
     assert!(crate::inbox::unhandled(&run).is_empty());
 }
+
+#[test]
+fn the_session_linear_created_on_delegation_is_used() {
+    let mut world = World::new();
+    world.fake().add_issue("DATA-1", "DATA", "Delegated");
+    let session = world.fake().delegate_session("DATA-1");
+    world.tick();
+    assert_eq!(world.run("DATA-1").record().unwrap().session_id, session);
+    let fake = world.fake();
+    assert_eq!(fake.sessions.len(), 1, "no second session");
+    assert!(!fake.sessions[0].sent("thought").is_empty());
+}
+
+#[test]
+fn a_claim_without_a_session_still_decides_its_coordinator() {
+    let mut world = World::new();
+    world.fake().add_issue("DATA-1", "DATA", "Early");
+    world.fake().sessions_disabled = true;
+    world.tick();
+    let record = world.run("DATA-1").record().unwrap();
+    assert!(record.session_id.is_empty());
+    assert_eq!(
+        record.coordinator.profile, "coordinator",
+        "the claim went on"
+    );
+
+    // A run left without a coordinator decision (an older build) is finished.
+    world
+        .run("DATA-1")
+        .update(|r| r.coordinator = Default::default())
+        .unwrap();
+    world.fake().sessions_disabled = false;
+    world.tick();
+    let record = world.run("DATA-1").record().unwrap();
+    assert_eq!(record.coordinator.profile, "coordinator");
+    assert!(!record.session_id.is_empty());
+    let fake = world.fake();
+    assert_eq!(fake.sessions.len(), 1);
+    assert_eq!(fake.issue("DATA-1")["state"]["name"], "In Progress");
+    assert!(
+        fake.sessions[0]
+            .sent("thought")
+            .iter()
+            .any(|a| a["content"]["body"] == "Picked up DATA-1.")
+    );
+}

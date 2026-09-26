@@ -4,7 +4,7 @@ The test suite runs the ticker and the coordinator's commands against a fake Her
 
 | # | Question | How the plugin behaves today |
 | --- | --- | --- |
-| 1 | When a person delegates an issue to an app without a webhook, does Linear create an Agent Session by itself? | The plugin always creates its own session with `agentSessionCreateOnIssue` and posts a thought in the same tick. |
+| 1 | When a person delegates an issue to an app without a webhook, does Linear create an Agent Session by itself? | **Checked (2026-09-26).** Without the "Agent session events" webhook category, Linear refuses every session ("Agent sessions are not enabled for this application"); with it, Linear creates the session on delegation. The plugin uses that session, and creates one only when none is open. |
 | 2 | Does an `elicitation` activity notify the person who delegated the issue? | A Herdr notification is also shown when `notifications.herdr` is on. |
 | 3 | Can an activity created with our `id` be read back with `activities(filter: { id: { eq } })`? | A write whose response was lost is checked this way before it is sent again. |
 | 4 | Does `agentSessionUpdate` accept a list for `plan`? | `plan set` sends a list of `{content, status}`. |
