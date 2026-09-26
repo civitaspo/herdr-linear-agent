@@ -5,7 +5,10 @@
 
 herdr-linear-agent is a [Herdr](https://github.com/herdrdev/herdr) plugin that picks up Linear issues delegated to its Linear app user and works on them with AI coding agents running in Herdr panes.
 
-For each issue, the plugin starts one coordinator agent. The coordinator reads the issue, splits the work, and starts one worker agent per repository in its own Herdr worktree. Workers implement the change, open pull requests and check CI. The plugin reports progress, questions and results to the issue's Linear Agent Session, and people reply there.
+> [!NOTE]
+> herdr-linear-agent is not [Linear Agent](https://linear.app/docs/linear-agent), the assistant built into Linear (`@Linear`, ⌘J). It is an independent Herdr plugin, not made by or affiliated with Linear, that connects to your workspace as its own OAuth app through Linear's public Agents API, the same way other third-party agents do.
+
+For each issue, the plugin starts one coordinator agent. The coordinator reads the issue, splits the work, and starts one worker agent per repository in its own Herdr worktree. Workers implement the change, open pull requests and check CI. The plugin reports progress, questions and results to the issue's Agent Session in Linear, and people reply there.
 
 - **Linear is the front door.** Delegate an issue to the app user; talk to the run in the issue's Agent Session. There is no public endpoint: the plugin polls Linear.
 - **One writer.** Only the plugin's background ticker writes to Linear. Agents call plugin subcommands that queue requests; they never hold a Linear token.
@@ -22,7 +25,7 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 
 ## Set up
 
-1. **Create a Linear OAuth application** (Settings → API → OAuth applications) for this plugin. Add the callback URL `http://127.0.0.1:43871/oauth/callback` and note the client ID. The plugin uses the authorization code flow with PKCE and never needs the client secret. It installs the app with `actor=app` and the scopes `read`, `write` and `app:assignable`, which creates an app user you can delegate issues to.
+1. **Create a Linear OAuth application** (Settings → API → OAuth applications) for this plugin. Its name becomes the app user's name: pick one that people cannot mistake for Linear's own `@Linear` (for example `herdr-linear-agent`). Add the callback URL `http://127.0.0.1:43871/oauth/callback` and note the client ID. The plugin uses the authorization code flow with PKCE and never needs the client secret. It installs the app with `actor=app` and the scopes `read`, `write` and `app:assignable`, which creates an app user you can delegate issues to.
 2. **Install the plugin:**
 
    ```bash
@@ -31,8 +34,8 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 
    The build step downloads the release binary, or builds from source with `cargo` when there is none.
 3. **Write the config** at `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` (default `~/.config/herdr-linear-agent/config.toml`). See [Configuration](#configuration).
-4. **Log in:** run the Herdr action **Linear Agent: log in to Linear**. It opens the browser, stores the token in the macOS Keychain or, on Linux, the Secret Service (service `dev.herdr-linear-agent.linear.oauth.v1`), and checks that it acts as the app user. The browser must run on the same machine: Linear redirects to `127.0.0.1`.
-5. **Check the setup:** run **Linear Agent: check setup**.
+4. **Log in:** run the Herdr action **herdr-linear-agent: log in to Linear**. It opens the browser, stores the token in the macOS Keychain or, on Linux, the Secret Service (service `dev.herdr-linear-agent.linear.oauth.v1`), and checks that it acts as the app user. The browser must run on the same machine: Linear redirects to `127.0.0.1`.
+5. **Check the setup:** run **herdr-linear-agent: check setup**.
 6. **Delegate an issue** in one of the configured teams to the app user.
 
 ## Configuration
@@ -129,13 +132,13 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 
 | Action | What it does |
 | --- | --- |
-| Linear Agent: log in to Linear | Authorizes the app in the browser and stores the token in the Keychain or Secret Service |
-| Linear Agent: status | Lists the runs, their coordinators and workers |
-| Linear Agent: open this run's issue | Opens the issue of the focused pane's run in the browser |
-| Linear Agent: focus the run of a Linear issue | Ctrl-click a Linear issue link to focus its run |
-| Linear Agent: stop taking new issues | Pauses intake; running runs continue |
-| Linear Agent: take new issues again | Resumes intake |
-| Linear Agent: check setup | Checks Herdr, the config, the agent CLIs, the login and the ticker |
+| herdr-linear-agent: log in to Linear | Authorizes the app in the browser and stores the token in the Keychain or Secret Service |
+| herdr-linear-agent: status | Lists the runs, their coordinators and workers |
+| herdr-linear-agent: open this run's issue | Opens the issue of the focused pane's run in the browser |
+| herdr-linear-agent: focus the run of a Linear issue | Ctrl-click a Linear issue link to focus its run |
+| herdr-linear-agent: stop taking new issues | Pauses intake; running runs continue |
+| herdr-linear-agent: take new issues again | Resumes intake |
+| herdr-linear-agent: check setup | Checks Herdr, the config, the agent CLIs, the login and the ticker |
 
 ## Files
 
