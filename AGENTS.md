@@ -29,8 +29,6 @@ mise run test
 mise run build
 ```
 
-The Rust tasks skip project commands until `Cargo.toml` exists.
-
 ## GitHub Actions and credentials
 
 - Pin every GitHub Action to an immutable commit SHA and keep `persist-credentials: false` on checkout steps.
