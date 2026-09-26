@@ -2,7 +2,7 @@
 # Puts the herdr-linear-agent binary at target/release/herdr-linear-agent.
 #
 # Herdr runs this as the plugin's build step. It downloads the prebuilt binary
-# of the release named by herdr-plugin.toml's `version` for this machine,
+# of the release named by `.release-version` for this machine,
 # checks it against the release's SHA256SUMS, and falls back to
 # `cargo build --release --locked` when there is no such binary or it cannot
 # be verified.
@@ -32,8 +32,8 @@ if [ "${HERDR_LINEAR_AGENT_BUILD:-}" = source ]; then
   build_from_source "HERDR_LINEAR_AGENT_BUILD=source is set"
 fi
 
-version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -n 1)
-[ -n "$version" ] || build_from_source "herdr-plugin.toml has no version"
+version=$(tr -d '[:space:]' < .release-version 2>/dev/null)
+[ -n "$version" ] || build_from_source ".release-version is missing"
 tag="v$version"
 
 [ "$(uname -s)" = Darwin ] || build_from_source "there is no prebuilt binary for $(uname -s)"
