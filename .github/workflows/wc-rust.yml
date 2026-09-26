@@ -1,4 +1,4 @@
-# Rust checks. Commands remain visible and skip until the project manifest exists.
+# Rust checks.
 # They run on macOS and Linux, the platforms the plugin supports, so the
 # Keychain and Secret Service code is compiled and tested as it ships.
 
@@ -41,21 +41,13 @@ jobs:
           cache: false
 
       - name: Check Rust formatting
-        if: hashFiles('Cargo.toml') != ''
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        if: hashFiles('Cargo.toml') != ''
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Build
-        if: hashFiles('Cargo.toml') != ''
         run: cargo build --workspace --locked
 
       - name: Test
-        if: hashFiles('Cargo.toml') != ''
         run: mise run test
-
-      - name: Skip until Rust manifest exists
-        if: hashFiles('Cargo.toml') == ''
-        run: echo "Cargo.toml not present yet; skipping Rust checks."

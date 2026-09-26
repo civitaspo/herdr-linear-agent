@@ -48,8 +48,7 @@ jobs:
         run: disable-checkout-persist-credentials
 
       - name: ShellCheck shell scripts
-        if: hashFiles('scripts/**/*.sh') != ''
-        run: find scripts -type f -name '*.sh' -print0 | xargs -0 -r shellcheck
+        run: shellcheck scripts/*.sh
 
       - name: Run ghalint
         run: ghalint run
