@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- remove a timing assumption from the routing agent scenario (#18)
 - attach macOS binaries to releases (#9)
 - update dependency jdx/mise to v2026.9.14 (#12)
 - pin rust crate tempfile to =3.27.0 (#10)
