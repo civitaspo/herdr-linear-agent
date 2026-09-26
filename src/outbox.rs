@@ -304,7 +304,7 @@ mod tests {
         let mut fake = FakeLinear::default();
         let issue = fake.add_issue("DATA-1", "DATA", "First");
         let mut linear = Linear::new(fake);
-        let session = linear.create_session(&issue).unwrap();
+        let session = linear.open_session(&issue).unwrap();
         (dir, run, linear, session, issue)
     }
 
