@@ -977,7 +977,9 @@ struct RawTokenResponse {
     refresh_token: Option<Secret>,
     token_type: Option<Secret>,
     expires_in: Option<u64>,
-    scope: Option<Secret>,
+    /// Not a secret, and space-separated when several scopes are granted
+    /// (`"app:assignable read write"`), which `Secret` would refuse.
+    scope: Option<String>,
     /// The default marks an omitted actor as absent; custom deserialization
     /// marks an explicit JSON null as present-but-invalid.
     #[serde(default)]
@@ -1027,8 +1029,7 @@ fn validate_token_response(response: TokenTransportResponse) -> Result<TokenBund
         .filter(|value| *value > 0)
         .ok_or(OAuthError::InvalidTokenResponse)?;
     raw.scope
-        .as_ref()
-        .map(Secret::as_str)
+        .as_deref()
         .filter(|value| scope_matches(value))
         .ok_or(OAuthError::InvalidTokenResponse)?;
     if raw.actor.present
@@ -2202,6 +2203,11 @@ mod tests {
     #[test]
     fn token_response_validation_is_strict_and_redacted() {
         let valid = validate_token_response(valid_token_response()).expect("valid response");
+        // The shape Linear returns: several scopes, space-separated, no actor.
+        let linear = token_response(
+            r#"{"access_token":"access","expires_in":86399,"refresh_token":"refresh","scope":"app:assignable read write","token_type":"Bearer"}"#,
+        );
+        assert!(validate_token_response(linear).is_ok());
         assert_eq!(valid.requested_actor(), REQUESTED_ACTOR);
         let actor_app = token_response(
             r#"{"access_token":"access","refresh_token":"refresh","token_type":"Bearer","expires_in":1,"scope":"read,write,app:assignable","actor":"app"}"#,
