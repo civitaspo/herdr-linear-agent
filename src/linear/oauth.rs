@@ -16,7 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -192,11 +192,8 @@ impl Clock for MonotonicClock {
 pub enum BrowserError {
     /// Browser launching is unsupported on this host.
     #[cfg_attr(
-        all(target_os = "macos", not(test)),
-        expect(
-            dead_code,
-            reason = "constructed only on hosts without `/usr/bin/open`"
-        )
+        all(any(target_os = "macos", target_os = "linux"), not(test)),
+        expect(dead_code, reason = "constructed only on unsupported hosts")
     )]
     Unsupported,
     /// The direct browser-launch command failed.
@@ -226,26 +223,24 @@ trait BrowserLauncher {
     ) -> Result<(), BrowserError>;
 }
 
-/// Direct macOS browser launcher.
-///
-/// Production uses `/usr/bin/open` directly.  No shell is involved and the URL
-/// is never logged by this implementation.
+/// Direct browser launcher: `/usr/bin/open` on macOS, `xdg-open` on Linux.
+/// No shell is involved and the URL is never logged by this implementation.
 #[derive(Debug, Default)]
-struct MacOsBrowserLauncher;
+struct SystemBrowserLauncher;
 
-impl BrowserLauncher for MacOsBrowserLauncher {
+impl BrowserLauncher for SystemBrowserLauncher {
     fn launch(
         &self,
         authorization_url: &str,
         deadline: Instant,
         clock: &dyn Clock,
     ) -> Result<(), BrowserError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             if clock.now() >= deadline {
                 return Err(BrowserError::LaunchFailed);
             }
-            let mut child = Command::new("/usr/bin/open")
+            let mut child = Command::new(crate::files::OPEN_COMMAND)
                 .arg(authorization_url)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -253,7 +248,7 @@ impl BrowserLauncher for MacOsBrowserLauncher {
                 .map_err(|_| BrowserError::LaunchFailed)?;
             wait_for_browser_child(&mut child, deadline, clock, std::thread::sleep)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (authorization_url, deadline, clock);
             Err(BrowserError::Unsupported)
@@ -261,15 +256,15 @@ impl BrowserLauncher for MacOsBrowserLauncher {
     }
 }
 
-// Process seam is compiled for macOS production and unit tests.
-#[cfg(any(target_os = "macos", test))]
+// Process seam is compiled for production hosts and unit tests.
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 trait ChildProcess {
     fn try_wait(&mut self) -> io::Result<Option<bool>>;
     fn kill(&mut self) -> io::Result<()>;
     fn wait(&mut self) -> io::Result<bool>;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl ChildProcess for std::process::Child {
     fn try_wait(&mut self) -> io::Result<Option<bool>> {
         std::process::Child::try_wait(self).map(|status| status.map(|status| status.success()))
@@ -284,7 +279,7 @@ impl ChildProcess for std::process::Child {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn wait_for_browser_child(
     child: &mut dyn ChildProcess,
     deadline: Instant,
@@ -320,7 +315,7 @@ fn wait_for_browser_child(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn terminate_and_reap(child: &mut dyn ChildProcess) {
     let _ = child.kill();
     let _ = child.wait();
@@ -963,7 +958,7 @@ pub fn authorize_production(config: &OAuthConfig) -> Result<TokenBundle, OAuthEr
     let mut random = OsRandom;
     let clock = MonotonicClock;
     let listener_factory = LoopbackCallbackListenerFactory;
-    let browser = MacOsBrowserLauncher;
+    let browser = SystemBrowserLauncher;
     let mut transport = HttpsTokenTransport::new().map_err(OAuthError::TokenTransport)?;
     authorize(
         config,

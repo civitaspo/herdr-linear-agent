@@ -16,3 +16,4 @@ The test suite runs the ticker and the coordinator's commands against a fake Her
 | 10 | What does `Issue.estimate` return for a team with T-shirt estimates? | Read as the Fibonacci scale, as Linear's docs describe. |
 | 11 | Where does `claude -p --output-format json --json-schema` put the schema-checked JSON? | The plugin reads `structured_output`, then `result`, then the whole output. |
 | 12 | Does Linear report the granted scope with commas or spaces? | Both are accepted; the set must equal `read`, `write`, `app:assignable`. |
+| 13 | Does the Secret Service store work on a Linux desktop and in a headless session (for example over SSH, where no keyring runs)? | The store needs a running Secret Service; without one, login and Linear reads fail and the doctor action says so. |

@@ -2,8 +2,8 @@
 # Puts the herdr-linear-agent binary at target/release/herdr-linear-agent.
 #
 # Herdr runs this as the plugin's build step. It downloads the prebuilt binary
-# of the release named by `.release-version` for this machine,
-# checks it against the release's SHA256SUMS, and falls back to
+# of the release named by `.release-version` for this machine (macOS or
+# Linux), checks it against its published SHA-256, and falls back to
 # `cargo build --release --locked` when there is no such binary or it cannot
 # be verified.
 #
@@ -36,13 +36,17 @@ version=$(tr -d '[:space:]' < .release-version 2>/dev/null)
 [ -n "$version" ] || build_from_source ".release-version is missing"
 tag="v$version"
 
-[ "$(uname -s)" = Darwin ] || build_from_source "there is no prebuilt binary for $(uname -s)"
+case "$(uname -s)" in
+  Darwin) os=apple-darwin ;;
+  Linux) os=unknown-linux-musl ;;
+  *) build_from_source "there is no prebuilt binary for $(uname -s)" ;;
+esac
 case "$(uname -m)" in
   arm64 | aarch64) arch=aarch64 ;;
   x86_64 | amd64) arch=x86_64 ;;
   *) build_from_source "there is no prebuilt binary for $(uname -m)" ;;
 esac
-asset="herdr-linear-agent-$arch-apple-darwin"
+asset="herdr-linear-agent-$arch-$os"
 
 # A prebuilt binary matches only the release commit itself. A checkout with
 # local changes, or one on a commit after the release, builds what it has.
@@ -66,21 +70,27 @@ fi
 
 base="https://github.com/civitaspo/herdr-linear-agent/releases/download/$tag"
 command -v curl >/dev/null 2>&1 || build_from_source "curl is not installed"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+else
+  build_from_source "neither sha256sum nor shasum is installed to check the download"
+fi
 
 mkdir -p target/release
 tmp=$(mktemp -d "target/release/.download.XXXXXX") || build_from_source "could not create a download folder"
 trap 'rm -rf "$tmp"' EXIT
 
 say "downloading $asset $tag"
-curl -fsSL --retry 2 --connect-timeout 10 -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" ||
-  build_from_source "could not download $base/SHA256SUMS"
-expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1 }' "$tmp/SHA256SUMS")
-[ -n "$expected" ] || build_from_source "the $tag release has no $asset"
+curl -fsSL --retry 2 --connect-timeout 10 -o "$tmp/$asset.sha256" "$base/$asset.sha256" ||
+  build_from_source "the $tag release has no $asset"
+expected=$(cut -d ' ' -f 1 "$tmp/$asset.sha256")
 curl -fsSL --retry 2 --connect-timeout 10 -o "$tmp/$asset" "$base/$asset" ||
   build_from_source "could not download $base/$asset"
-actual=$(shasum -a 256 "$tmp/$asset" | cut -d ' ' -f 1)
+actual=$(sha256 "$tmp/$asset")
 [ "$actual" = "$expected" ] ||
-  build_from_source "the downloaded $asset does not match its SHA256SUMS entry (got $actual, expected $expected)"
+  build_from_source "the downloaded $asset does not match its published SHA-256 (got $actual, expected $expected)"
 
 chmod 755 "$tmp/$asset"
 reported=$("$tmp/$asset" --version 2>/dev/null)

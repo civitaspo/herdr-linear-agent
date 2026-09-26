@@ -12,6 +12,12 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+/// The command that opens a URL in the user's browser.
+#[cfg(target_os = "macos")]
+pub const OPEN_COMMAND: &str = "/usr/bin/open";
+#[cfg(not(target_os = "macos"))]
+pub const OPEN_COMMAND: &str = "xdg-open";
+
 /// Writes through a temporary file in the same directory plus a rename. It
 /// never creates parent directories: callers create the folders they own.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {

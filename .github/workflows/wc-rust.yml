@@ -1,6 +1,6 @@
 # Rust checks. Commands remain visible and skip until the project manifest exists.
-# They run on macOS, the only platform the plugin supports, so the Keychain
-# code is compiled and linted as it ships.
+# They run on macOS and Linux, the platforms the plugin supports, so the
+# Keychain and Secret Service code is compiled and tested as it ships.
 
 name: rust (workflow_call)
 
@@ -15,8 +15,14 @@ defaults:
 
 jobs:
   rust:
-    name: rust
-    runs-on: macos-latest
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
     permissions:
       contents: read
     timeout-minutes: 20
