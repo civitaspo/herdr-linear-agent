@@ -144,9 +144,11 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 | `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` | Your config |
 | `$XDG_STATE_HOME/herdr-linear-agent/runs/<ISSUE-KEY>/` | A run: `issue.md`, `conversation.md`, worker records and reports, the coordinator's inbox, the outbox |
 | `$XDG_STATE_HOME/herdr-linear-agent/ticker.log` | The ticker's log |
-| `<worktree>/.herdr-linear-agent/<ISSUE-KEY>-<id>/` | A worker's brief and report, excluded from git |
+| `<worktree>/.herdr-linear-agent/<ISSUE-KEY>-<id>/` | A worker's brief and report (see below) |
 
 `$XDG_STATE_HOME` defaults to `~/.local/state` on Linux and macOS alike.
+
+A worker's brief and report live inside its worktree because the worker runs there: sandboxed agents, such as Codex with `-s workspace-write`, can write freely only inside their working directory. To keep that folder out of commits, `worker start` adds `.herdr-linear-agent/` to the repository's `info/exclude`. Every worktree of a repository shares that file with the main checkout, so the rule covers all of them, and it never changes a tracked file such as `.gitignore`. `git add -A`, `git add .` and `git commit -a` all leave the folder out; only a forced `git add -f` would stage it. The ticker copies each report into the run folder (`workers/<id>.md`), so it outlives the worktree.
 
 ## Working with other plugins
 
