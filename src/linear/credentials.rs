@@ -79,8 +79,9 @@ pub enum CredentialError {
     UnsupportedPlatform,
     /// The local OAuth configuration is invalid.
     Configuration,
-    /// The authorization operation failed.
-    Authorization,
+    /// The authorization operation failed at the given step. OAuth errors
+    /// are coarse and carry no provider payload or secret.
+    Authorization(OAuthError),
     /// The credential store could not complete a definitive operation.
     Storage,
     /// The store outcome could not be verified; callers must fail closed.
@@ -116,7 +117,9 @@ impl fmt::Display for CredentialError {
         let message = match self {
             Self::UnsupportedPlatform => "Linear OAuth credentials are unsupported on this host",
             Self::Configuration => "Linear OAuth configuration is invalid",
-            Self::Authorization => "Linear OAuth authorization failed",
+            Self::Authorization(error) => {
+                return write!(formatter, "Linear OAuth authorization failed: {error}");
+            }
             Self::Storage => "Linear OAuth credential storage failed",
             Self::StorageUncertain => "Linear OAuth credential storage could not be verified",
             Self::LockUnavailable => "Linear OAuth credential lock is unavailable",
@@ -1079,9 +1082,9 @@ impl CredentialManager {
         let bundle = self
             .authorizer
             .as_mut()
-            .ok_or(CredentialError::Authorization)?
+            .ok_or(CredentialError::Configuration)?
             .authorize()
-            .map_err(|_| CredentialError::Authorization)?;
+            .map_err(CredentialError::Authorization)?;
         let (access, refresh, lifetime) = bundle.into_credential_parts();
         let now = self.clock.now()?;
         let expires_at_ms = now
@@ -2390,7 +2393,12 @@ mod tests {
                 ))),
             },
         );
-        assert_eq!(manager.login(), Err(CredentialError::Authorization));
+        assert_eq!(
+            manager.login(),
+            Err(CredentialError::Authorization(OAuthError::Browser(
+                crate::linear::oauth::BrowserError::Unsupported
+            )))
+        );
         assert!(manager.load_record().expect("read").is_none());
 
         let mut manager = fake_manager(
