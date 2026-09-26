@@ -837,8 +837,8 @@ fn the_routing_agent_decides_an_unsized_issue() {
         ],
     );
     world.fake().add_issue("DATA-1", "DATA", "Tiny");
+    // The fake agent may answer within the tick that starts it.
     world.tick();
-    assert!(world.run("DATA-1").record().unwrap().routing.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while world.run("DATA-1").record().unwrap().routing.is_some()
         && std::time::Instant::now() < deadline
