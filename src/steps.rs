@@ -1276,7 +1276,7 @@ pub fn flush(
     }
     let since = *failing_since.get_or_insert_with(Instant::now);
     if since.elapsed() >= WRITE_FAILURE_NOTICE && !*notified {
-        let _ = t.herdr.notification_show("Linear Agent", "Linear has not accepted writes for 10 minutes. They are kept and retried; see the ticker log.");
+        let _ = t.herdr.notification_show("herdr-linear-agent", "Linear has not accepted writes for 10 minutes. They are kept and retried; see the ticker log.");
         *notified = true;
     }
 }

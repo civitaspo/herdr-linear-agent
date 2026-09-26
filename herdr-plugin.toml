@@ -1,8 +1,8 @@
 id = "herdr-linear-agent"
-name = "Linear Agent"
+name = "herdr-linear-agent"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
-description = "Run a coordinator and per-repository workers for Linear issues delegated to this agent."
+description = "Run coding agents in Herdr for Linear issues delegated to this plugin's Linear app user. Not Linear's built-in Linear Agent."
 platforms = ["macos", "linux"]
 
 [[build]]
@@ -14,43 +14,43 @@ command = ["target/release/herdr-linear-agent", "startup"]
 
 [[actions]]
 id = "login"
-title = "Linear Agent: log in to Linear"
+title = "herdr-linear-agent: log in to Linear"
 contexts = ["global"]
 command = ["target/release/herdr-linear-agent", "action", "login"]
 
 [[actions]]
 id = "status"
-title = "Linear Agent: status"
+title = "herdr-linear-agent: status"
 contexts = ["global", "workspace"]
 command = ["target/release/herdr-linear-agent", "action", "status"]
 
 [[actions]]
 id = "open-issue"
-title = "Linear Agent: open this run's issue"
+title = "herdr-linear-agent: open this run's issue"
 contexts = ["pane"]
 command = ["target/release/herdr-linear-agent", "action", "open-issue"]
 
 [[actions]]
 id = "focus-run"
-title = "Linear Agent: focus the run of a Linear issue"
+title = "herdr-linear-agent: focus the run of a Linear issue"
 contexts = ["global"]
 command = ["target/release/herdr-linear-agent", "action", "focus-run"]
 
 [[actions]]
 id = "pause"
-title = "Linear Agent: stop taking new issues"
+title = "herdr-linear-agent: stop taking new issues"
 contexts = ["global"]
 command = ["target/release/herdr-linear-agent", "action", "pause"]
 
 [[actions]]
 id = "resume"
-title = "Linear Agent: take new issues again"
+title = "herdr-linear-agent: take new issues again"
 contexts = ["global"]
 command = ["target/release/herdr-linear-agent", "action", "resume"]
 
 [[actions]]
 id = "doctor"
-title = "Linear Agent: check setup"
+title = "herdr-linear-agent: check setup"
 contexts = ["global"]
 command = ["target/release/herdr-linear-agent", "action", "doctor"]
 

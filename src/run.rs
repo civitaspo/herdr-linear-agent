@@ -273,7 +273,7 @@ impl Run {
     pub fn append_conversation(&self, created: &str, user_id: &str, body: &str) -> Result<()> {
         let _lock = self.lock()?;
         let path = self.conversation_md();
-        let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| "# Conversation\n\nReplies from allowed users in the Linear Agent Session, oldest first.\n".to_string());
+        let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| "# Conversation\n\nReplies from allowed users in the issue's Agent Session, oldest first.\n".to_string());
         text.push_str(&format!(
             "\n## {created} (user {user_id})\n\n{}\n",
             body.trim()

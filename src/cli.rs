@@ -13,7 +13,7 @@ use crate::runner::RealRunner;
 use crate::{progress, ticker};
 
 #[derive(Parser)]
-#[command(name = "herdr-linear-agent", version = crate::VERSION, about = "Run a coordinator and per-repository workers for Linear issues delegated to this agent")]
+#[command(name = "herdr-linear-agent", version = crate::VERSION, about = "Run a coordinator and per-repository workers for Linear issues delegated to this plugin's Linear app user")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

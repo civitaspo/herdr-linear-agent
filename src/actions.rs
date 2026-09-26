@@ -15,7 +15,7 @@ use crate::run::{AgentStatus, Run, Status};
 use crate::runner::Cmd;
 use crate::{ticker, worker};
 
-const TITLE: &str = "Linear Agent";
+const TITLE: &str = "herdr-linear-agent";
 
 /// Prints `body` and shows it as a notification in the invoking session, or
 /// in the configured one.
