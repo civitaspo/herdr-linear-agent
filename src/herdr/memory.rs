@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use tokio::sync::oneshot;
+
 use super::{Agent, AgentStatus, Herdr, HerdrError, Pane, PaneId, Placed, Snapshot, WorkspaceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,9 @@ struct Model {
     start_not_sent: bool,
     /// Every request fails as `NotSent`.
     down: bool,
+    /// The next snapshot is built, then answered only after the test let
+    /// it go: whatever runs meanwhile is newer than the snapshot.
+    hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 #[derive(Clone)]
@@ -129,6 +134,45 @@ impl Model {
         self.panes.retain(|_, p| p.workspace != *workspace);
         let panes = &self.panes;
         self.agents.retain(|pane, _| panes.contains_key(pane));
+    }
+
+    fn snapshot(&mut self) -> Result<Snapshot, HerdrError> {
+        self.request("session.snapshot")?;
+        let mut agents = Vec::new();
+        for fake in self.agents.values_mut() {
+            if fake.hidden_for > 0 {
+                fake.hidden_for -= 1;
+            } else {
+                agents.push(fake.agent.clone());
+            }
+        }
+        let hidden: Vec<PaneId> = self.hidden_panes.keys().cloned().collect();
+        self.hidden_panes.retain(|_, left| {
+            *left -= 1;
+            *left > 0
+        });
+        let panes: BTreeMap<PaneId, Pane> = self
+            .panes
+            .iter()
+            .filter(|(id, _)| !hidden.contains(id))
+            .map(|(id, pane)| (id.clone(), pane.clone()))
+            .collect();
+        agents.retain(|a| !hidden.contains(&a.pane));
+        let workspaces = panes
+            .values()
+            .map(|p| {
+                let label = self.labels.get(&p.workspace).cloned().unwrap_or_default();
+                (p.workspace.clone(), label)
+            })
+            .collect();
+        Ok(Snapshot {
+            version: "0.9.1".into(),
+            protocol: 22,
+            panes,
+            agents,
+            workspaces,
+            skipped: 0,
+        })
     }
 
     fn agent_in(&self, pane: &PaneId) -> Result<(), HerdrError> {
@@ -239,6 +283,15 @@ impl FakeHerdr {
         self.model().start_not_sent = true;
     }
 
+    /// Holds the next snapshot's answer: the first receiver fires once it
+    /// is built, and the answer goes out when the sender is used.
+    pub fn hold_next_snapshot(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (taken_tx, taken) = oneshot::channel();
+        let (go, go_rx) = oneshot::channel();
+        self.model().hold = Some((taken_tx, go_rx));
+        (taken, go)
+    }
+
     pub fn set_down(&self, down: bool) {
         self.model().down = down;
     }
@@ -288,43 +341,16 @@ impl FakeHerdr {
 
 impl Herdr for FakeHerdr {
     async fn snapshot(&self) -> Result<Snapshot, HerdrError> {
-        let mut model = self.model();
-        model.request("session.snapshot")?;
-        let mut agents = Vec::new();
-        for fake in model.agents.values_mut() {
-            if fake.hidden_for > 0 {
-                fake.hidden_for -= 1;
-            } else {
-                agents.push(fake.agent.clone());
-            }
+        let (snapshot, hold) = {
+            let mut model = self.model();
+            let snapshot = model.snapshot()?;
+            (snapshot, model.hold.take())
+        };
+        if let Some((taken, go)) = hold {
+            let _ = taken.send(());
+            let _ = go.await;
         }
-        let hidden: Vec<PaneId> = model.hidden_panes.keys().cloned().collect();
-        model.hidden_panes.retain(|_, left| {
-            *left -= 1;
-            *left > 0
-        });
-        let panes: BTreeMap<PaneId, Pane> = model
-            .panes
-            .iter()
-            .filter(|(id, _)| !hidden.contains(id))
-            .map(|(id, pane)| (id.clone(), pane.clone()))
-            .collect();
-        agents.retain(|a| !hidden.contains(&a.pane));
-        let workspaces = panes
-            .values()
-            .map(|p| {
-                let label = model.labels.get(&p.workspace).cloned().unwrap_or_default();
-                (p.workspace.clone(), label)
-            })
-            .collect();
-        Ok(Snapshot {
-            version: "0.9.1".into(),
-            protocol: 22,
-            panes,
-            agents,
-            workspaces,
-            skipped: 0,
-        })
+        Ok(snapshot)
     }
 
     async fn workspace_create(&self, cwd: &str, label: &str) -> Result<Placed, HerdrError> {

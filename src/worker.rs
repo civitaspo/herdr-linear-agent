@@ -46,6 +46,9 @@ pub struct Worker {
     pub pr_url: String,
     /// The "lost its pane before a report" error was sent.
     pub gone_reported: bool,
+    /// `worker restart` is moving it to a new pane: the watcher leaves it
+    /// alone until a snapshot shows the recorded pane.
+    pub restarting: bool,
     pub created: String,
     pub updated: String,
     pub agent: AgentRecord,

@@ -347,6 +347,43 @@ impl World {
         }
     }
 
+    /// One round whose pass takes its snapshot, then waits while
+    /// `worker restart DATA-1 <id>` runs, and applies the older snapshot to
+    /// the newer records.
+    pub async fn restart_worker_mid_pass(&mut self, id: &str) -> Worker {
+        let (taken, go) = self.herdr.hold_next_snapshot();
+        let wake = self.round().await;
+        let level = self.task.level().clone();
+        let ctx = Ctx {
+            env: &self.env,
+            runner: &self.runner,
+            detached_ticker: false,
+        };
+        let deps = Deps {
+            ctx: &ctx,
+            config: &self.config,
+            herdr: &self.herdr,
+            socket: SOCKET,
+            log: &self.log,
+        };
+        let session = Session {
+            herdr: self.herdr.clone(),
+            socket: SOCKET.into(),
+        };
+        let pass = self.reconciler.pass(&deps, &level, wake, self.now);
+        let restart = async {
+            taken.await.expect("the pass took no snapshot");
+            let restarted = commands::worker_restart(&ctx, &session, "DATA-1", id, None)
+                .await
+                .unwrap();
+            go.send(()).unwrap();
+            restarted
+        };
+        let ((), restarted) = tokio::join!(pass, restart);
+        self.seen_level = level;
+        restarted
+    }
+
     /// The deadline the reconciler would sleep until after the last pass.
     pub fn deadline(&self) -> Timestamp {
         let ctx = self.ctx();

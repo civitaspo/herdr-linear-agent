@@ -505,6 +505,49 @@ pub async fn worker_prompt<H: Herdr>(
     Ok(())
 }
 
+/// The restarted worker's new pane: its kept worktree opened again, or a
+/// worktree placed from its base when it never had one.
+async fn reopen<H: Herdr>(
+    ctx: &Ctx<'_>,
+    config: &Config,
+    session: &Session<H>,
+    w: &Worker,
+) -> Result<Placed> {
+    let id = &w.id;
+    if !w.worktree_path.is_empty() {
+        if !w.agent.workspace_id.is_empty() {
+            // The checkout stays; a workspace that is already gone is fine.
+            let _ = session
+                .herdr
+                .workspace_close(&WorkspaceId(w.agent.workspace_id.clone()))
+                .await;
+        }
+        return session
+            .herdr
+            .worktree_open(&w.worktree_path)
+            .await
+            .with_context(|| format!("could not open the worktree of {id}"));
+    }
+    let repo = config.repository(&w.repo)?.clone();
+    let repo_path = repo.path.to_string_lossy().into_owned();
+    match find_worktree(ctx.runner, &repo_path, &w.branch).await {
+        // A creation whose answer was lost left the checkout behind.
+        Some(path) => session
+            .herdr
+            .worktree_open(&path)
+            .await
+            .with_context(|| format!("could not open the worktree of {id}")),
+        // The worktree was never created: place it again from its base.
+        None => {
+            fetch(ctx.runner, &repo).await?;
+            let base = format!("origin/{}", repo.base);
+            create_worktree(ctx.runner, &session.herdr, &repo_path, &w.branch, &base)
+                .await
+                .with_context(|| format!("could not create the worktree for {id}"))
+        }
+    }
+}
+
 /// Starts a worker again in its worktree, optionally with another profile.
 pub async fn worker_restart<H: Herdr>(
     ctx: &Ctx<'_>,
@@ -532,38 +575,30 @@ pub async fn worker_restart<H: Herdr>(
     if !w.counts() {
         check_agents(ctx, config.limits)?;
     }
-    let placed = if w.worktree_path.is_empty() {
-        let repo = config.repository(&w.repo)?.clone();
-        let repo_path = repo.path.to_string_lossy().into_owned();
-        match find_worktree(ctx.runner, &repo_path, &w.branch).await {
-            // A creation whose answer was lost left the checkout behind.
-            Some(path) => session
-                .herdr
-                .worktree_open(&path)
-                .await
-                .with_context(|| format!("could not open the worktree of {id}"))?,
-            // The worktree was never created: place it again from its base.
-            None => {
-                fetch(ctx.runner, &repo).await?;
-                let base = format!("origin/{}", repo.base);
-                create_worktree(ctx.runner, &session.herdr, &repo_path, &w.branch, &base)
-                    .await
-                    .with_context(|| format!("could not create the worktree for {id}"))?
-            }
+    // Before the old workspace closes, so a pass woken by the close finds
+    // a worker the watcher leaves alone rather than one whose pane is gone.
+    worker::update(&run, id, |w| {
+        w.restarting = true;
+        w.gone_reported = false;
+        w.agent.status = AgentStatus::Open;
+        w.agent.workspace_id.clear();
+        w.agent.tab_id.clear();
+        w.agent.pane_id.clear();
+        w.agent.prompt_pending = true;
+        w.agent.last_group.clear();
+        w.agent.blocked_reported = false;
+    })?;
+    let placed = match reopen(ctx, &config, session, &w).await {
+        Ok(placed) => placed,
+        Err(error) => {
+            let message = format!("{error:#}");
+            worker::update(&run, id, |w| {
+                w.restarting = false;
+                w.agent.status = AgentStatus::Failed;
+                w.agent.error = message;
+            })?;
+            return Err(error);
         }
-    } else {
-        if !w.agent.workspace_id.is_empty() {
-            // The checkout stays; a workspace that is already gone is fine.
-            let _ = session
-                .herdr
-                .workspace_close(&WorkspaceId(w.agent.workspace_id.clone()))
-                .await;
-        }
-        session
-            .herdr
-            .worktree_open(&w.worktree_path)
-            .await
-            .with_context(|| format!("could not open the worktree of {id}"))?
     };
     let reset = worker::update(&run, id, |w| {
         w.restarts += 1;

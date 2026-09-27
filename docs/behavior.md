@@ -657,7 +657,7 @@ The tokens are stored in worker records, so existing values must keep parsing.
 
 ### Worker watch (`watch_worker`)
 
-For every worker that is `open` or `failed`:
+For every worker that is `open` or `failed`, except an `open` worker without a pane, which is between two panes and never judged gone, and a `restarting` one until a snapshot shows its recorded pane (or 30 s passed without it), which clears `restarting`: `tests/scenarios:a_worker_without_a_pane_is_never_judged_gone`
 
 1. Track it.
 2. Report: when `report_hash` of the report file differs from the stored one, copy the report home, store the new hash, and read the home copy. When it has a PR line different from `pr_url`: queue the action `Pull request` with parameter `<url> (worker <id>, repo <repo>)` and no result; add `{label: "<id> <repo> PR", url}` to the run's `external_urls` once; queue the full URL list; store `pr_url`. A report written in this pass counts for the group at once.
@@ -701,6 +701,8 @@ For an active run whose coordinator is `pending`:
 4. `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane whose cwd is `canonical_dir` and that is empty or holds our agent (kind and name) is adopted instead of creating a second workspace; the label is not compared, since a title edit changes it. With our agent in it, the adopted coordinator is prompted, not started. `tests/scenarios:a_placement_without_an_answer_is_adopted_after_a_title_edit` Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 
 A placement failure counts as a launch attempt (see below); `NotSent` and `OutcomeUnknown` do not.
+
+Effect results are applied only to records that did not move on, decided under the run lock when the result is applied: a placement only while the run is active and the coordinator still `pending` (otherwise the new workspace is closed), a start or its failure only while the run is active and the agent is still `open` in the pane the start went to. Other results are dropped. `tests/scenarios:a_start_result_for_a_pane_the_worker_left_is_dropped`
 
 ### Start
 
@@ -841,7 +843,7 @@ Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `wor
 
 ### Worker record (`workers/<id>.toml`)
 
-Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `gone_reported`, `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
+Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
 
 | Operation | Behavior |
 | --- | --- |
@@ -898,6 +900,7 @@ Input: issue key, title, URL, worker, task, restart flag, binary. Order in the t
 
 - At most 2 restarts per worker; the third fails with a message containing `limit is 2`.
 - A new profile must be a worker profile; without one the profile stays.
+- Under the run lock, before the old workspace is closed, the worker is marked `restarting`: its pane is cleared, `prompt_pending` set, `gone_reported`, `last_group` and `blocked_reported` reset. Only then are the workspace closed and the new pane opened. A failure there leaves the worker `failed`, no longer restarting. `tests/scenarios:a_restart_between_a_snapshot_and_its_pass_keeps_the_new_pane`
 - A worker without a `worktree_path` first looks for its branch's worktree (`git worktree list --porcelain`) and opens it when it exists; otherwise it is placed again from its base. `src/commands.rs:a_restart_opens_the_worktree_a_lost_answer_left_behind`
 - Close the old workspace (the checkout stays), open the kept worktree again with `worktree.open` and `path` = `worktree_path`, record the new pane, rewrite the brief with the restart note, set `restarts += 1`, `kind` of the profile, `open`, `prompt_pending`, `launch_attempts = 0`. The ticker starts it in a later pass with the new profile's arguments.
 - `tests/scenarios:restarts_switch_profiles_and_are_limited` (kind `codex`, restarts 1, one workspace closed, `previous attempt` in the brief, `model_reasoning_effort=xhigh` in the next start).

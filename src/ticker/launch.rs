@@ -7,7 +7,7 @@ use jiff::Timestamp;
 
 use super::reconcile::{
     AgentKey, DETECTION_GRACE, Deps, Effect, EffectDone, MAX_LAUNCH_ATTEMPTS, Reconciler,
-    error_activity, update_run, update_worker,
+    error_activity, update_run,
 };
 use crate::config::Config;
 use crate::herdr::{Herdr, HerdrError, PaneId, Placed, Snapshot};
@@ -120,32 +120,44 @@ impl Reconciler {
         result: Result<Placed, HerdrError>,
         now: Timestamp,
     ) -> Result<()> {
-        let record = run.record()?;
         match result {
             Ok(placed) => {
-                if record.status != Status::Active
-                    || record.coordinator.status != AgentStatus::Pending
-                {
-                    // The run moved on while the workspace was created.
+                let (workspace, tab, pane, cwd) = (
+                    placed.workspace.0.clone(),
+                    placed.tab.clone(),
+                    placed.pane.0.clone(),
+                    placed.cwd.clone(),
+                );
+                // Decided under the lock: the run may have moved on while
+                // the workspace was created.
+                let applied = self
+                    .guarded(run, move |run, lock| {
+                        let record = run.record()?;
+                        if record.status != Status::Active
+                            || record.coordinator.status != AgentStatus::Pending
+                        {
+                            return Ok((false, Vec::new()));
+                        }
+                        run.update_held(lock, |r| {
+                            place_coordinator(r, &workspace, &tab, &pane, &cwd)
+                        })?;
+                        Ok((true, Vec::new()))
+                    })
+                    .await?;
+                if !applied {
                     let _ = d.herdr.workspace_close(&placed.workspace).await;
-                    return Ok(());
                 }
-                update_run(run, move |r| {
-                    place_coordinator(
-                        r,
-                        &placed.workspace.0,
-                        &placed.tab,
-                        &placed.pane.0,
-                        &placed.cwd,
-                    );
-                })
-                .await?;
                 Ok(())
             }
             // The next snapshot shows whether it was placed.
             Err(HerdrError::OutcomeUnknown(_)) => {
                 let at = now.to_string();
-                update_run(run, move |r| r.coordinator.last_attempt_at = at).await?;
+                update_run(run, move |r| {
+                    if r.status == Status::Active && r.coordinator.status == AgentStatus::Pending {
+                        r.coordinator.last_attempt_at = at;
+                    }
+                })
+                .await?;
                 Ok(())
             }
             // Herdr down is not an attempt; the next one waits 15 s.
@@ -153,7 +165,10 @@ impl Reconciler {
                 self.not_sent.insert(key.clone(), now);
                 Ok(())
             }
-            Err(error) => self.attempt_failed(run, key, &error.to_string(), now).await,
+            Err(error) => {
+                self.attempt_failed(run, key, None, &error.to_string(), now)
+                    .await
+            }
         }
     }
 
@@ -165,6 +180,14 @@ impl Reconciler {
         result: Result<(), HerdrError>,
         now: Timestamp,
     ) -> Result<()> {
+        // A result for a pane the agent left (a restart, a close) is dropped.
+        let current = self
+            .agent_record(run, key)
+            .is_ok_and(|a| a.status == AgentStatus::Open && a.pane_id == pane)
+            && run.record().is_ok_and(|r| r.status == Status::Active);
+        if !current {
+            return Ok(());
+        }
         match result {
             // Herdr may not show the agent yet: it is not started again while
             // the grace lasts.
@@ -176,8 +199,60 @@ impl Reconciler {
                 self.not_sent.insert(key.clone(), now);
                 Ok(())
             }
-            Err(error) => self.attempt_failed(run, key, &error.to_string(), now).await,
+            Err(error) => {
+                self.attempt_failed(run, key, Some(pane), &error.to_string(), now)
+                    .await
+            }
         }
+    }
+
+    /// Counts a failed placement (`pane` none: the agent must still be
+    /// pending) or start (the agent must still be open in `pane`) of an
+    /// active run; the third fails the agent. Decided under the lock.
+    async fn attempt_failed(
+        &mut self,
+        run: &Run,
+        key: &AgentKey,
+        pane: Option<String>,
+        error: &str,
+        now: Timestamp,
+    ) -> Result<()> {
+        let (message, at) = (error.to_string(), now.to_string());
+        let activity = error_activity(format!("Could not start the {} agent: {error}", key.role()));
+        let worker_id = key.worker.clone();
+        self.guarded(run, move |run, lock| {
+            let record = run.record()?;
+            let agent = match &worker_id {
+                None => record.coordinator.clone(),
+                Some(id) => worker::load(run, id)?.agent,
+            };
+            let current = match &pane {
+                None => agent.status == AgentStatus::Pending,
+                Some(pane) => agent.status == AgentStatus::Open && agent.pane_id == *pane,
+            };
+            if record.status != Status::Active || !current {
+                return Ok(((), Vec::new()));
+            }
+            let count = |a: &mut AgentRecord| {
+                a.launch_attempts += 1;
+                a.last_attempt_at = at;
+                if a.launch_attempts >= MAX_LAUNCH_ATTEMPTS {
+                    a.status = AgentStatus::Failed;
+                    a.error = message;
+                }
+            };
+            let failed = match &worker_id {
+                None => {
+                    run.update_held(lock, |r| count(&mut r.coordinator))?
+                        .coordinator
+                }
+                Some(id) => worker::update_held(run, lock, id, |w| count(&mut w.agent))?.agent,
+            }
+            .status
+                == AgentStatus::Failed;
+            Ok(((), if failed { vec![activity] } else { Vec::new() }))
+        })
+        .await
     }
 
     /// A start Herdr has not detected once the grace ended counts as an
@@ -201,41 +276,9 @@ impl Reconciler {
             if pane_is_empty(snapshot, &pane) {
                 let grace = DETECTION_GRACE.as_secs();
                 let error = format!("Herdr did not detect the agent within {grace} s");
-                self.attempt_failed(run, &key, &error, now).await?;
+                self.attempt_failed(run, &key, Some(pane), &error, now)
+                    .await?;
             }
-        }
-        Ok(())
-    }
-
-    /// Counts a failed placement or start; the third fails the agent.
-    async fn attempt_failed(
-        &mut self,
-        run: &Run,
-        key: &AgentKey,
-        error: &str,
-        now: Timestamp,
-    ) -> Result<()> {
-        let (message, at) = (error.to_string(), now.to_string());
-        let mut failed = false;
-        let record = self.agent_record(run, key)?;
-        if record.launch_attempts + 1 >= MAX_LAUNCH_ATTEMPTS {
-            failed = true;
-        }
-        self.set_agent(run, key, move |a| {
-            a.launch_attempts += 1;
-            a.last_attempt_at = at;
-            if a.launch_attempts >= MAX_LAUNCH_ATTEMPTS {
-                a.status = AgentStatus::Failed;
-                a.error = message;
-            }
-        })
-        .await?;
-        if failed {
-            self.push(
-                run,
-                error_activity(format!("Could not start the {} agent: {error}", key.role())),
-            )
-            .await?;
         }
         Ok(())
     }
@@ -245,22 +288,6 @@ impl Reconciler {
             None => run.record()?.coordinator,
             Some(id) => worker::load(run, id)?.agent,
         })
-    }
-
-    async fn set_agent(
-        &self,
-        run: &Run,
-        key: &AgentKey,
-        change: impl FnOnce(&mut AgentRecord) + Send + 'static,
-    ) -> Result<()> {
-        match &key.worker {
-            None => update_run(run, move |r| change(&mut r.coordinator))
-                .await
-                .map(|_| ()),
-            Some(id) => update_worker(run, id, move |w| change(&mut w.agent))
-                .await
-                .map(|_| ()),
-        }
     }
 
     fn start_in_flight(&self, run: &str) -> bool {

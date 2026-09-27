@@ -1176,3 +1176,76 @@ async fn a_placement_without_an_answer_is_adopted_after_a_title_edit() {
     );
     assert_eq!(to(&world, &panes[0].id.0), [LAUNCH]);
 }
+
+// ---------------------------------------------------------------- races
+
+#[tokio::test]
+async fn a_restart_between_a_snapshot_and_its_pass_keeps_the_new_pane() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    let again = world.restart_worker_mid_pass("w1").await;
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert!(
+        world.bodies(KEY, "error").is_empty(),
+        "{:?}",
+        world.bodies(KEY, "error")
+    );
+    assert!(!mentions(&world.inbox(KEY), "closed before"));
+    let w = world.worker(KEY, "w1");
+    assert_eq!(w.agent.pane_id, again.agent.pane_id);
+    assert_eq!(
+        to(&world, &w.agent.pane_id).len(),
+        1,
+        "started and prompted"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_without_a_pane_is_never_judged_gone() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    // A restart has cleared the pane and closed the workspace; the new one
+    // is not open yet.
+    world.run(KEY).update(|_| ()).unwrap();
+    crate::worker::update(&world.run(KEY), "w1", |w| {
+        w.agent.pane_id.clear();
+        w.agent.prompt_pending = true;
+    })
+    .unwrap();
+    world.herdr.remove_workspace(&w.agent.workspace_id);
+    world.later(5);
+    world.settle().await;
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(!mentions(&world.inbox(KEY), "closed before"));
+}
+
+#[tokio::test]
+async fn a_start_result_for_a_pane_the_worker_left_is_dropped() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let first = world.start_worker("api").await;
+    world.herdr.fail_next_start("startup_failed");
+    world.once().await;
+    // The start in the first pane is out when the coordinator restarts it.
+    let again = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
+        .await
+        .unwrap();
+    assert_ne!(again.agent.pane_id, first.agent.pane_id);
+    world.settle().await;
+    let w = world.worker(KEY, "w1");
+    assert_eq!(w.agent.launch_attempts, 0);
+    let in_new: Vec<PaneId> = world
+        .herdr
+        .starts()
+        .into_iter()
+        .map(|s| s.pane)
+        .filter(|p| p.0 == again.agent.pane_id)
+        .collect();
+    assert_eq!(in_new.len(), 1);
+}

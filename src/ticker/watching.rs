@@ -4,11 +4,11 @@ use anyhow::Result;
 use jiff::Timestamp;
 
 use super::reconcile::{
-    COORDINATOR_IDLE, Deps, HEARTBEAT, Reconciler, apply_tracked, elicitation, error_activity,
-    inbox_item, since, update_worker,
+    COORDINATOR_IDLE, Deps, HEARTBEAT, PANE_GRACE, Reconciler, apply_tracked, elicitation,
+    error_activity, inbox_item, since, update_worker,
 };
 use crate::agents;
-use crate::herdr::{Herdr, Snapshot};
+use crate::herdr::{Herdr, PaneId, Snapshot};
 use crate::linear::api::{Activity, Content, ExternalUrl};
 use crate::outbox::{self, Op};
 use crate::run::{AgentRecord, AgentStatus, Run};
@@ -155,13 +155,42 @@ impl Reconciler {
                 d.notify(&title, &body).await;
             }
         }
-        for w in worker::list(run)
+        for mut w in worker::list(run)
             .into_iter()
             .filter(|w| matches!(w.agent.status, AgentStatus::Open | AgentStatus::Failed))
         {
+            // A worker between two panes is neither gone nor anywhere yet.
+            if w.agent.status == AgentStatus::Open && w.agent.pane_id.is_empty() {
+                continue;
+            }
+            if w.restarting {
+                if !self.restart_landed(snapshot, &w.agent.pane_id, now) {
+                    continue;
+                }
+                let pane = w.agent.pane_id.clone();
+                w = update_worker(run, &w.id, move |r| {
+                    if r.agent.pane_id == pane {
+                        r.restarting = false;
+                    }
+                })
+                .await?;
+                if w.restarting {
+                    continue;
+                }
+            }
             self.watch_worker(d, snapshot, run, &label, &w, now).await?;
         }
         Ok(())
+    }
+
+    /// Whether a restarted worker's new pane is in a snapshot taken after
+    /// the restart, or has been missing longer than the pane grace.
+    fn restart_landed(&mut self, snapshot: &Snapshot, pane: &str, now: Timestamp) -> bool {
+        if snapshot.panes.contains_key(&PaneId(pane.to_string())) {
+            return true;
+        }
+        let first = *self.missing_since.entry(pane.to_string()).or_insert(now);
+        now.duration_since(first) >= PANE_GRACE
     }
 
     /// The Linear writes of a worker are queued in the critical section
