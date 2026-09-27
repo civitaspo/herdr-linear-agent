@@ -408,43 +408,72 @@ async fn linear(config: &Config, state_dir: &Path, links: Links, log: Arc<Log>) 
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
     use crate::paths::Env;
     use crate::process::fake::FakeRunner;
 
-    fn held(version: &str) -> LockState {
+    const MINE: &str = "0.2.0+b1d";
+    const RELEASE_WAIT: Duration = Duration::from_secs(5);
+
+    fn held_by(version: &str, pid: u32, started: &str) -> LockState {
         LockState::Held(Info {
             version: version.into(),
-            ..Info::default()
+            pid,
+            started: started.into(),
         })
     }
 
+    /// Takes the ticker lock the way another process would and writes `info`
+    /// into it; the lock lasts as long as the returned file.
+    fn grab_lock(state_dir: &Path, info: &str) -> File {
+        let mut file = File::create(lock_path(state_dir)).unwrap();
+        file.try_lock().unwrap();
+        file.write_all(info.as_bytes()).unwrap();
+        file
+    }
+
+    /// Another test may fork while the lock file is open, so the release is
+    /// observed by polling.
+    async fn released(state_dir: &Path) -> bool {
+        let give_up = tokio::time::Instant::now() + RELEASE_WAIT;
+        while lock_state(state_dir) != LockState::Free {
+            if tokio::time::Instant::now() >= give_up {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
     #[test]
-    fn start_decisions() {
-        assert_eq!(
-            decide_start(&LockState::Free, "v1", false),
-            StartAction::Spawn
-        );
-        assert_eq!(
-            decide_start(&LockState::Free, "v1", true),
-            StartAction::Spawn
-        );
-        assert_eq!(decide_start(&held("v1"), "v1", false), StartAction::Nothing);
-        assert_eq!(
-            decide_start(&held("v0"), "v1", false),
-            StartAction::StopThenSpawn
-        );
-        // A stop in progress: finish it, then spawn.
-        assert_eq!(
-            decide_start(&held("v1"), "v1", true),
-            StartAction::StopThenSpawn
-        );
+    fn start_spawns_leaves_or_replaces_by_the_holders_version() {
+        let table = [
+            (LockState::Free, false, StartAction::Spawn),
+            (LockState::Free, true, StartAction::Spawn),
+            (held_by(MINE, 11, ""), false, StartAction::Nothing),
+            (
+                held_by("0.1.0+a0a", 11, ""),
+                false,
+                StartAction::StopThenSpawn,
+            ),
+            (
+                held_by("0.1.0+a0a", 11, ""),
+                true,
+                StartAction::StopThenSpawn,
+            ),
+            (held_by(MINE, 11, ""), true, StartAction::StopThenSpawn),
+        ];
+        for (lock, stop_file, expected) in table {
+            assert_eq!(
+                decide_start(&lock, MINE, stop_file),
+                expected,
+                "{lock:?} with stop file {stop_file}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn start_creates_nothing_without_a_config() {
+    async fn without_a_config_start_neither_spawns_nor_creates_the_state_folder() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
@@ -455,139 +484,155 @@ mod tests {
         };
         start(&ctx).await.unwrap();
         assert!(!env.state_dir().exists());
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
-    fn wait_until_free(state_dir: &Path) {
-        // Another test may fork a child at this instant; until that child
-        // execs, it shares the locked descriptor.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while lock_state(state_dir) != LockState::Free && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn lock_probe_sees_a_holder_and_its_version() {
+    #[tokio::test]
+    async fn a_probe_reports_the_holders_version_pid_and_start() {
         let state = tempfile::tempdir().unwrap();
         assert_eq!(lock_state(state.path()), LockState::Free);
-        let mut file = File::options()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path(state.path()))
-            .unwrap();
-        file.lock().unwrap();
-        file.write_all(br#"{"version":"v9","pid":1}"#).unwrap();
-        match lock_state(state.path()) {
-            LockState::Held(info) => assert_eq!(info.version, "v9"),
-            LockState::Free => panic!("lock should be held"),
-        }
-        assert!(describe(state.path()).starts_with("ticker v9 running since"));
-        drop(file);
-        wait_until_free(state.path());
-        assert_eq!(lock_state(state.path()), LockState::Free);
+        assert_eq!(describe(state.path()), "ticker not running");
+
+        let holder = grab_lock(
+            state.path(),
+            r#"{"version":"9.9.9+feed","pid":4242,"started":"2026-09-28T09:00:00Z"}"#,
+        );
+        assert_eq!(
+            lock_state(state.path()),
+            held_by("9.9.9+feed", 4242, "2026-09-28T09:00:00Z")
+        );
+        assert_eq!(
+            describe(state.path()),
+            "ticker 9.9.9+feed running since 2026-09-28T09:00:00Z (pid 4242)"
+        );
+
+        drop(holder);
+        assert!(released(state.path()).await);
         assert!(describe(state.path()).contains("not running"));
     }
 
     #[tokio::test]
-    async fn stop_with_a_free_lock_removes_a_stale_stop_file() {
+    async fn stop_without_a_holder_only_clears_a_leftover_stop_file() {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(stop_path(state.path()), b"").unwrap();
         stop(state.path()).await.unwrap();
         assert!(!stop_path(state.path()).exists());
+        assert_eq!(lock_state(state.path()), LockState::Free);
     }
 
     #[tokio::test]
-    async fn one_ticker_holds_the_lock_with_its_version() {
+    async fn the_running_ticker_holds_the_lock_alone_and_names_this_build() {
         let state = tempfile::tempdir().unwrap();
-        let lock = acquire(state.path()).await.unwrap();
-        match lock_state(state.path()) {
-            LockState::Held(info) => {
-                assert_eq!(
-                    (info.version.as_str(), info.pid),
-                    (VERSION, std::process::id())
-                );
-                assert!(!info.started.is_empty());
-            }
-            LockState::Free => panic!("lock should be held"),
-        }
+        let owner = acquire(state.path()).await.unwrap();
+        let LockState::Held(info) = lock_state(state.path()) else {
+            panic!("the lock is free while a ticker holds it");
+        };
+        assert_eq!(info.version, VERSION);
+        assert_eq!(info.pid, std::process::id());
+        assert!(
+            info.started.parse::<Timestamp>().is_ok(),
+            "{}",
+            info.started
+        );
         assert_eq!(
             decide_start(&lock_state(state.path()), VERSION, false),
             StartAction::Nothing
         );
-        let error = acquire(state.path()).await.unwrap_err().to_string();
-        assert!(error.starts_with("another ticker runs"), "{error}");
-        drop(lock);
-        wait_until_free(state.path());
+
+        let rival = acquire(state.path()).await.unwrap_err().to_string();
+        assert!(rival.contains("another ticker runs"), "{rival}");
+
+        drop(owner);
+        assert!(released(state.path()).await);
         drop(acquire(state.path()).await.unwrap());
     }
 
     #[tokio::test]
-    async fn a_ticker_of_another_version_is_stopped_before_the_new_one_starts() {
+    async fn a_ticker_of_an_older_build_is_stopped_before_this_build_takes_over() {
         let state = tempfile::tempdir().unwrap();
         let dir = state.path().to_path_buf();
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        // The old ticker: holds the lock until it sees the stop file.
-        let old = std::thread::spawn(move || {
-            let mut file = File::options()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(lock_path(&dir))
-                .unwrap();
-            file.lock().unwrap();
-            file.write_all(br#"{"version":"0.0.1+old","pid":1}"#)
-                .unwrap();
-            held_tx.send(()).unwrap();
-            while !stop_path(&dir).exists() {
-                std::thread::sleep(Duration::from_millis(10));
+        let old = grab_lock(&dir, r#"{"version":"0.0.9+0ld","pid":1}"#);
+        // Stands in for the old ticker's supervisor: it exits once asked.
+        let old_ticker = tokio::spawn({
+            let dir = dir.clone();
+            async move {
+                while !stop_path(&dir).exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                drop(old);
             }
-            drop(file);
         });
-        held_rx.recv().unwrap();
-        let lock = lock_state(state.path());
+
+        let seen = lock_state(&dir);
         assert_eq!(
-            decide_start(&lock, VERSION, false),
+            decide_start(&seen, VERSION, stop_path(&dir).exists()),
             StartAction::StopThenSpawn
         );
-        stop(state.path()).await.unwrap();
-        old.join().unwrap();
-        assert_eq!(lock_state(state.path()), LockState::Free);
-        assert!(
-            !stop_path(state.path()).exists(),
-            "the stop file is removed"
-        );
-        assert_eq!(
-            decide_start(&lock_state(state.path()), VERSION, false),
-            StartAction::Spawn
-        );
-    }
+        stop(&dir).await.unwrap();
+        old_ticker.await.unwrap();
+        assert_eq!(lock_state(&dir), LockState::Free);
+        assert!(!stop_path(&dir).exists());
 
-    #[test]
-    fn log_is_capped() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = Log::new(dir.path().join("log"));
-        let long = "x".repeat(10_000);
-        for _ in 0..150 {
-            log.line(&long);
-        }
-        let size = std::fs::metadata(&log.path).unwrap().len();
-        assert!(size <= LOG_CAP, "{size}");
-        assert!(size > LOG_CAP / 4);
-    }
-
-    #[test]
-    fn the_session_counts_as_lost_after_five_minutes_down() {
-        let since: Timestamp = "2026-09-25T12:00:00Z".parse().unwrap();
-        let link = |connected| Link {
-            connected,
-            since,
-            wakes: 0,
-            last_error: None,
+        let successor = acquire(&dir).await.unwrap();
+        let LockState::Held(info) = lock_state(&dir) else {
+            panic!("the new ticker does not hold the lock");
         };
-        let later = |secs| since + SignedDuration::from_secs(secs);
-        assert!(!unreachable(&link(false), later(299)));
-        assert!(unreachable(&link(false), later(300)));
-        assert!(!unreachable(&link(true), later(3600)));
+        assert_eq!(info.version, VERSION);
+        drop(successor);
+    }
+
+    #[test]
+    fn the_log_is_trimmed_to_stay_between_a_quarter_of_its_cap_and_the_cap() {
+        let state = tempfile::tempdir().unwrap();
+        let log = Log::new(log_path(state.path()));
+        let filler = "y".repeat(10_000);
+        for n in 0..150 {
+            log.line(&format!("entry {n} {filler}"));
+        }
+        let text = std::fs::read_to_string(&log.path).unwrap();
+        let size = text.len() as u64;
+        assert!(size <= LOG_CAP, "{size} bytes");
+        assert!(size > LOG_CAP / 4, "{size} bytes");
+        assert!(text.ends_with(&format!("entry 149 {filler}\n")));
+        assert!(!text.contains("entry 0 "));
+        assert!(text.lines().all(|l| l.ends_with(filler.as_str())));
+    }
+
+    #[test]
+    fn a_log_entry_stays_on_one_line() {
+        let state = tempfile::tempdir().unwrap();
+        let log = Log::new(log_path(state.path()));
+        log.line("DATA-1: first\nsecond\tthird");
+        let text = std::fs::read_to_string(&log.path).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.ends_with(" DATA-1: first second third\n"), "{text}");
+    }
+
+    #[test]
+    fn the_session_is_given_up_after_five_minutes_down() {
+        let went_down: Timestamp = "2026-09-28T10:00:00Z".parse().unwrap();
+        let table = [
+            (false, 0, false),
+            (false, 299, false),
+            (false, 300, true),
+            (false, 7200, true),
+            (true, 7200, false),
+        ];
+        for (connected, secs, gone) in table {
+            let link = Link {
+                connected,
+                since: went_down,
+                wakes: 3,
+                last_error: None,
+            };
+            let now = went_down
+                .checked_add(SignedDuration::from_secs(secs))
+                .unwrap();
+            assert_eq!(
+                unreachable(&link, now),
+                gone,
+                "connected {connected}, {secs} s"
+            );
+        }
     }
 }

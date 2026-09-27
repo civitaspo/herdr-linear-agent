@@ -262,129 +262,330 @@ pub fn digest(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::tests::SAMPLE;
+    use std::collections::BTreeMap;
 
-    #[test]
-    fn priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands() {
-        let dir = tempfile::tempdir().unwrap();
+    use super::*;
+    use crate::herdr::{Agent, AgentStatus as Seen, Pane, PaneId, WorkspaceId};
+
+    const BIN: &str = "/opt/hla/bin/herdr-linear-agent";
+
+    struct Folder {
+        _home: tempfile::TempDir,
+        run: Run,
+        record: RunRecord,
+    }
+
+    fn folder(title: &str) -> Folder {
+        let home = tempfile::tempdir().unwrap();
         let record = RunRecord {
+            issue_id: "0b7c6c1e-issue".into(),
             identifier: "DATA-1".into(),
-            title: "Fix\nlogin".into(),
+            title: title.into(),
+            url: "https://linear.app/acme/issue/DATA-1".into(),
+            team_key: "DATA".into(),
             ..RunRecord::default()
         };
-        let run = Run::create(dir.path(), record.clone()).unwrap();
-        write_priming(&run, &record, "/bin/hla").unwrap();
-        write_priming(&run, &record, "/bin/hla").unwrap();
-        let agents = std::fs::read_to_string(run.dir.join("AGENTS.md")).unwrap();
-        assert!(agents.contains("Run `/bin/hla skill DATA-1`"));
-        assert!(agents.contains("(Fix login)"));
+        let run = Run::create(&home.path().join("runs"), record.clone()).unwrap();
+        Folder {
+            _home: home,
+            run,
+            record,
+        }
+    }
+
+    fn sample_config() -> Config {
+        Config::parse(crate::config::tests::SAMPLE).unwrap()
+    }
+
+    /// Each needle appears after the previous one.
+    fn assert_in_order(text: &str, needles: &[&str]) {
+        let mut from = 0;
+        for needle in needles {
+            let Some(at) = text[from..].find(needle) else {
+                panic!("`{needle}` is missing after byte {from} of:\n{text}");
+            };
+            from += at + needle.len();
+        }
+    }
+
+    #[test]
+    fn priming_points_the_coordinator_at_the_binary_and_allows_only_agent_commands() {
+        let f = folder("Fix the\nlogin");
+        std::os::unix::fs::symlink("elsewhere.md", f.run.dir.join("CLAUDE.md")).unwrap();
+        write_priming(&f.run, &f.record, BIN).unwrap();
+
+        let agents = std::fs::read_to_string(f.run.dir.join("AGENTS.md")).unwrap();
+        let expected = [
+            "# herdr-linear-agent run DATA-1",
+            "",
+            "If your working directory is this folder, you are the coordinator of the \
+             herdr-linear-agent run for the Linear issue DATA-1 (Fix the login).",
+            "",
+            "Run `/opt/hla/bin/herdr-linear-agent skill DATA-1` now and follow the sheet it \
+             prints. Then run `/opt/hla/bin/herdr-linear-agent context DATA-1` at the start \
+             of every turn.",
+        ];
+        assert_eq!(agents, format!("{}\n", expected.join("\n")));
         assert_eq!(
-            std::fs::read_link(run.dir.join("CLAUDE.md")).unwrap(),
+            std::fs::read_link(f.run.dir.join("CLAUDE.md")).unwrap(),
             Path::new("AGENTS.md")
         );
-        let settings: serde_json::Value =
-            files::read_json(&run.dir.join(".claude/settings.local.json")).unwrap();
-        let allow: Vec<&str> = settings["permissions"]["allow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(allow.contains(&"Bash(/bin/hla context:*)"));
-        assert!(allow.contains(&"Bash(/bin/hla inbox done:*)"));
-        assert!(
-            !allow
-                .iter()
-                .any(|a| a.contains("ticker") || a.contains("action") || a.contains("startup"))
-        );
-        assert!(sheet("/bin/hla", "DATA-1").contains("`/bin/hla worker start DATA-1 --repo"));
-    }
 
-    #[test]
-    fn the_digest_shows_the_catalog_profiles_workers_and_inbox() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = RunRecord {
-            identifier: "DATA-1".into(),
-            title: "First".into(),
-            url: "https://linear.app/x".into(),
-            ..RunRecord::default()
-        };
-        let run = Run::create(dir.path(), record).unwrap();
-        std::fs::write(run.issue_md(), "# DATA-1 First\n\nThe body.").unwrap();
-        run.append_conversation("2026-09-25T00:00:00Z", "user-1", "Use the api repo.")
-            .unwrap();
-        worker::allocate(
-            &run,
-            |_| Ok(()),
-            |w| {
-                w.title = "API change".into();
-                w.repo = "api".into();
-                w.agent.status = AgentStatus::Open;
-                w.agent.last_group = "reported".into();
-            },
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(f.run.dir.join(".claude/settings.local.json")).unwrap(),
         )
         .unwrap();
-        let id = inbox::write(&run, "reply", "reply", "A new reply is in conversation.md").unwrap();
-        let config = Config::parse(SAMPLE).unwrap();
-        let rows = worker_rows(&run, None);
-        let (text, shown) = digest(&run, &config, "/bin/hla", &rows).unwrap();
-        for needle in [
-            "The body.",
-            "Use the api repo.",
-            "- api: /src/api (base main) \u{2014} The API server",
-            "- deep: codex gpt-6-sol, effort xhigh",
-            "- w1 [Reported] API change",
-            "[reply] reply:",
-        ] {
-            assert!(text.contains(needle), "missing {needle}:\n{text}");
+        let allowed: Vec<String> = [
+            "skill",
+            "context",
+            "inbox done",
+            "plan",
+            "say",
+            "ask",
+            "worker",
+            "finish",
+        ]
+        .iter()
+        .map(|sub| format!("Bash(/opt/hla/bin/herdr-linear-agent {sub}:*)"))
+        .collect();
+        assert_eq!(
+            settings,
+            serde_json::json!({"permissions": {"allow": allowed}})
+        );
+        for plugin_only in ["startup", "action", "ticker"] {
+            assert!(!settings.to_string().contains(plugin_only), "{plugin_only}");
         }
+
+        // A second placement keeps the link and rewrites the text.
+        write_priming(&f.run, &f.record, "/usr/local/bin/hla").unwrap();
         assert!(
-            !text.contains("coordinator-light"),
-            "only worker profiles are offered"
+            std::fs::read_to_string(f.run.dir.join("CLAUDE.md"))
+                .unwrap()
+                .contains("Run `/usr/local/bin/hla skill DATA-1`")
         );
-        assert_eq!(shown, [id]);
     }
 
     #[test]
-    fn rows_are_live_with_a_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = Run::create(
-            dir.path(),
-            RunRecord {
-                identifier: "DATA-1".into(),
-                ..RunRecord::default()
-            },
+    fn the_sheet_fills_in_the_binary_and_the_key() {
+        let filled = sheet("/bin/hla", "DATA-7");
+        assert!(
+            filled.contains("`/bin/hla worker start DATA-7 --repo "),
+            "{filled}"
+        );
+        assert!(!filled.contains("{bin}") && !filled.contains("{key}"));
+        assert!(sheet("/bin/hla", "<ISSUE-KEY>").contains("worker start <ISSUE-KEY> --repo"));
+    }
+
+    #[test]
+    fn prompts_labels_and_the_pending_record_follow_the_key() {
+        assert_eq!(
+            launch_prompt("DATA-1", false),
+            "[herdr-linear-agent ticker] Start DATA-1. Follow AGENTS.md."
+        );
+        assert_eq!(
+            launch_prompt("DATA-1", true),
+            "[herdr-linear-agent ticker] You were restarted as the coordinator of DATA-1. \
+             Run context."
+        );
+        assert_eq!(
+            NUDGE_REPLY,
+            "[herdr-linear-agent ticker] There is a new reply in Linear. Run context."
+        );
+        assert_eq!(
+            NUDGE_INBOX,
+            "[herdr-linear-agent ticker] There are new inbox items. Run context."
+        );
+
+        let f = folder(&format!("Tab\there {}", "z".repeat(80)));
+        let label = workspace_label(&f.record);
+        assert_eq!(label, format!("DATA-1 Tabhere {}", "z".repeat(52)));
+
+        let pending = pending_record(&f.record, "coordinator-light", "claude");
+        assert_eq!(pending.status, AgentStatus::Pending);
+        assert_eq!(pending.profile, "coordinator-light");
+        assert_eq!(pending.kind, "claude");
+        assert_eq!(pending.agent_name, "data-1-coordinator");
+    }
+
+    #[test]
+    fn the_digest_lists_issue_catalog_worker_profiles_workers_and_inbox_in_order() {
+        let f = folder("Fix login");
+        std::fs::write(
+            f.run.issue_md(),
+            "# DATA-1 Fix login\n\nThe login page loops.\n",
         )
         .unwrap();
-        worker::allocate(
-            &run,
-            |_| Ok(()),
-            |w| {
-                w.agent.status = AgentStatus::Open;
-                w.agent.pane_id = "w2:p1".into();
-                w.agent.last_group = "working".into();
-            },
+        std::fs::write(
+            f.run.conversation_md(),
+            "# Conversation\n\nuser-1: please keep the old URL\n",
         )
         .unwrap();
+        let item = inbox::write(
+            &f.run,
+            "worker",
+            "w1",
+            "w1 (api) has a new report:\nworkers/w1.md",
+        )
+        .unwrap();
+        let rows = [
+            WorkerRow {
+                id: "w1".into(),
+                title: "Change API".into(),
+                repo: "api".into(),
+                state: "Reported",
+                pr_url: "https://github.com/acme/api/pull/7".into(),
+            },
+            WorkerRow {
+                id: "w2".into(),
+                title: "Update the page".into(),
+                repo: "web".into(),
+                state: "Working",
+                pr_url: String::new(),
+            },
+        ];
+
+        let (text, shown) = digest(&f.run, &sample_config(), "/bin/hla", &rows).unwrap();
+        assert_in_order(
+            &text,
+            &[
+                "## Issue",
+                "The login page loops.",
+                "## Conversation",
+                "please keep the old URL",
+                "## Repositories",
+                "- api: /src/api (base main) \u{2014} The API server\n",
+                "- web: /src/web (base develop)\n",
+                "## Worker profiles",
+                "- standard: claude sonnet, effort high \u{2014} scoped features and fixes",
+                "- deep: codex gpt-6-sol, effort xhigh \u{2014} cross-module changes",
+                "## Workers",
+                "- w1 [Reported] Change API",
+                "PR https://github.com/acme/api/pull/7",
+                "- w2 [Working] Update the page",
+                "## Inbox",
+                &item,
+                "[worker] w1: w1 (api) has a new report: workers/w1.md",
+            ],
+        );
+        for coordinator_profile in ["- coordinator:", "- coordinator-light:", "- router:"] {
+            assert!(!text.contains(coordinator_profile), "{coordinator_profile}");
+        }
+        assert_eq!(shown, [item]);
+
+        inbox::done(&f.run, &[], true).unwrap();
+        let (_, shown) = digest(&f.run, &sample_config(), "/bin/hla", &[]).unwrap();
+        assert!(shown.is_empty());
+    }
+
+    fn pane_row(pane: &str) -> (PaneId, Pane) {
+        let workspace = pane.split(':').next().unwrap();
+        let entry = Pane {
+            id: PaneId(pane.into()),
+            workspace: WorkspaceId(workspace.into()),
+            tab: format!("{workspace}:t1"),
+            terminal: format!("term-{workspace}"),
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+        };
+        (entry.id.clone(), entry)
+    }
+
+    fn claude_in(pane: &str, name: &str, cwd: &str, status: Seen) -> Agent {
+        Agent {
+            pane: PaneId(pane.into()),
+            kind: Some("claude".into()),
+            name: Some(name.into()),
+            status,
+            session: None,
+            cwd: Some(cwd.into()),
+            foreground_cwd: None,
+            terminal: "term-x".into(),
+            interactive_ready: true,
+            launch_pending: false,
+            state_change_seq: 1,
+            state_labels: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn rows_read_the_snapshot_when_there_is_one_and_the_stored_group_otherwise() {
+        let f = folder("Fix login");
+        let setups: [(AgentStatus, &str, &str); 5] = [
+            (AgentStatus::Open, "working", ""),
+            (AgentStatus::Failed, "", ""),
+            (AgentStatus::Stopped, "reported", "h3"),
+            (AgentStatus::Open, "", ""),
+            (AgentStatus::Open, "reported", "h5"),
+        ];
+        for (n, (status, stored, hash)) in setups.into_iter().enumerate() {
+            let n = n + 1;
+            worker::allocate(
+                &f.run,
+                |_| Ok(()),
+                |w| {
+                    w.title = format!("Task {n}");
+                    w.repo = format!("repo{n}");
+                    w.report_hash = hash.into();
+                    w.pr_url = if n == 5 {
+                        "https://github.com/acme/repo5/pull/5".into()
+                    } else {
+                        String::new()
+                    };
+                    w.agent = AgentRecord {
+                        status,
+                        kind: "claude".into(),
+                        agent_name: format!("data-1-w{n}"),
+                        pane_id: format!("p{n}:1"),
+                        cwd: format!("/wt/repo{n}"),
+                        last_group: stored.into(),
+                        ..AgentRecord::default()
+                    };
+                },
+            )
+            .unwrap();
+        }
+        let states = |rows: Vec<WorkerRow>| rows.into_iter().map(|r| r.state).collect::<Vec<_>>();
+
+        let offline = worker_rows(&f.run, None);
+        assert_eq!(offline[0].title, "Task 1");
+        assert_eq!(offline[0].repo, "repo1");
+        assert_eq!(offline[4].pr_url, "https://github.com/acme/repo5/pull/5");
+        assert_eq!(
+            states(offline),
+            [
+                "Working",
+                "Waiting on you",
+                "Stopped",
+                "Starting",
+                "Reported"
+            ]
+        );
+
+        // Only w1's pane is alive, with its agent idle.
         let snapshot = Snapshot {
             version: "0.9.1".into(),
             protocol: 22,
-            panes: Default::default(),
-            agents: Vec::new(),
+            panes: BTreeMap::from([pane_row("p1:1")]),
+            agents: vec![claude_in("p1:1", "data-1-w1", "/wt/repo1", Seen::Idle)],
             skipped: 0,
         };
+        let state = tempfile::tempdir().unwrap();
         let view = View {
             snapshot: &snapshot,
-            state_dir: dir.path(),
-            socket: "/s",
-            now: Timestamp::now(),
+            state_dir: state.path(),
+            socket: "/tmp/herdr-work.sock",
+            now: "2026-09-28T12:00:00Z".parse().unwrap(),
         };
-        assert_eq!(worker_rows(&run, None)[0].state, "Working");
         assert_eq!(
-            worker_rows(&run, Some(&view))[0].state,
-            "Waiting on you",
-            "its pane is gone and it wrote no report"
+            states(worker_rows(&f.run, Some(&view))),
+            [
+                "Idle",
+                "Waiting on you",
+                "Stopped",
+                "Waiting on you",
+                "Reported"
+            ]
         );
     }
 }

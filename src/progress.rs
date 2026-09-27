@@ -199,83 +199,165 @@ mod tests {
     use super::*;
     use crate::herdr::FakeHerdr;
 
-    #[test]
-    fn activity_is_cleaned_and_capped_at_forty_columns() {
-        assert_eq!(clean("  Reading code\n", 40), "Reading code");
-        assert_eq!(clean(&"x".repeat(60), 40).len(), 40);
-        assert_eq!(clean("a\u{202e}b\u{7}c", 40), "abc");
-        assert_eq!(clean("日本語テキスト", 6), "日本語");
+    const WORK_SOCKET: &str = "/tmp/herdr-work.sock";
+    const SIDE_SOCKET: &str = "/tmp/herdr-side.sock";
+
+    fn progress_of(socket: &str, pane: &str, terminal: &str) -> Record {
+        Record {
+            socket: socket.into(),
+            pane_id: pane.into(),
+            terminal_id: terminal.into(),
+            activity: "Writing the handler".into(),
+            percent: Some(55),
+            reported_at: 1_790_000_000,
+        }
     }
 
     #[test]
-    fn records_round_trip_per_session_and_stale_terminals_are_ignored() {
+    fn an_activity_is_trimmed_stripped_and_cut_to_its_columns() {
+        let table = [
+            ("  Running the suite \n", 40, "Running the suite"),
+            ("Fix\u{7}ing\u{1b} the build", 40, "Fixing the build"),
+            ("left\u{202E}right\u{2066}\u{200F}", 40, "leftright"),
+            ("日本語テキスト", 6, "日本語"),
+            ("日本語テキスト", 7, "日本語"),
+            ("abc def", 4, "abc"),
+        ];
+        for (raw, columns, expected) in table {
+            assert_eq!(clean(raw, columns), expected, "{raw:?} at {columns}");
+        }
+        assert_eq!(clean(&"q".repeat(55), ACTIVITY_COLUMNS), "q".repeat(40));
+        assert_eq!(clean(&"字".repeat(33), ACTIVITY_COLUMNS), "字".repeat(20));
+    }
+
+    #[test]
+    fn records_are_kept_per_socket_and_pane() {
         let state = tempfile::tempdir().unwrap();
-        let record = Record {
-            socket: "/a.sock".into(),
-            pane_id: "w1:p1".into(),
-            terminal_id: "term_1".into(),
-            activity: WAITING.into(),
-            reported_at: 7,
-            ..Record::default()
-        };
-        save(state.path(), &record).unwrap();
-        let other = Record {
-            socket: "/b.sock".into(),
-            pane_id: "w1:p1".into(),
-            terminal_id: "term_9".into(),
-            activity: "Testing".into(),
-            reported_at: 8,
-            ..Record::default()
-        };
-        save(state.path(), &other).unwrap();
-        assert_eq!(load(state.path(), "/a.sock", "w1:p1").unwrap(), record);
-        assert!(
-            self_report(state.path(), "/a.sock", "w1:p1", "term_1")
-                .unwrap()
-                .waiting()
-        );
-        assert!(self_report(state.path(), "/a.sock", "w1:p1", "term_2").is_none());
-        assert!(self_report(state.path(), "/a.sock", "w1:p1", "").is_some());
-        prune(state.path(), "/a.sock", &["w1:p2".into()]);
-        assert!(load(state.path(), "/a.sock", "w1:p1").is_none());
-        assert!(load(state.path(), "/b.sock", "w1:p1").is_some());
+        let mine = progress_of(WORK_SOCKET, "w1:p1", "term-1");
+        save(state.path(), &mine).unwrap();
+        assert_eq!(load(state.path(), WORK_SOCKET, "w1:p1"), Some(mine));
+        assert_eq!(load(state.path(), SIDE_SOCKET, "w1:p1"), None);
+        assert_eq!(load(state.path(), WORK_SOCKET, "w1:p2"), None);
+        assert!(state.path().join("progress").is_dir());
+    }
+
+    #[test]
+    fn a_record_from_an_earlier_terminal_of_the_pane_is_not_its_self_report() {
+        let state = tempfile::tempdir().unwrap();
+        let mine = progress_of(WORK_SOCKET, "w2:p1", "term-7");
+        save(state.path(), &mine).unwrap();
+        let table = [("term-7", true), ("", true), ("term-8", false)];
+        for (terminal, counts) in table {
+            let found = self_report(state.path(), WORK_SOCKET, "w2:p1", terminal);
+            assert_eq!(found.is_some(), counts, "terminal {terminal:?}");
+        }
+    }
+
+    #[test]
+    fn pruning_touches_only_gone_panes_of_the_same_socket() {
+        let state = tempfile::tempdir().unwrap();
+        for (socket, pane) in [
+            (WORK_SOCKET, "w1:p1"),
+            (WORK_SOCKET, "w2:p1"),
+            (SIDE_SOCKET, "w2:p1"),
+        ] {
+            save(state.path(), &progress_of(socket, pane, "term-1")).unwrap();
+        }
+        prune(state.path(), WORK_SOCKET, &["w1:p1".to_string()]);
+        assert!(load(state.path(), WORK_SOCKET, "w1:p1").is_some());
+        assert!(load(state.path(), WORK_SOCKET, "w2:p1").is_none());
+        assert!(load(state.path(), SIDE_SOCKET, "w2:p1").is_some());
+    }
+
+    #[test]
+    fn only_the_exact_waiting_activity_waits() {
+        assert_eq!(WAITING, "Waiting for you");
+        let mut record = progress_of(WORK_SOCKET, "w1:p1", "term-1");
+        assert!(!record.waiting());
+        record.activity = "Waiting for you".into();
+        assert!(record.waiting());
+        record.activity = "Waiting for you to merge".into();
+        assert!(!record.waiting());
     }
 
     #[tokio::test]
-    async fn report_writes_the_record_and_a_token_inside_a_pane() {
+    async fn a_report_in_a_pane_saves_its_record_and_sets_the_activity_token() {
         let home = tempfile::tempdir().unwrap();
         let state = home.path().join("state");
         let herdr = FakeHerdr::new(home.path());
-        let pane = herdr.add_pane("/wt");
-        report_in_pane(&state, &herdr, "/s.sock", &pane, None, WAITING, 1)
-            .await
-            .unwrap();
-        let record = load(&state, "/s.sock", &pane.0).unwrap();
-        assert!(record.waiting());
-        assert_eq!(record.terminal_id, "term-1");
-        let tokens: Vec<_> = herdr
-            .metadata()
-            .into_iter()
-            .filter(|m| m.tokens == [("hla_activity".into(), "Waiting for you".into())])
-            .collect();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].source, SOURCE);
+        let pane = herdr.add_pane("/wt/api");
 
-        let inside = Env::for_test(
-            home.path(),
-            &[
-                ("HERDR_ENV", "1"),
-                ("HERDR_PANE_ID", "w1:p1"),
-                ("HERDR_SOCKET_PATH", "/s.sock"),
-                ("XDG_STATE_HOME", state.to_str().unwrap()),
-            ],
+        report_in_pane(
+            &state,
+            &herdr,
+            WORK_SOCKET,
+            &pane,
+            Some(40),
+            " Running tests\u{7} ",
+            1_790_000_123,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load(&state, WORK_SOCKET, &pane.0),
+            Some(Record {
+                socket: WORK_SOCKET.into(),
+                pane_id: "w1:p1".into(),
+                terminal_id: "term-1".into(),
+                activity: "Running tests".into(),
+                percent: Some(40),
+                reported_at: 1_790_000_123,
+            })
         );
-        assert!(report(&inside, Some(101), "x").await.is_err());
+        assert_eq!(herdr.requests(), ["pane.current", "pane.report_metadata"]);
+        let [token] = herdr.metadata().try_into().unwrap();
+        assert_eq!(token.pane, pane);
+        assert_eq!(token.source, "herdr-linear-agent");
+        assert_eq!(
+            token.tokens,
+            [("hla_activity".to_string(), "Running tests".to_string())]
+        );
+        assert_eq!(token.ttl_ms, 300_000);
 
-        // Outside a pane nothing is written.
-        let outside_home = tempfile::tempdir().unwrap();
-        let outside = Env::for_test(outside_home.path(), &[]);
-        report(&outside, Some(10), "Reading").await.unwrap();
-        assert!(!outside.state_dir().exists());
+        report_in_pane(
+            &state,
+            &herdr,
+            WORK_SOCKET,
+            &pane,
+            None,
+            "Scoping",
+            1_790_000_200,
+        )
+        .await
+        .unwrap();
+        let unknown = load(&state, WORK_SOCKET, &pane.0).unwrap();
+        assert_eq!(
+            (unknown.percent, unknown.activity.as_str()),
+            (None, "Scoping")
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_a_pane_nothing_is_written_and_a_percent_over_a_hundred_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let partial: [&[(&str, &str)]; 3] = [
+            &[],
+            &[
+                ("HERDR_ENV", "0"),
+                ("HERDR_PANE_ID", "w1:p1"),
+                ("HERDR_SOCKET_PATH", WORK_SOCKET),
+            ],
+            &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w1:p1")],
+        ];
+        for vars in partial {
+            let env = Env::for_test(home.path(), vars);
+            report(&env, Some(10), "Reading").await.unwrap();
+            assert!(!env.state_dir().exists(), "{vars:?}");
+        }
+        let env = Env::for_test(home.path(), &[]);
+        let refused = report(&env, Some(101), "Reading").await.unwrap_err();
+        assert!(refused.to_string().contains("at most 100"), "{refused}");
+        report(&env, Some(100), "Done").await.unwrap();
     }
 }

@@ -223,56 +223,104 @@ pub mod fake {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn captures_output_and_exit_code() {
-        let out = RealRunner
-            .run(
-                &Cmd::new("sh", Duration::from_secs(5))
-                    .args(["-c", "echo hi; echo err >&2; exit 3"]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.code, Some(3));
-        assert_eq!(out.stdout, "hi\n");
-        assert_eq!(out.stderr, "err\n");
-        assert!(!out.success());
-        assert_eq!(out.error_text(), "err");
+    /// Upper bound for work the runner must finish promptly; far above the
+    /// deadlines under test, so a slow machine does not flake.
+    const PROMPT: std::time::Duration = Duration::from_secs(5);
+
+    fn sh(script: &str, timeout: Duration) -> Cmd {
+        Cmd::new("sh", timeout).args(["-c", script])
+    }
+
+    async fn timed(cmd: Cmd) -> (Result<Output>, Duration) {
+        let started = std::time::Instant::now();
+        let result = RealRunner.run(&cmd).await;
+        (result, started.elapsed())
     }
 
     #[tokio::test]
-    async fn a_process_left_behind_does_not_hold_the_result() {
-        let start = std::time::Instant::now();
-        let out = RealRunner
-            .run(&Cmd::new("sh", Duration::from_secs(10)).args(["-c", "sleep 5 & echo done"]))
-            .await
-            .unwrap();
-        assert!(out.success(), "{out:?}");
-        assert_eq!(out.stdout, "done\n");
-        assert!(start.elapsed() < Duration::from_secs(3));
-    }
-
-    #[tokio::test]
-    async fn missing_program_is_an_error() {
-        assert!(
-            RealRunner
-                .run(&Cmd::new("hla-no-such-program", Duration::from_secs(1)))
-                .await
-                .is_err()
+    async fn both_streams_and_the_exit_status_are_captured() {
+        let script = "printf 'on stdout'; printf 'on stderr' >&2; exit 3";
+        let (result, _) = timed(sh(script, PROMPT)).await;
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            Output {
+                code: Some(3),
+                stdout: "on stdout".into(),
+                stderr: "on stderr".into(),
+                timed_out: false,
+            }
         );
+        assert!(!output.success());
+        assert_eq!(output.error_text(), "on stderr");
+
+        let (result, _) = timed(sh("true", PROMPT)).await;
+        assert!(result.unwrap().success());
+    }
+
+    #[test]
+    fn error_text_prefers_stderr_then_says_how_the_child_ended() {
+        let ended = |code, stderr: &str, timed_out| Output {
+            code,
+            stderr: stderr.into(),
+            timed_out,
+            ..Output::default()
+        };
+        let cases = [
+            (
+                ended(
+                    Some(128),
+                    "\n  fatal: not a git repository  \nhint\n",
+                    false,
+                ),
+                "fatal: not a git repository",
+            ),
+            (ended(Some(2), "", false), "exit code 2"),
+            (ended(None, "", false), "killed by a signal"),
+            (ended(None, "partial output", true), "timed out"),
+        ];
+        for (output, expected) in cases {
+            assert_eq!(output.error_text(), expected, "{output:?}");
+        }
+        let fetch = Cmd::new("git", PROMPT)
+            .args(["-C", "/src/api", "fetch"])
+            .arg("origin");
+        assert_eq!(fetch.display(), "git -C /src/api fetch origin");
     }
 
     #[tokio::test]
-    async fn times_out_a_chatty_child() {
-        // `yes` fills the pipe far past its buffer; draining it keeps the
-        // deadline in reach.
-        let start = std::time::Instant::now();
-        let out = RealRunner
-            .run(&Cmd::new("yes", Duration::from_millis(300)))
-            .await
-            .unwrap();
-        assert!(out.timed_out);
-        assert!(!out.success());
-        assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(out.stdout.len() > 65_536);
+    async fn a_background_grandchild_holding_the_pipes_does_not_delay_the_result() {
+        let script = "sleep 30 & echo launched";
+        let (result, took) = timed(sh(script, Duration::from_secs(20))).await;
+        let output = result.unwrap();
+        assert_eq!(output.code, Some(0));
+        assert_eq!(output.stdout, "launched\n");
+        assert!(!output.timed_out);
+        assert!(took < PROMPT, "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_does_not_exist_is_an_error() {
+        let missing = Cmd::new("/nonexistent/hla-no-such-program", PROMPT);
+        let (result, _) = timed(missing).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("could not run"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_child_past_its_deadline_is_killed_even_while_it_floods_stdout() {
+        let deadline = Duration::from_millis(300);
+        for cmd in [
+            Cmd::new("yes", deadline).arg("flood"),
+            sh("sleep 30", deadline),
+        ] {
+            let shown = cmd.display();
+            let (result, took) = timed(cmd).await;
+            let output = result.unwrap();
+            assert!(output.timed_out, "{shown}");
+            assert_eq!(output.code, None, "{shown}");
+            assert!(!output.success(), "{shown}");
+            assert!(took < PROMPT, "{shown} took {took:?}");
+        }
     }
 }

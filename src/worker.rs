@@ -492,384 +492,788 @@ pub fn group(worker: &Worker, live: &Live) -> Group {
 mod tests {
     use std::collections::BTreeMap;
 
+    use jiff::SignedDuration;
+
     use super::*;
     use crate::herdr::{Pane, PaneId, WorkspaceId};
     use crate::run::RunRecord;
 
-    fn now() -> Timestamp {
-        "2026-09-25T12:00:00Z".parse().unwrap()
+    const SOCKET: &str = "/tmp/herdr-work.sock";
+    const WORKTREE: &str = "/wt/api";
+
+    fn noon() -> Timestamp {
+        "2026-09-28T12:00:00Z".parse().unwrap()
     }
 
-    fn ago(secs: i64) -> String {
-        (now() - jiff::SignedDuration::from_secs(secs)).to_string()
+    fn secs_before_noon(secs: i64) -> String {
+        noon()
+            .checked_sub(SignedDuration::from_secs(secs))
+            .unwrap()
+            .to_string()
     }
 
-    fn open_worker() -> Worker {
+    struct Runs {
+        home: tempfile::TempDir,
+    }
+
+    impl Runs {
+        fn new() -> Self {
+            Runs {
+                home: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn dir(&self) -> PathBuf {
+            self.home.path().join("runs")
+        }
+
+        fn add(&self, key: &str, status: Status, coordinator: AgentStatus) -> Run {
+            let record = RunRecord {
+                issue_id: format!("uuid-{key}"),
+                identifier: key.into(),
+                title: "Fix login".into(),
+                status,
+                coordinator: AgentRecord {
+                    status: coordinator,
+                    ..AgentRecord::default()
+                },
+                ..RunRecord::default()
+            };
+            Run::create(&self.dir(), record).unwrap()
+        }
+    }
+
+    fn api_worker_agent(pane: &str) -> AgentRecord {
+        AgentRecord {
+            status: AgentStatus::Open,
+            profile: "standard".into(),
+            kind: "claude".into(),
+            agent_name: "data-1-w1".into(),
+            pane_id: pane.into(),
+            cwd: WORKTREE.into(),
+            ..AgentRecord::default()
+        }
+    }
+
+    /// A pane as `session.snapshot` lists it; its workspace is the id's
+    /// prefix and its terminal `term-<pane>`.
+    fn listed_pane(id: &str) -> (PaneId, Pane) {
+        let workspace = id.split(':').next().unwrap();
+        let pane = Pane {
+            id: PaneId(id.into()),
+            workspace: WorkspaceId(workspace.into()),
+            tab: format!("{workspace}:t1"),
+            terminal: format!("term-{id}"),
+            cwd: Some(WORKTREE.into()),
+            foreground_cwd: None,
+            label: None,
+        };
+        (pane.id.clone(), pane)
+    }
+
+    fn herdr_sees(
+        pane: &str,
+        name: Option<&str>,
+        cwd: &str,
+        kind: &str,
+        status: HerdrStatus,
+    ) -> Agent {
+        Agent {
+            pane: PaneId(pane.into()),
+            kind: Some(kind.into()),
+            name: name.map(Into::into),
+            status,
+            session: Some("sess-w1".into()),
+            cwd: Some(cwd.into()),
+            foreground_cwd: None,
+            terminal: format!("term-{pane}"),
+            interactive_ready: true,
+            launch_pending: false,
+            state_change_seq: 2,
+            state_labels: BTreeMap::new(),
+        }
+    }
+
+    fn ours_in(pane: &str, status: HerdrStatus) -> Agent {
+        herdr_sees(pane, Some("data-1-w1"), WORKTREE, "claude", status)
+    }
+
+    fn session_with(panes: &[&str], agents: Vec<Agent>) -> Snapshot {
+        Snapshot {
+            version: "0.9.1".into(),
+            protocol: 22,
+            panes: panes.iter().map(|p| listed_pane(p)).collect(),
+            agents,
+            skipped: 0,
+        }
+    }
+
+    fn api_worker(status: AgentStatus, report_hash: &str, prompt_pending: bool) -> Worker {
         Worker {
             id: "w1".into(),
+            title: "Change API".into(),
+            repo: "api".into(),
+            report_hash: report_hash.into(),
             agent: AgentRecord {
-                status: AgentStatus::Open,
-                kind: "claude".into(),
-                agent_name: "data-1-w1".into(),
-                pane_id: "w2:p1".into(),
-                cwd: "/wt".into(),
-                last_state: "idle".into(),
-                last_state_change: ago(45),
-                ..AgentRecord::default()
+                status,
+                prompt_pending,
+                ..api_worker_agent("w1:p1")
             },
             ..Worker::default()
         }
     }
 
-    fn live(state: Option<&str>, secs: i64) -> Live {
+    fn in_pane(status: Option<HerdrStatus>, secs: i64) -> Live {
         Live {
             pane_exists: true,
-            agent_state: state.map(HerdrStatus::parse),
+            agent_state: status,
             state_secs: secs,
             ..Live::default()
         }
     }
 
     #[test]
-    fn groups_follow_the_rows_in_order() {
-        let w = open_worker();
-        let failed = Worker {
-            agent: AgentRecord {
-                status: AgentStatus::Failed,
-                ..w.agent.clone()
-            },
-            ..w.clone()
-        };
-        assert_eq!(
-            group(&failed, &live(Some("working"), 0)),
-            Group::WaitingOnYou
-        );
-        assert_eq!(
-            group(&w, &Live::default()),
-            Group::WaitingOnYou,
-            "pane gone without a report"
-        );
-        assert_eq!(group(&w, &live(Some("blocked"), 30)), Group::WaitingOnYou);
-        assert_eq!(
-            group(&w, &live(Some("blocked"), 29)),
-            Group::Working,
-            "a quickly answered prompt never shows"
-        );
-        let pending = Worker {
-            agent: AgentRecord {
-                prompt_pending: true,
-                ..w.agent.clone()
-            },
-            ..w.clone()
-        };
-        assert_eq!(
-            group(&pending, &live(Some("unknown"), 60)),
-            Group::WaitingOnYou,
-            "a launch stuck on a dialog"
-        );
-        assert_eq!(group(&pending, &live(None, 0)), Group::Working);
-
-        let reported = Worker {
-            report_hash: "h".into(),
-            ..w.clone()
-        };
-        assert_eq!(group(&reported, &live(Some("idle"), 0)), Group::Reported);
-        assert_eq!(group(&reported, &live(Some("done"), 0)), Group::Reported);
-        assert_eq!(group(&reported, &live(Some("working"), 0)), Group::Working);
-        assert_eq!(
-            group(&reported, &Live::default()),
-            Group::Reported,
-            "a closed pane after the report is finished work"
-        );
-        assert_eq!(group(&w, &live(Some("idle"), 0)), Group::Idle);
-
-        let waiting = progress::Record {
-            activity: progress::WAITING.into(),
-            reported_at: 1,
-            ..Default::default()
-        };
-        let asked = Live {
-            self_report: Some(waiting.clone()),
-            ..live(Some("idle"), 0)
-        };
-        assert_eq!(group(&reported, &asked), Group::WaitingOnYou);
-        let still_working = Live {
-            self_report: Some(waiting),
-            ..live(Some("working"), 0)
-        };
-        assert_eq!(group(&reported, &still_working), Group::Working);
-
-        for g in [
-            Group::WaitingOnYou,
-            Group::Working,
-            Group::Idle,
-            Group::Reported,
-        ] {
-            assert_eq!(Group::from_token(g.token()), Some(g));
+    fn validate_id_accepts_w_and_a_number_without_leading_zero() {
+        for good in ["w1", "w12", "w307"] {
+            assert!(validate_id(good).is_ok(), "{good}");
         }
-        assert_eq!(Group::from_token("waiting"), None);
-    }
-
-    fn agent(pane: &str, name: &str, cwd: &str, kind: &str) -> Agent {
-        Agent {
-            pane: PaneId(pane.into()),
-            kind: Some(kind.into()),
-            name: Some(name.into()),
-            status: HerdrStatus::Idle,
-            session: None,
-            cwd: Some(cwd.into()),
-            foreground_cwd: None,
-            terminal: format!("term-{pane}"),
-            interactive_ready: true,
-            launch_pending: false,
-            state_change_seq: 1,
-            state_labels: BTreeMap::new(),
+        for bad in ["", "w", "w0", "w01", "x1", "../w1", "w1a", "W1", "w-1"] {
+            assert!(validate_id(bad).is_err(), "{bad:?}");
         }
-    }
-
-    fn snapshot(agents: Vec<Agent>) -> Snapshot {
-        let panes = agents
-            .iter()
-            .map(|a| {
-                let workspace = a.pane.0.split(':').next().unwrap().to_string();
-                let pane = Pane {
-                    id: a.pane.clone(),
-                    tab: format!("{workspace}:t1"),
-                    workspace: WorkspaceId(workspace),
-                    terminal: a.terminal.clone(),
-                    cwd: a.cwd.clone(),
-                    foreground_cwd: None,
-                    label: None,
-                };
-                (a.pane.clone(), pane)
-            })
-            .collect();
-        Snapshot {
-            version: "0.9.1".into(),
-            protocol: 22,
-            panes,
-            agents,
-            skipped: 0,
-        }
-    }
-
-    #[test]
-    fn identity_is_pane_cwd_kind_and_name() {
-        let w = open_worker();
-        let rec = &w.agent;
-        assert!(find_agent(rec, &[agent("w2:p1", "data-1-w1", "/wt", "claude")]).is_some());
-        assert!(
-            find_agent(rec, &[agent("w2:p1", "", "/wt", "claude")]).is_some(),
-            "natively resumed, unnamed"
-        );
-        assert!(find_agent(rec, &[agent("w2:p1", "other", "/wt", "claude")]).is_none());
-        assert!(find_agent(rec, &[agent("w2:p1", "data-1-w1", "/other", "claude")]).is_none());
-        assert!(find_agent(rec, &[agent("w2:p1", "data-1-w1", "/wt", "codex")]).is_none());
-        let state = Path::new("/nonexistent");
-        // Renumbered after a restart: found by name, cwd and kind.
-        let moved = live_state(
-            rec,
-            &snapshot(vec![agent("w9:p3", "data-1-w1", "/wt", "claude")]),
-            now(),
-            state,
-            "/s",
-        );
-        assert!(moved.pane_exists);
-        assert_eq!(moved.moved_to.unwrap().2, "w9:p3");
-        // Someone else's agent in our pane: treated as gone.
-        let foreign = live_state(
-            rec,
-            &snapshot(vec![agent("w2:p1", "other", "/wt", "claude")]),
-            now(),
-            state,
-            "/s",
-        );
-        assert!(!foreign.pane_exists);
-        let ours = live_state(
-            rec,
-            &snapshot(vec![agent("w2:p1", "data-1-w1", "/wt", "claude")]),
-            now(),
-            state,
-            "/s",
-        );
-        assert_eq!(ours.state_secs, 45);
-        assert_eq!(ours.agent_state, Some(HerdrStatus::Idle));
-        // The placed pane at its shell prompt, before the agent starts.
-        let mut shell = snapshot(vec![agent("w2:p1", "data-1-w1", "/wt", "claude")]);
-        shell.agents.clear();
-        let waiting = live_state(rec, &shell, now(), state, "/s");
-        assert!(waiting.pane_exists && waiting.agent_state.is_none());
-    }
-
-    #[test]
-    fn a_self_report_counts_only_while_it_is_recent() {
-        let state = tempfile::tempdir().unwrap();
-        let w = open_worker();
-        let record = progress::Record {
-            socket: "/s".into(),
-            pane_id: "w2:p1".into(),
-            terminal_id: "term-w2:p1".into(),
-            activity: progress::WAITING.into(),
-            reported_at: now().as_second() - 60,
-            ..progress::Record::default()
-        };
-        progress::save(state.path(), &record).unwrap();
-        let view = snapshot(vec![agent("w2:p1", "data-1-w1", "/wt", "claude")]);
-        let fresh = live_state(&w.agent, &view, now(), state.path(), "/s");
-        assert_eq!(fresh.self_report, Some(record));
-        let later = now() + jiff::SignedDuration::from_secs(SELF_REPORT_SECS);
         assert_eq!(
-            live_state(&w.agent, &view, later, state.path(), "/s").self_report,
-            None
+            validate_id("w0").unwrap_err().to_string(),
+            "`w0` is not a worker id (expected w1, w2, ...)"
         );
     }
 
     #[test]
-    fn ids_branches_briefs_and_pr_lines() {
-        assert!(validate_id("w1").is_ok() && validate_id("w12").is_ok());
-        for bad in ["", "w", "w0", "w01", "x1", "../w1", "w1a"] {
-            assert!(validate_id(bad).is_err(), "{bad}");
+    fn branches_briefs_and_prompts_are_named_from_the_key_and_id() {
+        let names = [
+            (
+                "DATA-1",
+                "w1",
+                "Change API",
+                "herdr-linear-agent/data-1/w1-change-api",
+            ),
+            (
+                "DATA-12",
+                "w3",
+                "Fix the $(login) bug!",
+                "herdr-linear-agent/data-12/w3-fix-the-login-bug",
+            ),
+            ("DATA-1", "w2", "???", "herdr-linear-agent/data-1/w2"),
+        ];
+        for (key, id, title, branch) in names {
+            assert_eq!(branch_name(key, id, title), branch, "{title}");
+        }
+        for worktree in ["/wt/api", "/wt/api/", "/wt/api//"] {
+            assert_eq!(
+                brief_dir(worktree, "DATA-1", "w1"),
+                "/wt/api/.herdr-linear-agent/DATA-1-w1"
+            );
         }
         assert_eq!(
-            branch_name("DATA-12", "w1", "Fix the $(login) bug!"),
-            "herdr-linear-agent/data-12/w1-fix-the-login-bug"
-        );
-        assert_eq!(
-            branch_name("DATA-12", "w2", "???"),
-            "herdr-linear-agent/data-12/w2"
-        );
-        assert_eq!(
-            brief_dir("/wt/", "DATA-12", "w1"),
-            "/wt/.herdr-linear-agent/DATA-12-w1"
-        );
-        assert_eq!(
-            launch_prompt("DATA-12", "w1"),
-            "Read .herdr-linear-agent/DATA-12-w1/brief.md and do what it says."
+            launch_prompt("DATA-1", "w2"),
+            "Read .herdr-linear-agent/DATA-1-w2/brief.md and do what it says."
         );
 
-        assert_eq!(
-            pr_line("PR: https://github.com/o/r/pull/12\n## Report"),
-            Some("https://github.com/o/r/pull/12".into())
-        );
-        for bad in [
-            "## Report",
-            "PR: https://evil.example/o/r/pull/1",
-            "PR: https://github.com/o/r/issues/1",
-            "PR: https://github.com/o/r/pull/1x",
-        ] {
-            assert_eq!(pr_line(bad), None, "{bad}");
-        }
+        let Op::Activity { activity } = start_action(&api_worker(AgentStatus::Open, "", true))
+        else {
+            panic!("Start worker is an activity");
+        };
+        let Content::Action {
+            action,
+            parameter,
+            result,
+        } = activity.content
+        else {
+            panic!("Start worker is an action");
+        };
+        assert_eq!(action, "Start worker");
+        assert_eq!(parameter, "w1 api: Change API");
+        assert_eq!(result, None);
+    }
 
-        let w = Worker {
-            id: "w1".into(),
+    #[test]
+    fn a_brief_puts_heading_restart_note_rules_report_command_and_task_in_order() {
+        let worker = Worker {
             repo: "api".into(),
-            branch: "b".into(),
+            branch: "herdr-linear-agent/data-1/w1-change-api".into(),
             base: "main".into(),
-            worktree_path: "/wt".into(),
-            brief_dir: "/wt/.herdr-linear-agent/DATA-12-w1".into(),
-            ..Worker::default()
+            worktree_path: WORKTREE.into(),
+            brief_dir: brief_dir(WORKTREE, "DATA-1", "w1"),
+            ..api_worker(AgentStatus::Open, "", true)
         };
-        let brief = compose_brief(&BriefInput {
-            issue_key: "DATA-12",
-            issue_title: "Title",
-            issue_url: "https://linear.app/x",
-            worker: &w,
-            task: "Do it.",
-            restart: true,
-            binary: "/bin/hla",
-        });
-        let pos = |needle: &str| {
-            brief
+        let brief = |restart| {
+            compose_brief(&BriefInput {
+                issue_key: "DATA-1",
+                issue_title: "Fix\nlogin",
+                issue_url: "https://linear.app/acme/issue/DATA-1",
+                worker: &worker,
+                task: "\n  Change the session handler.  \n",
+                restart,
+                binary: "/bin/hla",
+            })
+        };
+        let rules = include_str!("../assets/WORKER.md").lines().next().unwrap();
+        let restarted = brief(true);
+        let mut from = 0;
+        for needle in [
+            "# Worker brief",
+            "DATA-1 Fix login",
+            "https://linear.app/acme/issue/DATA-1",
+            "api",
+            WORKTREE,
+            "herdr-linear-agent/data-1/w1-change-api",
+            "main",
+            "/wt/api/.herdr-linear-agent/DATA-1-w1/report.md",
+            "previous attempt",
+            rules,
+            "/bin/hla report --percent N",
+            "--activity",
+            "Change the session handler.",
+        ] {
+            let at = restarted[from..]
                 .find(needle)
-                .unwrap_or_else(|| panic!("missing {needle}"))
-        };
-        assert!(pos("# Worker brief") < pos("previous attempt"));
-        assert!(pos("previous attempt") < pos("/bin/hla report --percent N"));
-        assert!(pos("/bin/hla report") < pos("Do it."));
-        assert!(brief.contains("/wt/.herdr-linear-agent/DATA-12-w1/report.md"));
+                .unwrap_or_else(|| panic!("`{needle}` is not after byte {from}"));
+            from += at + needle.len();
+        }
+        assert!(restarted.ends_with("Change the session handler.\n"));
+        assert!(!brief(false).contains("previous attempt"));
     }
 
     #[test]
-    fn allocation_follow_ups_and_report_copies() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = Run::create(
-            dir.path(),
-            RunRecord {
-                identifier: "DATA-1".into(),
-                ..RunRecord::default()
-            },
-        )
-        .unwrap();
-        let a = allocate(&run, |_| Ok(()), |w| w.repo = "api".into()).unwrap();
-        let b = allocate(&run, |_| Ok(()), |_| {}).unwrap();
-        assert_eq!((a.id.as_str(), b.id.as_str()), ("w1", "w2"));
-        assert!(
-            allocate(
-                &run,
-                |workers| if workers.len() >= 2 {
-                    bail!("full")
-                } else {
-                    Ok(())
-                },
-                |_| {}
-            )
-            .is_err()
-        );
-        update(&run, "w1", |w| w.title = "T".into()).unwrap();
-        assert_eq!(load(&run, "w1").unwrap().repo, "api");
-
-        std::fs::write(task_path(&run, "w1"), "The task.").unwrap();
-        append_follow_up(&run, "w1", "Also do Y.\n").unwrap();
-        append_follow_up(&run, "w1", "And Z.").unwrap();
-        let text = std::fs::read_to_string(task_path(&run, "w1")).unwrap();
-        assert!(
-            text.starts_with("The task.\n\n## Follow-ups\n\n### 20"),
-            "{text}"
-        );
-        assert_eq!(text.matches("## Follow-ups").count(), 1);
-
-        let work = tempfile::tempdir().unwrap();
-        let brief = work.path().join(".herdr-linear-agent/DATA-1-w1");
-        std::fs::create_dir_all(&brief).unwrap();
-        let w = Worker {
-            brief_dir: brief.to_string_lossy().into_owned(),
-            ..load(&run, "w1").unwrap()
-        };
-        assert_eq!(copy_report_home(&run, &w).unwrap(), None);
-        std::fs::write(
-            brief.join("report.md"),
-            "PR: https://github.com/o/r/pull/1\n",
-        )
-        .unwrap();
-        assert!(copy_report_home(&run, &w).unwrap().is_some());
-        assert!(home_report_path(&run, "w1").is_file());
-        // A symbolic link is never read.
-        std::fs::remove_file(brief.join("report.md")).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", brief.join("report.md")).unwrap();
-        assert_eq!(report_hash(&w), None);
+    fn a_pr_counts_only_on_the_first_pr_line_naming_a_github_pull_request() {
+        let pull = Some("https://github.com/acme/api/pull/7");
+        let table = [
+            ("Done.\nPR: https://github.com/acme/api/pull/7\n", pull),
+            ("   PR:   https://github.com/acme/api/pull/7   ", pull),
+            (
+                "PR: https://github.com/my-org/api.v2/pull/1234",
+                Some("https://github.com/my-org/api.v2/pull/1234"),
+            ),
+            ("PR: https://gitlab.com/acme/api/pull/7", None),
+            ("PR: http://github.com/acme/api/pull/7", None),
+            ("PR: https://github.com/acme/api/issues/7", None),
+            ("PR: https://github.com/acme/api/pull/7/files", None),
+            ("PR: https://github.com/acme/api/pull/7 (draft)", None),
+            ("PR: https://github.com/acme/api/pull/", None),
+            ("PR: https://github.com/acme/api/pull/x7", None),
+            ("See PR: https://github.com/acme/api/pull/7", None),
+            ("PR: none yet\nPR: https://github.com/acme/api/pull/8", None),
+            ("No pull request.", None),
+        ];
+        for (report, expected) in table {
+            assert_eq!(pr_line(report).as_deref(), expected, "{report:?}");
+        }
     }
 
     #[test]
-    fn a_record_of_an_older_build_still_loads() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = Run::create(
-            dir.path(),
-            RunRecord {
-                identifier: "DATA-1".into(),
-                ..RunRecord::default()
+    fn allocation_hands_out_ids_and_a_refusal_writes_nothing() {
+        let runs = Runs::new();
+        let run = runs.add("DATA-1", Status::Active, AgentStatus::Open);
+        let first = allocate(
+            &run,
+            |existing| {
+                assert!(existing.is_empty());
+                Ok(())
             },
+            |w| w.repo = "api".into(),
         )
         .unwrap();
-        std::fs::write(
-            run.workers_dir().join("w1.toml"),
-            "id = \"w1\"\nrepo = \"api\"\n\n[agent]\nstatus = \"open\"\nlast_group = \"working\"\n",
+        assert_eq!((first.id.as_str(), first.repo.as_str()), ("w1", "api"));
+        assert!(!first.created.is_empty());
+        assert_eq!(first.created, first.updated);
+        assert!(run.dir.join("workers/w1.toml").is_file());
+
+        let second = allocate(
+            &run,
+            |existing| {
+                assert_eq!(existing.len(), 1);
+                Ok(())
+            },
+            |w| w.repo = "web".into(),
         )
         .unwrap();
-        let w = load(&run, "w1").unwrap();
+        assert_eq!(second.id, "w2");
+
+        let refused = allocate(
+            &run,
+            |_| bail!("one worker per repository"),
+            |_| panic!("init runs only after the check passed"),
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("one worker per repository")
+        );
+        assert_eq!(list(&run).len(), 2);
+        assert_eq!(load(&run, "w2").unwrap().repo, "web");
         assert_eq!(
-            (w.repo.as_str(), w.agent.status),
-            ("api", AgentStatus::Open)
+            load(&run, "w9").unwrap_err().to_string(),
+            "run DATA-1 has no worker w9"
         );
-        assert_eq!(list(&run).len(), 1);
+        assert!(load(&run, "../w1").is_err());
+    }
+
+    #[test]
+    fn ids_sort_by_number_and_updates_keep_id_and_created() {
+        let runs = Runs::new();
+        let run = runs.add("DATA-1", Status::Active, AgentStatus::Open);
+        for _ in 0..10 {
+            allocate(&run, |_| Ok(()), |_| {}).unwrap();
+        }
+        let ids: Vec<String> = list(&run).into_iter().map(|w| w.id).collect();
+        assert_eq!(ids[8..], ["w9", "w10"]);
+
+        let before = load(&run, "w3").unwrap();
+        let after = update(&run, "w3", |w| {
+            w.pr_url = "https://github.com/acme/api/pull/3".into();
+            w.id = "w99".into();
+            w.created = "1999-01-01T00:00:00Z".into();
+        })
+        .unwrap();
+        assert_eq!(after.id, "w3");
+        assert_eq!(after.created, before.created);
+        assert_eq!(load(&run, "w3").unwrap(), after);
+        assert!(load(&run, "w99").is_err());
+    }
+
+    #[test]
+    fn follow_ups_share_one_heading_in_the_task_file() {
+        let runs = Runs::new();
+        let run = runs.add("DATA-1", Status::Active, AgentStatus::Open);
+        assert_eq!(task_path(&run, "w1"), run.dir.join("workers/w1.task.md"));
+        assert_eq!(home_report_path(&run, "w1"), run.dir.join("workers/w1.md"));
+
+        std::fs::write(task_path(&run, "w1"), "Change the handler.\n").unwrap();
+        append_follow_up(&run, "w1", "  Also cover the redirect.  ").unwrap();
+        append_follow_up(&run, "w1", "Rename the flag.").unwrap();
+        let task = std::fs::read_to_string(task_path(&run, "w1")).unwrap();
+        assert!(
+            task.starts_with("Change the handler.\n\n## Follow-ups\n"),
+            "{task}"
+        );
+        assert_eq!(task.matches("## Follow-ups").count(), 1);
+        assert_eq!(task.matches("\n### ").count(), 2);
+        let first = task.find("\n\nAlso cover the redirect.\n").unwrap();
+        let second = task.find("\n\nRename the flag.\n").unwrap();
+        assert!(first < second);
+        assert!(task.ends_with("Rename the flag.\n"));
+    }
+
+    #[test]
+    fn reports_are_hashed_and_copied_home_never_through_a_link() {
+        let runs = Runs::new();
+        let run = runs.add("DATA-1", Status::Active, AgentStatus::Open);
+        let brief = runs.home.path().join("wt/.herdr-linear-agent/DATA-1-w1");
+        std::fs::create_dir_all(&brief).unwrap();
+        let worker = Worker {
+            brief_dir: brief.to_string_lossy().into_owned(),
+            ..api_worker(AgentStatus::Open, "", false)
+        };
+        let home = home_report_path(&run, "w1");
+
+        assert_eq!(report_hash(&worker), None);
+        assert_eq!(copy_report_home(&run, &worker).unwrap(), None);
+        assert!(!home.exists());
+
+        let text = "Done.\nPR: https://github.com/acme/api/pull/7\n";
+        std::fs::write(brief.join("report.md"), text).unwrap();
+        let hash = report_hash(&worker).unwrap();
+        assert_eq!(hash, files::sha256_hex(text.as_bytes()));
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            copy_report_home(&run, &worker).unwrap().as_deref(),
+            Some(text)
+        );
+        assert_eq!(std::fs::read_to_string(&home).unwrap(), text);
+
+        let secret = runs.home.path().join("secret.txt");
+        std::fs::write(&secret, "not a report").unwrap();
+        std::fs::remove_file(brief.join("report.md")).unwrap();
+        std::fs::remove_file(&home).unwrap();
+        std::os::unix::fs::symlink(&secret, brief.join("report.md")).unwrap();
+        assert_eq!(report_hash(&worker), None);
+        assert_eq!(copy_report_home(&run, &worker).unwrap(), None);
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn pending_and_open_agents_of_active_runs_count_against_max_agents() {
+        for (status, counts) in [
+            (AgentStatus::Pending, true),
+            (AgentStatus::Open, true),
+            (AgentStatus::Failed, false),
+            (AgentStatus::Stopped, false),
+        ] {
+            assert_eq!(api_worker(status, "", false).counts(), counts, "{status:?}");
+        }
+
+        let runs = Runs::new();
+        let busy = runs.add("DATA-1", Status::Active, AgentStatus::Open);
+        for status in [AgentStatus::Open, AgentStatus::Failed, AgentStatus::Pending] {
+            allocate(&busy, |_| Ok(()), |w| w.agent.status = status).unwrap();
+        }
+        let detached = runs.add("DATA-2", Status::Detached, AgentStatus::Open);
+        allocate(
+            &detached,
+            |_| Ok(()),
+            |w| w.agent.status = AgentStatus::Open,
+        )
+        .unwrap();
+        runs.add("DATA-3", Status::Active, AgentStatus::Stopped);
+        runs.add("DATA-4", Status::Active, AgentStatus::Pending);
+        assert_eq!(agent_count(&Run::list(&runs.dir())), 4);
+    }
+
+    #[test]
+    fn records_written_before_this_build_still_load() {
+        let runs = Runs::new();
+        let run = runs.add("DATA-1", Status::Active, AgentStatus::Open);
+        let stored = r#"id = "w1"
+title = "Change API"
+repo = "api"
+repo_path = "/src/api"
+branch = "herdr-linear-agent/data-1/w1-change-api"
+base = "main"
+worktree_path = "/wt/api"
+brief_dir = "/wt/api/.herdr-linear-agent/DATA-1-w1"
+restarts = 1
+report_hash = "5e1f"
+pr_url = "https://github.com/acme/api/pull/7"
+created = "2026-05-01T08:00:00Z"
+updated = "2026-05-01T09:30:00Z"
+
+[agent]
+status = "open"
+profile = "standard"
+kind = "claude"
+agent_name = "data-1-w1"
+pane_id = "w1:p1"
+cwd = "/wt/api"
+last_group = "waiting"
+"#;
+        std::fs::write(run.dir.join("workers/w1.toml"), stored).unwrap();
+        let worker = load(&run, "w1").unwrap();
+        assert_eq!(worker.branch, "herdr-linear-agent/data-1/w1-change-api");
+        assert_eq!(worker.restarts, 1);
+        assert_eq!(worker.pr_url, "https://github.com/acme/api/pull/7");
+        assert_eq!(worker.announced_report_hash, "");
+        assert!(!worker.gone_reported);
+        assert_eq!(worker.agent.status, AgentStatus::Open);
+        assert_eq!(worker.agent.pane_id, "w1:p1");
+        assert_eq!(Group::from_token(&worker.agent.last_group), None);
+        assert_eq!(list(&run), std::slice::from_ref(&worker));
+
+        let rewritten = update(&run, "w1", |w| w.agent.last_group = "working".into()).unwrap();
+        assert_eq!(rewritten.created, "2026-05-01T08:00:00Z");
+        assert_eq!(load(&run, "w1").unwrap(), rewritten);
+    }
+
+    #[test]
+    fn the_recorded_agent_needs_pane_cwd_kind_and_name_to_agree() {
+        let record = api_worker_agent("w1:p1");
+        let table = [
+            (
+                "all agree",
+                herdr_sees(
+                    "w1:p1",
+                    Some("data-1-w1"),
+                    WORKTREE,
+                    "claude",
+                    HerdrStatus::Idle,
+                ),
+                true,
+            ),
+            (
+                "resumed with an empty name",
+                herdr_sees("w1:p1", Some(""), WORKTREE, "claude", HerdrStatus::Idle),
+                true,
+            ),
+            (
+                "resumed without a name",
+                herdr_sees("w1:p1", None, WORKTREE, "claude", HerdrStatus::Idle),
+                true,
+            ),
+            (
+                "another name",
+                herdr_sees(
+                    "w1:p1",
+                    Some("data-1-w2"),
+                    WORKTREE,
+                    "claude",
+                    HerdrStatus::Idle,
+                ),
+                false,
+            ),
+            (
+                "another cwd",
+                herdr_sees(
+                    "w1:p1",
+                    Some("data-1-w1"),
+                    "/wt/web",
+                    "claude",
+                    HerdrStatus::Idle,
+                ),
+                false,
+            ),
+            (
+                "another kind",
+                herdr_sees(
+                    "w1:p1",
+                    Some("data-1-w1"),
+                    WORKTREE,
+                    "codex",
+                    HerdrStatus::Idle,
+                ),
+                false,
+            ),
+            (
+                "another pane",
+                herdr_sees(
+                    "w4:p1",
+                    Some("data-1-w1"),
+                    WORKTREE,
+                    "claude",
+                    HerdrStatus::Idle,
+                ),
+                false,
+            ),
+        ];
+        for (case, seen, ours) in table {
+            let found = find_agent(&record, std::slice::from_ref(&seen));
+            assert_eq!(found.is_some(), ours, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_shows_where_the_agent_sits_and_how_long_its_status_held() {
+        let state = tempfile::tempdir().unwrap();
+        let record = AgentRecord {
+            last_state: "blocked".into(),
+            last_state_change: secs_before_noon(45),
+            ..api_worker_agent("w1:p1")
+        };
+        let read =
+            |snapshot: Snapshot| live_state(&record, &snapshot, noon(), state.path(), SOCKET);
+
+        let home = read(session_with(
+            &["w1:p1"],
+            vec![ours_in("w1:p1", HerdrStatus::Blocked)],
+        ));
+        assert!(home.pane_exists);
+        assert_eq!(home.moved_to, None);
+        assert_eq!(home.agent_state, Some(HerdrStatus::Blocked));
+        assert_eq!(home.state_secs, 45);
+        assert_eq!(home.agent.unwrap().name.as_deref(), Some("data-1-w1"));
+
+        let changed = read(session_with(
+            &["w1:p1"],
+            vec![ours_in("w1:p1", HerdrStatus::Working)],
+        ));
+        assert_eq!(changed.agent_state, Some(HerdrStatus::Working));
+        assert_eq!(changed.state_secs, 0);
+
+        let moved = read(session_with(
+            &["w3:p2"],
+            vec![ours_in("w3:p2", HerdrStatus::Blocked)],
+        ));
+        assert!(moved.pane_exists);
+        assert_eq!(
+            moved.moved_to,
+            Some(("w3".into(), "w3:t1".into(), "w3:p2".into()))
+        );
+        assert_eq!(moved.state_secs, 45);
+
+        let stranger = herdr_sees(
+            "w1:p1",
+            Some("someone-else"),
+            WORKTREE,
+            "claude",
+            HerdrStatus::Idle,
+        );
+        let foreign = read(session_with(&["w1:p1"], vec![stranger]));
+        assert!(!foreign.pane_exists);
+        assert_eq!(foreign.agent_state, None);
+        assert_eq!(foreign.agent, None);
+
+        let at_prompt = read(session_with(&["w1:p1"], vec![]));
+        assert!(at_prompt.pane_exists);
+        assert_eq!(at_prompt.agent_state, None);
+
+        assert_eq!(read(session_with(&[], vec![])), Live::default());
+    }
+
+    #[test]
+    fn a_waiting_self_report_counts_while_recent_and_not_working() {
+        let table = [
+            (
+                60,
+                "term-w1:p1",
+                HerdrStatus::Idle,
+                true,
+                Group::WaitingOnYou,
+            ),
+            (
+                299,
+                "term-w1:p1",
+                HerdrStatus::Idle,
+                true,
+                Group::WaitingOnYou,
+            ),
+            (300, "term-w1:p1", HerdrStatus::Idle, false, Group::Idle),
+            (60, "term-before", HerdrStatus::Idle, false, Group::Idle),
+            (60, "term-w1:p1", HerdrStatus::Working, true, Group::Working),
+        ];
+        for (age, terminal, status, recent, expected) in table {
+            let state = tempfile::tempdir().unwrap();
+            progress::save(
+                state.path(),
+                &progress::Record {
+                    socket: SOCKET.into(),
+                    pane_id: "w1:p1".into(),
+                    terminal_id: terminal.into(),
+                    activity: progress::WAITING.into(),
+                    percent: None,
+                    reported_at: noon().as_second() - age,
+                },
+            )
+            .unwrap();
+            let worker = api_worker(AgentStatus::Open, "", false);
+            let snapshot = session_with(&["w1:p1"], vec![ours_in("w1:p1", status)]);
+            let seen = live_state(&worker.agent, &snapshot, noon(), state.path(), SOCKET);
+            let case = format!("{age} s old from {terminal}, {status:?}");
+            assert_eq!(seen.self_report.is_some(), recent, "{case}");
+            assert_eq!(group(&worker, &seen), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn the_first_matching_row_decides_the_group() {
+        use AgentStatus::{Failed, Open};
+        use HerdrStatus::{Blocked, Done, Idle, Unknown, Working};
+        let gone = Live::default();
+        let asked = Live {
+            self_report: Some(progress::Record {
+                activity: progress::WAITING.into(),
+                ..progress::Record::default()
+            }),
+            ..in_pane(Some(Idle), 5)
+        };
+        let table = [
+            (
+                "failed beats a report",
+                api_worker(Failed, "h", false),
+                in_pane(Some(Idle), 0),
+                Group::WaitingOnYou,
+            ),
+            (
+                "pane gone after a report",
+                api_worker(Open, "h", false),
+                gone.clone(),
+                Group::Reported,
+            ),
+            (
+                "pane gone before a report",
+                api_worker(Open, "", false),
+                gone,
+                Group::WaitingOnYou,
+            ),
+            (
+                "blocked for 30 s",
+                api_worker(Open, "", false),
+                in_pane(Some(Blocked), 30),
+                Group::WaitingOnYou,
+            ),
+            (
+                "blocked for 29 s",
+                api_worker(Open, "", false),
+                in_pane(Some(Blocked), 29),
+                Group::Working,
+            ),
+            (
+                "launch dialog for 60 s",
+                api_worker(Open, "", true),
+                in_pane(Some(Unknown), 60),
+                Group::WaitingOnYou,
+            ),
+            (
+                "launch dialog for 59 s",
+                api_worker(Open, "", true),
+                in_pane(Some(Unknown), 59),
+                Group::Working,
+            ),
+            (
+                "unknown after the prompt",
+                api_worker(Open, "", false),
+                in_pane(Some(Unknown), 600),
+                Group::Working,
+            ),
+            (
+                "asked in its self-report",
+                api_worker(Open, "h", false),
+                asked,
+                Group::WaitingOnYou,
+            ),
+            (
+                "working",
+                api_worker(Open, "h", false),
+                in_pane(Some(Working), 900),
+                Group::Working,
+            ),
+            (
+                "no agent yet",
+                api_worker(Open, "", true),
+                in_pane(None, 0),
+                Group::Working,
+            ),
+            (
+                "idle with a report",
+                api_worker(Open, "h", false),
+                in_pane(Some(Idle), 0),
+                Group::Reported,
+            ),
+            (
+                "done with a report",
+                api_worker(Open, "h", false),
+                in_pane(Some(Done), 0),
+                Group::Reported,
+            ),
+            (
+                "idle without a report",
+                api_worker(Open, "", false),
+                in_pane(Some(Idle), 0),
+                Group::Idle,
+            ),
+            (
+                "done without a report",
+                api_worker(Open, "", false),
+                in_pane(Some(Done), 0),
+                Group::Idle,
+            ),
+        ];
+        for (case, worker, seen, expected) in table {
+            assert_eq!(group(&worker, &seen), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn group_labels_and_tokens_round_trip() {
+        let table = [
+            (Group::WaitingOnYou, "Waiting on you", "waiting_on_you"),
+            (Group::Working, "Working", "working"),
+            (Group::Idle, "Idle", "idle"),
+            (Group::Reported, "Reported", "reported"),
+        ];
+        for (group, label, token) in table {
+            assert_eq!(group.label(), label);
+            assert_eq!(group.token(), token);
+            assert_eq!(Group::from_token(token), Some(group));
+        }
+        for unknown in ["", "waiting", "Working", "blocked"] {
+            assert_eq!(Group::from_token(unknown), None, "{unknown:?}");
+        }
     }
 }
