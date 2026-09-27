@@ -182,7 +182,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `issue_updated_at` | the issue's `updatedAt` when `issue.md` was last written |
 | `issue_hash` | hash of the parts a person edits |
 | `size`, `size_source` | size and where it came from: `estimate`, `label`, `agent`, `agent (timed out)`, `default` |
-| `routing` | a running routing job: `pid`, `started`, `output` path; `null` otherwise |
+| `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory and only clears this field |
 | `coordinator` | the coordinator's agent record |
 | `prompt_cursor` | prompts created after this timestamp are unread |
 | `last_activity` | when an activity was last sent |
@@ -204,7 +204,9 @@ Agent record (coordinator and every worker's `agent`):
 | `launch_attempts` | |
 | `agent_session` | the agent's native session id, for a resume |
 | `resume` | the next start resumes `agent_session` |
-| `last_state`, `last_state_change` | the last Herdr status seen and when it changed |
+| `last_state`, `last_state_change` | the last Herdr status seen and when its episode began |
+| `last_state_seq` | Herdr's `state_change_seq` when `last_state` was seen |
+| `last_attempt_at` | when the last unsuccessful placement or start was made |
 | `last_group` | the last worker group token |
 | `blocked_reported` | the "needs someone in Herdr" question was sent for this episode |
 
@@ -317,7 +319,9 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 - The wake task subscribes to the global events (pane created, updated, closed, exited, moved, agent detected; tab created and closed; workspace closed) and to `pane.agent_status_changed` for the panes of its latest snapshot. It takes a snapshot only to learn the pane set: at connect and after an event that changes panes.
 - When the pane set changes it opens the new status subscription, waits for its ack, drops the old one, and wakes the ticker once more, so a status change that reached only the old connection is seen in the next snapshot.
 - An event that does not parse is skipped. A refused status subscription or a failed snapshot is retried (200 ms doubling to 5 s) without counting as a disconnect. Only a failed connect, EOF or I/O error on the global subscription marks Herdr disconnected; the reconnect backoff (200 ms doubling to 5 s) resets after the connection stayed up 30 s.
-- Rules that read panes or agents run only in a pass whose snapshot succeeded.
+- Rules that read panes or agents run only in a pass whose snapshot succeeded. Without one, a pass still applies Linear facts: relay, close (closing the recorded workspaces of open agents), detach and the heartbeat (groups from `last_group`).
+- The snapshot's workspaces give each workspace's label, which finds a coordinator placement whose answer was lost.
+- A recorded pane the ticker has never seen in a snapshot counts as present and empty for 30 s after it was first missed (Herdr may answer a placement before its pane list shows the pane). A pane seen before is gone as soon as a snapshot lacks it.
 - **Timing change:** Herdr is no longer polled. The snapshot replaces the old per-tick `agent list` and `pane list`.
 
 ### Requests used
@@ -387,9 +391,9 @@ An agent in Herdr is the recorded agent only when pane id, working directory, ki
 
 ### Pass structure
 
-Each run pass runs, in this order, the parts whose inputs are ready: relay (after a run read), watch, routing results, launch (placement, start, prompt, nudge), heartbeat, inbox pruning, flush. Intake runs in the Linear task. A failure in one run is logged as `<KEY>: <error>` and never stops the others. After Herdr state changes, progress records of panes that no longer exist are pruned.
+A pass takes one snapshot, then: applies the Linear events (sessions, sent activities, write failures, run reads: close, detach, issue edits, relay); intake from a delegated list it has not seen; the results of effect tasks and routing agents; then per active run, with a snapshot, watch, launch (placement, start, prompt) and nudge, and with or without one the heartbeat and inbox pruning; then the write-failure notice and the pruning of progress records. Intake runs in the reconciler, which owns the run records and the limits; the Linear task only polls and flushes. A failure in one run is logged as `<KEY>: <error>` and never stops the others. After Herdr state changes, progress records of panes that no longer exist are pruned.
 
-**Timing change:** passes are driven by events and timers, not by a 15 second loop. Time-based rules (30 s blocked, 60 s launch dialog, 60 s idle nudge, 20 min heartbeat, run timeout, routing timeout, 10 min write failure) must be re-evaluated by timers at least as often as they would have been at 15 s.
+**Timing change:** passes are driven by events and timers, not by a 15 second loop. After a pass the reconciler sleeps until the earliest future time a rule may become due, at most 150 s. Time rules read an injected `now`; nothing in a pass reads the wall clock. Time-based rules (30 s blocked, 60 s launch dialog, 60 s idle nudge, 20 min heartbeat, run timeout, routing timeout, 10 min write failure) must be re-evaluated by timers at least as often as they would have been at 15 s.
 
 ### Log lines
 
@@ -399,7 +403,7 @@ Each run pass runs, in this order, the parts whose inputs are ready: relay (afte
 | `intake: <error>` | the delegated-issue poll failed |
 | `<KEY>: picked up` | a claim |
 | `<KEY>: could not pick up: <error>` | a claim failed |
-| `<KEY>: could not open the session yet: <error>` | claim without a session |
+| `<KEY>: could not open the session yet: <error>` | not written by the rewrite: the claim leaves the session to the flush, which logs the next line |
 | `<KEY>: could not create the session: <error>` | flush without a session |
 | `<KEY>: Linear refused request <request id>: <error>` | a definitive refusal |
 | `<KEY>: Linear write failed, will retry: <error>` | the queue is blocked |
@@ -446,7 +450,7 @@ Operations of the Linear task:
 
 | Operation | Interval | Behavior |
 | --- | --- | --- |
-| intake poll | `linear.intake_interval_seconds` (default 5) | `delegated_issues`, then intake |
+| intake poll | `linear.intake_interval_seconds` (default 5) | `delegated_issues`, published for the reconciler's intake |
 | run read | `linear.run_read_interval_seconds` (default 5) | `run_updates` for every active run with a session, then per-run handling |
 | viewer | once, cached | the app user id; retried until known; run reads wait for it |
 | flush | after new outbox requests and after each read | see [Outbox and flush](#outbox-and-flush) |
@@ -473,7 +477,7 @@ For each delegated issue in the order returned:
 
 1. A run exists for the key:
    - Active, with no coordinator profile decided and no routing job (a claim cut short, or an older build): read the issue and run `finish_claim`. Log errors as `<KEY>: <error>`.
-   - Not active (detached or closed): set it active. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
+   - Not active (detached or closed), in a delegated list read after the detach or close: set it active. A list read at or before that moment does not count, so a list and a run read of one round cannot flip the run back and forth. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
    - Otherwise nothing. The issue is never claimed twice. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 2. No run: skip while `<state_dir>/paused` exists. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
 3. Stop the whole intake (not only this issue) when active runs are at `max_runs`, or when the agent count plus one would exceed `max_agents`. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
@@ -485,14 +489,14 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 
 1. Validate the key; read the issue detail.
 2. Create the state and runs directories. Create the run with `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, and `prompt_cursor = last_activity = timeout_since = now`.
-3. Write `issue.md`. Log `<KEY>: picked up`.
-4. Queue the thought `Picked up <KEY>.`
-5. `finish_claim`.
+3. Log `<KEY>: picked up`.
+4. Queue the thought `Picked up <KEY>.` and the issue-state request with target `started`.
+5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. The session is opened by the flush (Linear's auto-created one, or a new one).
 
 ### `finish_claim(run, detail)`
 
-1. When the run has no session: `open_session` (the session Linear created on delegation, or a new one). On failure log `<KEY>: could not open the session yet: <error>` and go on; the flush opens it later.
-2. Queue an issue-state request with target `started`.
+1. The session is opened by the flush, never here.
+2. Queue an issue-state request with target `started`, unless one is queued or the issue is already started, completed or canceled.
 3. Route.
 
 Rules pinned:
@@ -516,7 +520,7 @@ Rules pinned:
 
 ### Route and decide
 
-- `route`: a known size decides now. Without `[routing.agent]`, decide `(unknown, "default")`. Otherwise start the routing agent, record the job in `run.json` (`pid`, `started`, `output`) and return; a spawn failure is logged and decides `(unknown, "agent")`.
+- `route`: a known size decides now. Without `[routing.agent]`, decide `(unknown, "default")`. Otherwise start the routing agent in its own task and keep the job in memory; a spawn failure is logged and decides `(unknown, "agent")`. A run whose coordinator is undecided and whose routing is not running asks the Linear task for the detail and is routed when it arrives.
 - `decide(size, source)`: pick the profile, set `size`, `size_source`, `routing = null` and a pending coordinator record (`status pending`, `profile`, `kind`, `agent_name`), then queue the thought ``The coordinator uses the `<profile>` profile (<why>).`` with `<why>`:
 
 | Size and source | `<why>` |
@@ -533,12 +537,12 @@ Rules pinned:
 - Schema: object with one required property `size`, a string enum of the 8 size names, no additional properties. It is written to `.state/routing.schema.json`.
 - The child runs in `.state/`, with the ticker's `PATH`, stderr discarded, stdin `Title: <title>\n\n<description>\n`. For `claude`, stdout goes to `.state/routing.out`; for `codex`, stdout is discarded and `-o` writes that file. A child that exits before reading closes the pipe; that is not an error and the answer reads as unknown. `src/routing.rs:the_agent_gets_the_issue_on_standard_input`
 - `parse_output`: take `structured_output` when it is an object, else parse the string `result` as JSON, else the whole value. The answer must be an object with exactly one key, `size`, whose value is a size name; anything else is `unknown`. `src/routing.rs:outputs_are_checked_against_the_schema`
-- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. A job started by an earlier ticker is not a child: check it with signal 0 and kill it with SIGKILL. The job is in the record, so a ticker restart never runs the agent twice.
+- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. Routing jobs are in memory, so a ticker restart routes again. A record written by an older build with `routing` set: when its pid is alive, kill it with SIGKILL; clear `routing`; route again.
 - With `tokio::process`, wait on the child with a timeout in its own task and hand the result to the run's pass. `tests/scenarios:the_routing_agent_decides_an_unsized_issue` (fake `claude` answers XS: size XS, source `agent`, profile `coordinator-light`).
 
 ## Reading runs: close, detach, issue edits
 
-For every active run with a session, per update, in this order:
+For every active run with a session, per update, in this order. A read that started before the run's last status change (a re-delegation, a reopen, a close or a detach) is ignored, so a read made with an old query cannot undo a newer state:
 
 1. State type `completed` or `canceled`: close the run.
 2. Delegate is not the app user: detach the run.
@@ -587,7 +591,7 @@ For an `open` record, given `Live`:
 - `moved_to` updates `workspace_id`, `tab_id`, `pane_id`.
 - A found agent with an empty name is renamed to the recorded name.
 - A found agent's non-empty session id is stored in `agent_session`.
-- A status different from `last_state` sets `last_state` (empty when no agent) and `last_state_change = now`.
+- A status different from `last_state`, or the same status with a `state_change_seq` different from `last_state_seq`, starts a new episode: it sets `last_state` (empty when no agent), `last_state_seq`, `last_state_change = now`, and clears `blocked_reported`. A new blocked episode with the same status is therefore reported again.
 - `blocked_reported` is cleared when the agent no longer needs a person.
 
 ### Needs a person
@@ -667,7 +671,7 @@ Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a 
 
 ### Pane metadata tokens
 
-`pane.report_metadata` with `pane_id`, `source` (the plugin's metadata source id), `display_agent`, `tokens: {"hla_state": "<state>"}`, `ttl_ms: 300000`. Failures are ignored. All pane tokens use the `hla_` prefix. Herdr allows at most 16 tokens per report, names `^[A-Za-z0-9_-]{1,32}$`. Refresh the token before the TTL runs out while the pane exists (the old tick refreshed it every 15 s).
+`pane.report_metadata` with `pane_id`, `source` (the plugin's metadata source id), `display_agent`, `tokens: {"hla_state": "<state>"}`, `ttl_ms: 300000`. Failures are ignored. All pane tokens use the `hla_` prefix. Herdr allows at most 16 tokens per report, names `^[A-Za-z0-9_-]{1,32}$`. A pane's token is reported when its value changes, and otherwise every 150 s (half the TTL) while the pane exists.
 
 ## Launching agents
 
@@ -690,23 +694,24 @@ For an active run whose coordinator is `pending`:
    - `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
 2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused.
 3. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` from the root pane; set `status open`, `prompt_pending true`, `launch_attempts 0`.
-4. Placement happens in the claim pass. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
+4. `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane of a workspace with the run's label whose cwd is `canonical_dir` is adopted instead of creating a second workspace. Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 
-A placement failure counts as a launch attempt (see below).
+A placement failure counts as a launch attempt (see below); `NotSent` and `OutcomeUnknown` do not.
 
 ### Start
 
 For each `open` agent of the run with `prompt_pending` (coordinator first, then workers by id):
 
 - Start only when the pane exists and no agent is in it (the pane is at its shell prompt). An agent already in the pane (for example one left `blocked` by `agent_not_ready`) is never started again.
-- At most one start per run per pass. **Timing change:** in the rewrite a run has at most one start in flight, and the next start waits until the previous one's outcome is known.
+- At most one start per run per pass. **Timing change:** in the rewrite a run has at most one start in flight, and the next start waits until the previous one's outcome is known. `agent.start` runs as an effect task; after it answers (or its answer is lost) the agent is not started again in that pane for 60 s while Herdr has not detected it.
 - Arguments: `profile_args(profile)`, then `resume_args(kind, agent_session)` when `resume` is set and the arguments exist. Examples: a `coordinator-light` start ends `-- --model sonnet`; a resumed coordinator ends `--resume sess-data-1-coordinator`; a `standard` worker ends `--model sonnet --effort high --permission-mode auto`; a `deep` worker includes `model_reasoning_effort=xhigh`. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:restarts_switch_profiles_and_are_limited`
 - Trust dialog: when `claude.auto_accept_trust_dialog` is true and the kind is `claude`, right before the start, trust the coordinator's `canonical_dir`, or the worker's worktree (its `cwd`) and its repository's main checkout (`repo_path`). Nothing is trusted when the option is off. `tests/scenarios:the_trust_dialog_is_accepted_only_when_enabled`
 - `claude_trust.trust(env, dirs)`: the config is `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`. A missing file is left missing; a file whose top level is not an object is left alone. For each non-empty folder, set `projects.<folder>.hasTrustDialogAccepted = true` when it is not already true, keeping every other key, the key order and the file mode (0600 when unknown). Write through `.claude.json.hla.<pid>.tmp` and a rename. Returns whether the file changed. `src/claude_trust.rs:trust_is_added_once_and_everything_else_is_kept`, `src/claude_trust.rs:a_missing_or_unexpected_config_is_left_alone`
 - Outcome:
   - Success: the agent is running; the prompt is still pending.
   - Error `agent_not_ready`: the agent exists in the pane but is not ready (a trust or permission dialog); keep `open` and `prompt_pending`; the needs-a-person rules take over. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
-  - Any other error: increase `launch_attempts`. After 3 attempts, set `failed` with `error` = the message and queue an error activity (text: open question).
+  - Any other error: increase `launch_attempts`. After 3 attempts, set `failed` with `error` = the message and queue an error activity (see decision 6).
+  - Attempts are spaced: after an unsuccessful attempt the next one waits 15 s, doubling with every counted attempt (`last_attempt_at`). `NotSent` (Herdr down) waits 15 s and does not count.
 
 ### Launch prompt
 
@@ -999,8 +1004,8 @@ report [--percent N | --unknown] --activity TEXT
 - `agent_not_ready` in the fake leaves a `blocked` agent in the pane and returns the error.
 - Git: every `git -C` fails with 128 `not a git repository`, except `fetch origin`, which succeeds.
 - The fake Linear (`src/linear/api.rs` `fake`) is kept, with its clock that stamps each activity after the present.
-- `World::tick` becomes "run the ticker until quiescent" with both Linear intervals due. Assertions that count ticks become assertions on the order of effects (placement, then one start, then one prompt).
-- Ages are simulated by rewriting recorded timestamps (`last_state_change`, `last_activity`, `timeout_since`), so time rules must read those fields, not only in-memory timers.
+- `World::tick` becomes `World::settle`: Linear step and pass alternate, with both Linear intervals due, until a round changes no run-folder file, makes no Herdr request other than `session.snapshot` and `pane.report_metadata`, leaves the Linear queries as they were and has nothing in flight; it fails after 50 rounds. Assertions that count ticks become assertions on the order of effects (placement, then one start, then one prompt).
+- Durations use an injected clock. The World advances its clock instead of rewriting recorded timestamps, and the fake Linear stamps activities after that clock.
 
 ## Decisions for the questions the inputs left open
 
@@ -1011,9 +1016,9 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 3. Progress records use the metadata `source` `herdr-linear-agent`. **Kept:** a record is `state/progress/<pane>-<hash>.json` and sets the pane token `hla_activity` with a 300 s TTL. The record holds `pane`, `terminal`, `percent` (or null for `--unknown`), `activity` and `at`. The percent is not sent as a token.
 4. An inbox item is `inbox/<id>.json` with the fields `id`, `kind`, `created`, `worker` (optional) and `body`. Ids are `i<n>` from a counter kept under the run lock. `inbox done` moves an item to `inbox/done/`. Done items older than 7 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
 5. The `Start worker` action is queued when a worker's launch prompt is delivered, not when `worker start` returns. Its parameter is `<id> <repo>: <title>`.
-6. A launch attempt is one failed placement or one failed `agent.start`, including `agent_not_ready`. After 3 attempts the agent is `Failed` with the last error. The ticker then posts the error activity `Could not start the <role> agent: <error>`, where the role is `coordinator` or `worker <id>`. `agent.start` gets `timeout_ms` 30000.
+6. A launch attempt is one failed placement or one failed `agent.start`, including `agent_not_ready`; `NotSent` and `OutcomeUnknown` are not attempts. After 3 attempts the agent is `Failed` with the last error. The ticker then posts the error activity `Could not start the <role> agent: <error>`, where the role is `coordinator` or `worker <id>`. `agent.start` gets `timeout_ms` 30000.
 7. `worker prompt` sends the given text itself with `agent.prompt`. It fails with `worker <id> is not running` when the worker is not `open` or has no pane. It is refused while the worker waits on a dialog, as the tests pin.
-8. A restart resets `last_group`, `report_hash`, `gone_reported`, `blocked_reported`, `error` and `launch_attempts`, and sets `prompt_pending`. `announced_report_hash` and `pr_url` are kept. A `failed` worker whose worktree was never created is placed again from its base.
+8. A restart resets `last_group`, `report_hash`, `gone_reported`, `blocked_reported`, `error`, `launch_attempts`, `last_attempt_at` and `last_state_seq`, and sets `prompt_pending`. `announced_report_hash` and `pr_url` are kept. A `failed` worker whose worktree was never created is placed again from its base.
 9. When `git fetch` fails, `worker start` fails with `git fetch failed: <stderr first line>` and writes no worker record. The `max_agents` refusal is `the limit of <n> agents is reached`.
 10. Only workers that are not `stopped` count for one worker per repository and for `max_workers_per_run`.
 11. A `Waiting for you` self-report counts only while Herdr does not show the agent `working`, and only while the report is younger than 5 minutes.

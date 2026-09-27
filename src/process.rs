@@ -41,7 +41,8 @@ impl Cmd {
         self
     }
 
-    /// The program and its arguments separated by spaces, for logs and tests.
+    /// The program and its arguments separated by spaces, for tests.
+    #[cfg(test)]
     pub fn display(&self) -> String {
         std::iter::once(self.program.as_str())
             .chain(self.args.iter().map(String::as_str))

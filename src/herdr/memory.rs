@@ -248,6 +248,19 @@ impl FakeHerdr {
         agent.agent.state_change_seq += 1;
     }
 
+    /// The agent named `name` loses its name, as a natively resumed agent
+    /// does.
+    pub fn forget_name(&self, name: &str) {
+        let mut model = self.model();
+        if let Some(agent) = model
+            .agents
+            .values_mut()
+            .find(|a| a.agent.name.as_deref() == Some(name))
+        {
+            agent.agent.name = None;
+        }
+    }
+
     /// The workspace goes away without a request, as when a person closes it.
     pub fn remove_workspace(&self, workspace: &str) {
         self.model()

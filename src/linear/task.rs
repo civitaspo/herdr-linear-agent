@@ -140,6 +140,7 @@ impl LinearTask {
         self.last_read = None;
     }
 
+    #[cfg(test)]
     pub fn level(&self) -> &LinearLevel {
         &self.level
     }

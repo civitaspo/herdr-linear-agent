@@ -1,7 +1,3 @@
-// The reconciler and its test World are not written yet, so the helpers
-// and fakes they will call are unused; writing them removes this allow.
-#![allow(dead_code)]
-
 mod actions;
 mod agents;
 mod claude_trust;

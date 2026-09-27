@@ -46,6 +46,8 @@ pub trait LinearApi: Sync {
 
     /// The response headers of every call since the last take, oldest first
     /// (the rate-limit headers are read from them).
+    // The budget that reads them (PR 3) is not written yet.
+    #[allow(dead_code)]
     fn take_headers(&self) -> Vec<HeaderMap> {
         Vec::new()
     }

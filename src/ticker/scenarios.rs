@@ -867,3 +867,37 @@ async fn a_list_read_with_the_detaching_read_does_not_bring_the_run_back() {
     let again = "The issue was delegated again; the run continues.";
     assert_eq!(count(&world.bodies(KEY, "thought"), again), 0, "no flap");
 }
+
+#[tokio::test]
+async fn an_agent_that_lost_its_name_is_renamed_and_still_watched() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.herdr.forget_name("data-1-coordinator");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.renames(),
+        [(PaneId(pane.clone()), "data-1-coordinator".to_string())]
+    );
+    let c = world.record(KEY);
+    assert_eq!((c.coordinator_lost, c.coordinator.pane_id), (false, pane));
+}
+
+#[tokio::test]
+async fn after_a_herdr_restart_the_panes_count_and_nothing_is_lost() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.herdr.restart();
+    world.later(5);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "open agents are not started again"
+    );
+}

@@ -341,14 +341,17 @@ impl Reconciler {
     }
 
     /// Whether an effect task or a routing agent is still running.
+    #[cfg(test)]
     pub fn busy(&self) -> bool {
         !self.in_flight.is_empty() || !self.routing.is_empty()
     }
 
+    #[cfg(test)]
     pub fn effects_in_flight(&self) -> usize {
         self.in_flight.len()
     }
 
+    #[cfg(test)]
     pub fn routing_in_flight(&self) -> usize {
         self.routing.len()
     }
