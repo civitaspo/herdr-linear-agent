@@ -3,8 +3,14 @@
 //! to Linear; agents leave requests in a run's outbox.
 
 pub mod api;
+// The ticker switch in this PR removes this allow.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod client;
 pub mod credentials;
 pub mod oauth;
+// The ticker switch in this PR removes this allow.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod task;
 pub mod transport;
 
 use zeroize::Zeroizing;
@@ -33,6 +39,9 @@ pub enum ApiError {
     ActorIdentityMismatch,
     /// A response field was missing or malformed.
     ReadFieldsInvalid,
+    /// Linear rate-limited the request (HTTP 429, or a GraphQL error whose
+    /// `extensions.code` is `RATELIMITED`). It is never a definitive refusal.
+    RateLimited,
 }
 
 impl std::fmt::Display for ApiError {
@@ -58,6 +67,7 @@ impl std::fmt::Display for ApiError {
             Self::ReadFieldsInvalid => {
                 formatter.write_str("a Linear response field is missing or malformed")
             }
+            Self::RateLimited => formatter.write_str("Linear rate-limited the request"),
         }
     }
 }

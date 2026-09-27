@@ -14,9 +14,9 @@ use super::credentials::CredentialManager;
 use super::{ApiError, VerifiedReadOutcome};
 
 pub const GRAPHQL_ENDPOINT: &str = "https://api.linear.app/graphql";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 
 /// Sends one GraphQL operation and returns its `data` object.
@@ -127,7 +127,7 @@ impl Transport for HttpsTransport {
 }
 
 /// Exactly one `application/json` content type, parameters allowed.
-fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
+pub(crate) fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
     let (Some(value), None) = (values.next(), values.next()) else {
         return false;
     };

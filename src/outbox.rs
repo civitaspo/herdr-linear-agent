@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::files;
 use crate::linear::ApiError;
 use crate::linear::api::{Activity, ExternalUrl, IssueDetail, Linear};
+use crate::linear::client::LinearApi;
 use crate::linear::transport::Transport;
 use crate::run::Run;
 
@@ -191,6 +192,98 @@ fn apply<T: Transport>(
             linear.set_issue_state(issue_id, &state_id)?;
             // The write is confirmed by reading the issue again.
             if linear.issue(issue_id)?.state.id != state_id {
+                return Err(ApiError::RequestFailed);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The async counterpart of [`send`] for the event-driven ticker: the same
+/// order, attempted markers, read-back and set-aside rules, over a
+/// [`LinearApi`]. `RateLimited` is not definitive, so such a request stays
+/// queued.
+// The ticker switch in this PR removes this allow.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn send_async(
+    run: &Run,
+    session_id: &str,
+    issue_id: &str,
+    review_state: &str,
+    linear: &impl LinearApi,
+) -> Sent {
+    let mut sent = Sent {
+        count: 0,
+        refused: Vec::new(),
+        blocked: None,
+        activity_sent: false,
+    };
+    for (path, mut request) in pending(run) {
+        let outcome = send_one_async(
+            &path,
+            &mut request,
+            session_id,
+            issue_id,
+            review_state,
+            linear,
+        )
+        .await;
+        match outcome {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&path);
+                sent.count += 1;
+                sent.activity_sent |= matches!(request.op, Op::Activity { .. });
+            }
+            Err(error) if definitive(&error) => {
+                set_aside(&path);
+                sent.refused.push((request, error));
+            }
+            Err(error) => {
+                sent.blocked = Some(error);
+                break;
+            }
+        }
+    }
+    sent
+}
+
+async fn send_one_async(
+    path: &Path,
+    request: &mut Request,
+    session_id: &str,
+    issue_id: &str,
+    review_state: &str,
+    linear: &impl LinearApi,
+) -> Result<(), ApiError> {
+    let checked = match &request.op {
+        Op::Activity { .. } if request.attempted => {
+            linear.activity_exists(session_id, &request.id).await?
+        }
+        // Replacing the plan or the URL list is idempotent, and a state move
+        // reads the issue before it writes.
+        _ => false,
+    };
+    if checked {
+        return Ok(());
+    }
+    request.attempted = true;
+    files::write_json(path, request).map_err(|_| ApiError::Configuration)?;
+    match &request.op {
+        Op::Activity { activity } => {
+            linear
+                .create_activity(session_id, &request.id, activity)
+                .await
+        }
+        Op::Plan { plan } => linear.set_plan(session_id, plan).await,
+        Op::ExternalUrls { urls } => linear.set_external_urls(session_id, urls).await,
+        Op::IssueState { target } => {
+            let issue = linear.issue(issue_id).await?;
+            let Some(state_id) = target_state(&issue, *target, review_state)? else {
+                return Ok(());
+            };
+            linear.set_issue_state(issue_id, &state_id).await?;
+            // The write is confirmed by reading the issue again.
+            if linear.issue(issue_id).await?.state.id != state_id {
                 return Err(ApiError::RequestFailed);
             }
             Ok(())

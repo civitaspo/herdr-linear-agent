@@ -10,7 +10,7 @@ use super::ApiError;
 use super::transport::Transport;
 
 /// Pages read per poll at most: 50 issues each.
-const MAX_PAGES: usize = 4;
+pub(crate) const MAX_PAGES: usize = 4;
 
 const VIEWER_QUERY: &str = r#"query HlaViewer {
   viewer { id app isMe name }
@@ -261,6 +261,250 @@ pub struct RunUpdate {
     pub prompts: Vec<Prompt>,
 }
 
+/// One GraphQL operation: its fixed text and its variables. The sync
+/// [`Linear`] and the async [`super::client::LinearApi`] both send these, so
+/// the text and the parsing of every operation live only here.
+pub(crate) struct Call {
+    pub operation: &'static str,
+    pub query: std::borrow::Cow<'static, str>,
+    pub variables: Value,
+    /// For a mutation, the payload field whose `success` must be true.
+    pub payload: Option<&'static str>,
+}
+
+impl Call {
+    fn read(operation: &'static str, query: &'static str, variables: Value) -> Call {
+        Call {
+            operation,
+            query: query.into(),
+            variables,
+            payload: None,
+        }
+    }
+
+    fn write(
+        operation: &'static str,
+        query: &'static str,
+        variables: Value,
+        payload: &'static str,
+    ) -> Call {
+        Call {
+            operation,
+            query: query.into(),
+            variables,
+            payload: Some(payload),
+        }
+    }
+
+    pub fn is_write(&self) -> bool {
+        self.payload.is_some()
+    }
+
+    pub fn viewer() -> Call {
+        Call::read("HlaViewer", VIEWER_QUERY, json!({}))
+    }
+
+    pub fn delegated_issues(team_keys: &[String], after: Option<&str>) -> Call {
+        Call::read(
+            "HlaDelegatedIssues",
+            DELEGATED_QUERY,
+            json!({ "teamKeys": team_keys, "after": after }),
+        )
+    }
+
+    pub fn issue(id: &str) -> Call {
+        Call::read("HlaIssue", ISSUE_QUERY, json!({ "id": id }))
+    }
+
+    pub fn sessions() -> Call {
+        Call::read("HlaSessions", SESSIONS_QUERY, json!({}))
+    }
+
+    pub fn session_create(issue_id: &str) -> Call {
+        Call::write(
+            "HlaSessionCreate",
+            SESSION_CREATE,
+            json!({ "issueId": issue_id }),
+            "agentSessionCreateOnIssue",
+        )
+    }
+
+    pub fn activity_create(
+        session_id: &str,
+        id: &str,
+        activity: &Activity,
+    ) -> Result<Call, ApiError> {
+        let mut input = json!({
+            "agentSessionId": session_id,
+            "id": id,
+            "content": serde_json::to_value(&activity.content).map_err(|_| ApiError::Configuration)?,
+            "ephemeral": activity.ephemeral,
+        });
+        if let Some(signal) = &activity.signal {
+            input["signal"] = json!(signal);
+        }
+        if let Some(metadata) = &activity.signal_metadata {
+            input["signalMetadata"] = metadata.clone();
+        }
+        Ok(Call::write(
+            "HlaActivityCreate",
+            ACTIVITY_CREATE,
+            json!({ "input": input }),
+            "agentActivityCreate",
+        ))
+    }
+
+    pub fn activity_find(session_id: &str, id: &str) -> Call {
+        Call::read(
+            "HlaActivityFind",
+            ACTIVITY_FIND,
+            json!({ "sessionId": session_id, "id": id }),
+        )
+    }
+
+    pub fn set_plan(session_id: &str, plan: &Value) -> Call {
+        Call::write(
+            "HlaSessionUpdate",
+            SESSION_UPDATE,
+            json!({ "id": session_id, "input": { "plan": plan } }),
+            "agentSessionUpdate",
+        )
+    }
+
+    pub fn set_external_urls(session_id: &str, urls: &[ExternalUrl]) -> Call {
+        Call::write(
+            "HlaSessionUpdate",
+            SESSION_UPDATE,
+            json!({ "id": session_id, "input": { "externalUrls": urls } }),
+            "agentSessionUpdate",
+        )
+    }
+
+    pub fn set_issue_state(issue_id: &str, state_id: &str) -> Call {
+        Call::write(
+            "HlaIssueState",
+            ISSUE_STATE_UPDATE,
+            json!({ "id": issue_id, "stateId": state_id }),
+            "issueUpdate",
+        )
+    }
+
+    /// `HlaRuns` for a non-empty list of runs.
+    pub fn run_updates(runs: &[RunQuery]) -> Call {
+        let mut declarations = Vec::new();
+        let mut body = String::from("  viewer { id app isMe }\n");
+        let mut variables = serde_json::Map::new();
+        for (n, run) in runs.iter().enumerate() {
+            declarations.push(format!(
+                "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!"
+            ));
+            body.push_str(&RUN_PART.replace('@', &n.to_string()));
+            variables.insert(format!("i{n}"), json!(run.issue_id));
+            variables.insert(format!("s{n}"), json!(run.session_id));
+            variables.insert(format!("c{n}"), json!(run.cursor));
+        }
+        let query = format!("query HlaRuns({}) {{\n{body}}}", declarations.join(", "));
+        Call {
+            operation: "HlaRuns",
+            query: query.into(),
+            variables: Value::Object(variables),
+            payload: None,
+        }
+    }
+
+    /// A read's data, or a write's payload once its `success` is true.
+    pub fn finish(&self, data: Value) -> Result<Value, ApiError> {
+        let Some(payload) = self.payload else {
+            return Ok(data);
+        };
+        let result = field(&data, payload)?;
+        if result["success"].as_bool() != Some(true) {
+            return Err(ApiError::Graphql(format!("{payload} did not succeed")));
+        }
+        Ok(result.clone())
+    }
+}
+
+pub(crate) fn parse_viewer(data: &Value) -> Result<Viewer, ApiError> {
+    serde_json::from_value(field(data, "viewer")?.clone()).map_err(|_| ApiError::ReadFieldsInvalid)
+}
+
+/// One page of the delegated poll, and the cursor of the next page when
+/// there is one.
+pub(crate) fn parse_delegated_page(
+    data: &Value,
+) -> Result<(Vec<IssueRef>, Option<String>), ApiError> {
+    let page = field(data, "issues")?;
+    let mut issues = Vec::new();
+    for node in nodes(page) {
+        issues.push(serde_json::from_value(node.clone()).map_err(|_| ApiError::ReadFieldsInvalid)?);
+    }
+    let info = &page["pageInfo"];
+    if info["hasNextPage"].as_bool() != Some(true) {
+        return Ok((issues, None));
+    }
+    Ok((issues, Some(text(info, "endCursor")?)))
+}
+
+pub(crate) fn parse_issue_data(data: &Value) -> Result<IssueDetail, ApiError> {
+    parse_issue(field(data, "issue")?)
+}
+
+/// The issue's newest open session of this app: the one Linear created on
+/// delegation, or one the plugin created earlier.
+pub(crate) fn newest_open_session(
+    data: &Value,
+    issue_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let viewer = text(field(data, "viewer")?, "id")?;
+    nodes(field(data, "agentSessions")?)
+        .filter(|s| s["issue"]["id"] == issue_id && s["appUser"]["id"] == viewer.as_str())
+        .filter(|s| s["status"] != "complete")
+        .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
+        .map(|session| text(session, "id"))
+        .transpose()
+}
+
+/// The ID of the session a `session_create` payload names.
+pub(crate) fn created_session(payload: &Value) -> Result<String, ApiError> {
+    text(field(payload, "agentSession")?, "id")
+}
+
+pub(crate) fn activity_found(data: &Value, id: &str) -> Result<bool, ApiError> {
+    Ok(nodes(&field(data, "agentSession")?["activities"]).any(|n| n["id"] == id))
+}
+
+/// The updates of `count` runs from an `HlaRuns` answer, in query order.
+pub(crate) fn parse_run_updates(data: &Value, count: usize) -> Result<Vec<RunUpdate>, ApiError> {
+    (0..count)
+        .map(|n| {
+            let issue = field(data, &format!("i{n}"))?;
+            let session = field(data, &format!("s{n}"))?;
+            let mut prompts = nodes(&session["activities"])
+                .map(|a| {
+                    Ok(Prompt {
+                        id: text(a, "id")?,
+                        created_at: text(a, "createdAt")?,
+                        signal: a["signal"].as_str().map(str::to_string),
+                        user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
+                        body: a["content"]["body"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, ApiError>>()?;
+            prompts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(RunUpdate {
+                issue: IssueStatus {
+                    updated_at: text(issue, "updatedAt")?,
+                    state_type: text(field(issue, "state")?, "type")?,
+                    state_name: text(field(issue, "state")?, "name")?,
+                    delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
+                },
+                prompts,
+            })
+        })
+        .collect()
+}
+
 /// The typed Linear API over a transport.
 pub struct Linear<T: Transport> {
     transport: T,
@@ -294,14 +538,16 @@ impl<T: Transport> Linear<T> {
         &mut self.transport
     }
 
-    fn read(&mut self, operation: &str, query: &str, variables: Value) -> Result<Value, ApiError> {
-        self.transport.execute(operation, query, variables, false)
+    fn call(&mut self, mut call: Call) -> Result<Value, ApiError> {
+        let variables = std::mem::take(&mut call.variables);
+        let data =
+            self.transport
+                .execute(call.operation, &call.query, variables, call.is_write())?;
+        call.finish(data)
     }
 
     pub fn viewer(&mut self) -> Result<Viewer, ApiError> {
-        let data = self.read("HlaViewer", VIEWER_QUERY, json!({}))?;
-        serde_json::from_value(field(&data, "viewer")?.clone())
-            .map_err(|_| ApiError::ReadFieldsInvalid)
+        parse_viewer(&self.call(Call::viewer())?)
     }
 
     /// Issues delegated to the app user in the configured teams whose state is
@@ -310,71 +556,34 @@ impl<T: Transport> Linear<T> {
         let mut issues = Vec::new();
         let mut after: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let data = self.read(
-                "HlaDelegatedIssues",
-                DELEGATED_QUERY,
-                json!({ "teamKeys": team_keys, "after": after }),
-            )?;
-            let page = field(&data, "issues")?;
-            for node in nodes(page) {
-                issues.push(
-                    serde_json::from_value(node.clone())
-                        .map_err(|_| ApiError::ReadFieldsInvalid)?,
-                );
+            let data = self.call(Call::delegated_issues(team_keys, after.as_deref()))?;
+            let (page, next) = parse_delegated_page(&data)?;
+            issues.extend(page);
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
             }
-            let info = &page["pageInfo"];
-            if info["hasNextPage"].as_bool() != Some(true) {
-                break;
-            }
-            after = Some(text(info, "endCursor")?);
         }
         Ok(issues)
     }
 
     pub fn issue(&mut self, id: &str) -> Result<IssueDetail, ApiError> {
-        let data = self.read("HlaIssue", ISSUE_QUERY, json!({ "id": id }))?;
-        parse_issue(field(&data, "issue")?)
-    }
-
-    fn write(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        payload: &str,
-    ) -> Result<Value, ApiError> {
-        let data = self.transport.execute(operation, query, variables, true)?;
-        let result = field(&data, payload)?;
-        if result["success"].as_bool() != Some(true) {
-            return Err(ApiError::Graphql(format!("{payload} did not succeed")));
-        }
-        Ok(result.clone())
+        parse_issue_data(&self.call(Call::issue(id))?)
     }
 
     /// Creates an Agent Session on the issue and returns its ID.
     /// The issue's newest open session of this app: the one Linear created on
     /// delegation, or one the plugin created earlier. Otherwise a new one.
     pub fn open_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
-        let data = self.read("HlaSessions", SESSIONS_QUERY, json!({}))?;
-        let viewer = text(field(&data, "viewer")?, "id")?;
-        let found = nodes(field(&data, "agentSessions")?)
-            .filter(|s| s["issue"]["id"] == issue_id && s["appUser"]["id"] == viewer.as_str())
-            .filter(|s| s["status"] != "complete")
-            .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
-        match found {
-            Some(session) => text(session, "id"),
+        let data = self.call(Call::sessions())?;
+        match newest_open_session(&data, issue_id)? {
+            Some(session) => Ok(session),
             None => self.create_session(issue_id),
         }
     }
 
     fn create_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
-        let result = self.write(
-            "HlaSessionCreate",
-            SESSION_CREATE,
-            json!({ "issueId": issue_id }),
-            "agentSessionCreateOnIssue",
-        )?;
-        text(field(&result, "agentSession")?, "id")
+        created_session(&self.call(Call::session_create(issue_id))?)
     }
 
     /// Sends an activity with the caller's UUID as its ID, so a lost response
@@ -385,45 +594,17 @@ impl<T: Transport> Linear<T> {
         id: &str,
         activity: &Activity,
     ) -> Result<(), ApiError> {
-        let mut input = json!({
-            "agentSessionId": session_id,
-            "id": id,
-            "content": serde_json::to_value(&activity.content).map_err(|_| ApiError::Configuration)?,
-            "ephemeral": activity.ephemeral,
-        });
-        if let Some(signal) = &activity.signal {
-            input["signal"] = json!(signal);
-        }
-        if let Some(metadata) = &activity.signal_metadata {
-            input["signalMetadata"] = metadata.clone();
-        }
-        self.write(
-            "HlaActivityCreate",
-            ACTIVITY_CREATE,
-            json!({ "input": input }),
-            "agentActivityCreate",
-        )
-        .map(|_| ())
+        self.call(Call::activity_create(session_id, id, activity)?)
+            .map(|_| ())
     }
 
     pub fn activity_exists(&mut self, session_id: &str, id: &str) -> Result<bool, ApiError> {
-        let data = self.read(
-            "HlaActivityFind",
-            ACTIVITY_FIND,
-            json!({ "sessionId": session_id, "id": id }),
-        )?;
-        Ok(nodes(&field(&data, "agentSession")?["activities"]).any(|n| n["id"] == id))
+        activity_found(&self.call(Call::activity_find(session_id, id))?, id)
     }
 
     /// Replaces the session's plan (Linear's list of `{content, status}`).
     pub fn set_plan(&mut self, session_id: &str, plan: &Value) -> Result<(), ApiError> {
-        self.write(
-            "HlaSessionUpdate",
-            SESSION_UPDATE,
-            json!({ "id": session_id, "input": { "plan": plan } }),
-            "agentSessionUpdate",
-        )
-        .map(|_| ())
+        self.call(Call::set_plan(session_id, plan)).map(|_| ())
     }
 
     /// Replaces the session's external URLs with the full list.
@@ -432,23 +613,13 @@ impl<T: Transport> Linear<T> {
         session_id: &str,
         urls: &[ExternalUrl],
     ) -> Result<(), ApiError> {
-        self.write(
-            "HlaSessionUpdate",
-            SESSION_UPDATE,
-            json!({ "id": session_id, "input": { "externalUrls": urls } }),
-            "agentSessionUpdate",
-        )
-        .map(|_| ())
+        self.call(Call::set_external_urls(session_id, urls))
+            .map(|_| ())
     }
 
     pub fn set_issue_state(&mut self, issue_id: &str, state_id: &str) -> Result<(), ApiError> {
-        self.write(
-            "HlaIssueState",
-            ISSUE_STATE_UPDATE,
-            json!({ "id": issue_id, "stateId": state_id }),
-            "issueUpdate",
-        )
-        .map(|_| ())
+        self.call(Call::set_issue_state(issue_id, state_id))
+            .map(|_| ())
     }
 
     /// Every active run's issue state and new prompts, in one request.
@@ -456,47 +627,8 @@ impl<T: Transport> Linear<T> {
         if runs.is_empty() {
             return Ok(Vec::new());
         }
-        let mut declarations = Vec::new();
-        let mut body = String::from("  viewer { id app isMe }\n");
-        let mut variables = serde_json::Map::new();
-        for (n, run) in runs.iter().enumerate() {
-            declarations.push(format!(
-                "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!"
-            ));
-            body.push_str(&RUN_PART.replace('@', &n.to_string()));
-            variables.insert(format!("i{n}"), json!(run.issue_id));
-            variables.insert(format!("s{n}"), json!(run.session_id));
-            variables.insert(format!("c{n}"), json!(run.cursor));
-        }
-        let query = format!("query HlaRuns({}) {{\n{body}}}", declarations.join(", "));
-        let data = self.read("HlaRuns", &query, Value::Object(variables))?;
-        (0..runs.len())
-            .map(|n| {
-                let issue = field(&data, &format!("i{n}"))?;
-                let session = field(&data, &format!("s{n}"))?;
-                let mut prompts = nodes(&session["activities"])
-                    .map(|a| {
-                        Ok(Prompt {
-                            id: text(a, "id")?,
-                            created_at: text(a, "createdAt")?,
-                            signal: a["signal"].as_str().map(str::to_string),
-                            user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
-                            body: a["content"]["body"].as_str().unwrap_or("").to_string(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, ApiError>>()?;
-                prompts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-                Ok(RunUpdate {
-                    issue: IssueStatus {
-                        updated_at: text(issue, "updatedAt")?,
-                        state_type: text(field(issue, "state")?, "type")?,
-                        state_name: text(field(issue, "state")?, "name")?,
-                        delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
-                    },
-                    prompts,
-                })
-            })
-            .collect()
+        let data = self.call(Call::run_updates(runs))?;
+        parse_run_updates(&data, runs.len())
     }
 }
 
