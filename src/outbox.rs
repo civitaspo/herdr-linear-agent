@@ -14,9 +14,8 @@ use serde_json::Value;
 
 use crate::files;
 use crate::linear::ApiError;
-use crate::linear::api::{Activity, ExternalUrl, IssueDetail, Linear};
+use crate::linear::api::{Activity, ExternalUrl, IssueDetail};
 use crate::linear::client::LinearApi;
-use crate::linear::transport::Transport;
 use crate::run::Run;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,94 +117,10 @@ pub struct Sent {
     pub activity_sent: bool,
 }
 
-/// Sends a run's queued requests in order until one cannot be sent.
-pub fn send<T: Transport>(
-    run: &Run,
-    session_id: &str,
-    issue_id: &str,
-    review_state: &str,
-    linear: &mut Linear<T>,
-) -> Sent {
-    let mut sent = Sent {
-        count: 0,
-        refused: Vec::new(),
-        blocked: None,
-        activity_sent: false,
-    };
-    for (path, mut request) in pending(run) {
-        let outcome = (|| -> Result<(), ApiError> {
-            if request.attempted && already_applied(&request, session_id, linear)? {
-                return Ok(());
-            }
-            request.attempted = true;
-            files::write_json(&path, &request).map_err(|_| ApiError::Configuration)?;
-            apply(&request, session_id, issue_id, review_state, linear)
-        })();
-        match outcome {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&path);
-                sent.count += 1;
-                sent.activity_sent |= matches!(request.op, Op::Activity { .. });
-            }
-            Err(error) if definitive(&error) => {
-                set_aside(&path);
-                sent.refused.push((request, error));
-            }
-            Err(error) => {
-                sent.blocked = Some(error);
-                break;
-            }
-        }
-    }
-    sent
-}
-
-fn already_applied<T: Transport>(
-    request: &Request,
-    session_id: &str,
-    linear: &mut Linear<T>,
-) -> Result<bool, ApiError> {
-    match &request.op {
-        Op::Activity { .. } => linear.activity_exists(session_id, &request.id),
-        // Replacing the plan or the URL list is idempotent, and a state move
-        // reads the issue before it writes.
-        Op::Plan { .. } | Op::ExternalUrls { .. } | Op::IssueState { .. } => Ok(false),
-    }
-}
-
-fn apply<T: Transport>(
-    request: &Request,
-    session_id: &str,
-    issue_id: &str,
-    review_state: &str,
-    linear: &mut Linear<T>,
-) -> Result<(), ApiError> {
-    match &request.op {
-        Op::Activity { activity } => linear.create_activity(session_id, &request.id, activity),
-        Op::Plan { plan } => linear.set_plan(session_id, plan),
-        Op::ExternalUrls { urls } => linear.set_external_urls(session_id, urls),
-        Op::IssueState { target } => {
-            let issue = linear.issue(issue_id)?;
-            let Some(state_id) = target_state(&issue, *target, review_state)? else {
-                return Ok(());
-            };
-            linear.set_issue_state(issue_id, &state_id)?;
-            // The write is confirmed by reading the issue again.
-            if linear.issue(issue_id)?.state.id != state_id {
-                return Err(ApiError::RequestFailed);
-            }
-            Ok(())
-        }
-    }
-}
-
-/// The async counterpart of [`send`] for the event-driven ticker: the same
-/// order, attempted markers, read-back and set-aside rules, over a
-/// [`LinearApi`]. `RateLimited` is not definitive, so such a request stays
-/// queued.
-// The ticker switch in this PR removes this allow.
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn send_async(
+/// Sends a run's queued requests in order until one cannot be sent. An
+/// attempted activity is looked up before it is sent again; a refusal is set
+/// aside; `RateLimited` is not definitive, so such a request stays queued.
+pub async fn send(
     run: &Run,
     session_id: &str,
     issue_id: &str,
@@ -219,7 +134,7 @@ pub async fn send_async(
         activity_sent: false,
     };
     for (path, mut request) in pending(run) {
-        let outcome = send_one_async(
+        let outcome = send_one(
             &path,
             &mut request,
             session_id,
@@ -247,7 +162,7 @@ pub async fn send_async(
     sent
 }
 
-async fn send_one_async(
+async fn send_one(
     path: &Path,
     request: &mut Request,
     session_id: &str,
@@ -375,6 +290,8 @@ pub fn parse_plan(text: &str) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::linear::api::Content;
+    use std::sync::Mutex;
+
     use crate::linear::api::fake::FakeLinear;
     use crate::run::RunRecord;
 
@@ -384,7 +301,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (tempfile::TempDir, Run, Linear<FakeLinear>, String, String) {
+    fn setup() -> (tempfile::TempDir, Run, Mutex<FakeLinear>, String, String) {
         let dir = tempfile::tempdir().unwrap();
         let run = Run::create(
             dir.path(),
@@ -396,14 +313,13 @@ mod tests {
         .unwrap();
         let mut fake = FakeLinear::default();
         let issue = fake.add_issue("DATA-1", "DATA", "First");
-        let mut linear = Linear::new(fake);
-        let session = linear.open_session(&issue).unwrap();
-        (dir, run, linear, session, issue)
+        let session = fake.delegate_session("DATA-1");
+        (dir, run, Mutex::new(fake), session, issue)
     }
 
-    #[test]
-    fn requests_go_out_in_order_and_are_removed() {
-        let (_dir, run, mut linear, session, issue) = setup();
+    #[tokio::test]
+    async fn requests_go_out_in_order_and_are_removed() {
+        let (_dir, run, linear, session, issue) = setup();
         push(&run, thought("one")).unwrap();
         push(
             &run,
@@ -420,11 +336,11 @@ mod tests {
             },
         )
         .unwrap();
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.count, 4);
         assert!(sent.activity_sent && sent.blocked.is_none());
         assert!(pending(&run).is_empty());
-        let fake = linear.transport();
+        let fake = linear.lock().unwrap();
         let bodies: Vec<Value> = fake.sessions[0]
             .sent("thought")
             .iter()
@@ -442,30 +358,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_lost_response_is_checked_by_a_read_and_never_sent_twice() {
-        let (_dir, run, mut linear, session, issue) = setup();
+    #[tokio::test]
+    async fn a_lost_response_is_checked_by_a_read_and_never_sent_twice() {
+        let (_dir, run, linear, session, issue) = setup();
         push(&run, thought("once")).unwrap();
-        linear.transport().lose_next_response = true;
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        linear.lock().unwrap().lose_next_response = true;
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
         assert!(pending(&run)[0].1.attempted);
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.count, 1);
-        assert_eq!(linear.transport().sessions[0].sent("thought").len(), 1);
-        assert_eq!(linear.transport().count("HlaActivityFind"), 1);
+        let fake = linear.lock().unwrap();
+        assert_eq!(fake.sessions[0].sent("thought").len(), 1);
+        assert_eq!(fake.count("HlaActivityFind"), 1);
     }
 
-    #[test]
-    fn a_failure_keeps_the_rest_in_order_and_a_refusal_is_set_aside() {
-        let (_dir, run, mut linear, session, issue) = setup();
+    #[tokio::test]
+    async fn a_failure_keeps_the_rest_in_order_and_a_refusal_is_set_aside() {
+        let (_dir, run, linear, session, issue) = setup();
         push(&run, thought("a")).unwrap();
         push(&run, thought("b")).unwrap();
-        linear.transport().fail_next = Some(ApiError::HttpStatus(503));
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        linear.lock().unwrap().fail_next = Some(ApiError::HttpStatus(503));
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!((sent.count, pending(&run).len()), (0, 2));
         // An attempted request whose send never reached Linear is read, then sent.
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.count, 2);
 
         push(
@@ -476,7 +393,7 @@ mod tests {
         )
         .unwrap();
         push(&run, thought("after")).unwrap();
-        let sent = send(&run, &session, &issue, "Missing State", &mut linear);
+        let sent = send(&run, &session, &issue, "Missing State", &linear).await;
         assert_eq!(sent.refused.len(), 1);
         assert_eq!(sent.count, 1);
         assert!(
@@ -489,10 +406,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn state_targets_leave_later_states_alone() {
-        let (_dir, _run, mut linear, _session, issue) = setup();
-        let mut detail = linear.issue(&issue).unwrap();
+    #[tokio::test]
+    async fn state_targets_leave_later_states_alone() {
+        let (_dir, _run, linear, _session, issue) = setup();
+        let mut detail = linear.issue(&issue).await.unwrap();
         assert_eq!(
             target_state(&detail, StateTarget::Started, "In Review")
                 .unwrap()

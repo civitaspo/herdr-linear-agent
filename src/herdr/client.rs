@@ -16,7 +16,7 @@ use tokio::time::{Instant, timeout_at};
 
 use super::{Agent, Event, HerdrError, Pane, PaneId, parse_event};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -203,12 +203,6 @@ impl Client {
         let Answer { snapshot } = self.call("session.snapshot", json!({})).await?;
         Ok(snapshot.version)
     }
-
-    pub async fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
-        self.call::<Value>("notification.show", json!({"title": title, "body": body}))
-            .await
-            .map(|_| ())
-    }
 }
 
 impl Subscription {
@@ -279,8 +273,8 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
-    use crate::herdr::AgentStatus;
-    use crate::herdr::fake::{FakeHerdr, agent_json, pane_json};
+    use crate::herdr::fake::{FakeHerdrServer, agent_json, pane_json};
+    use crate::herdr::{AgentStatus, Herdr};
 
     #[test]
     fn a_session_socket_comes_from_the_session_list() {
@@ -303,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_response_becomes_an_api_error() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.fail("session.snapshot", "server_busy", "try again later");
         let error = fake.client().snapshot().await.unwrap_err();
         assert_eq!(
@@ -361,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_snapshot_entry_is_skipped() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         let mut broken = agent_json("w1:p2", "codex", "idle", None);
         broken.as_object_mut().unwrap().remove("terminal_id");
         fake.set_snapshot(
@@ -403,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_old_snapshot_still_gives_its_version() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.set_raw_snapshot(json!({"version": "0.8.0", "protocol": 20, "panes": {}}));
         let client = fake.client();
         assert!(matches!(

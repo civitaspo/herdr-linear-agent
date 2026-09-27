@@ -3,13 +3,9 @@
 //! to Linear; agents leave requests in a run's outbox.
 
 pub mod api;
-// The ticker switch in this PR removes this allow.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod client;
 pub mod credentials;
 pub mod oauth;
-// The ticker switch in this PR removes this allow.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod task;
 pub mod transport;
 

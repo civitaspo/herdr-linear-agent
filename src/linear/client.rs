@@ -493,7 +493,6 @@ impl LinearApi for Mutex<api::fake::FakeLinear> {
         variables: Value,
         write: bool,
     ) -> impl Future<Output = Result<Value, ApiError>> + Send {
-        use super::transport::Transport;
         let result = self
             .lock()
             .unwrap()

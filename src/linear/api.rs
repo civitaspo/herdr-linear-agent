@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ApiError;
-use super::transport::Transport;
 
 /// Pages read per poll at most: 50 issues each.
 pub(crate) const MAX_PAGES: usize = 4;
@@ -505,11 +504,6 @@ pub(crate) fn parse_run_updates(data: &Value, count: usize) -> Result<Vec<RunUpd
         .collect()
 }
 
-/// The typed Linear API over a transport.
-pub struct Linear<T: Transport> {
-    transport: T,
-}
-
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a Value, ApiError> {
     value
         .get(name)
@@ -526,110 +520,6 @@ fn text(value: &Value, name: &str) -> Result<String, ApiError> {
 
 fn nodes(value: &Value) -> impl Iterator<Item = &Value> {
     value["nodes"].as_array().into_iter().flatten()
-}
-
-impl<T: Transport> Linear<T> {
-    pub fn new(transport: T) -> Self {
-        Linear { transport }
-    }
-
-    #[cfg(test)]
-    pub fn transport(&mut self) -> &mut T {
-        &mut self.transport
-    }
-
-    fn call(&mut self, mut call: Call) -> Result<Value, ApiError> {
-        let variables = std::mem::take(&mut call.variables);
-        let data =
-            self.transport
-                .execute(call.operation, &call.query, variables, call.is_write())?;
-        call.finish(data)
-    }
-
-    pub fn viewer(&mut self) -> Result<Viewer, ApiError> {
-        parse_viewer(&self.call(Call::viewer())?)
-    }
-
-    /// Issues delegated to the app user in the configured teams whose state is
-    /// neither completed nor canceled.
-    pub fn delegated_issues(&mut self, team_keys: &[String]) -> Result<Vec<IssueRef>, ApiError> {
-        let mut issues = Vec::new();
-        let mut after: Option<String> = None;
-        for _ in 0..MAX_PAGES {
-            let data = self.call(Call::delegated_issues(team_keys, after.as_deref()))?;
-            let (page, next) = parse_delegated_page(&data)?;
-            issues.extend(page);
-            match next {
-                Some(cursor) => after = Some(cursor),
-                None => break,
-            }
-        }
-        Ok(issues)
-    }
-
-    pub fn issue(&mut self, id: &str) -> Result<IssueDetail, ApiError> {
-        parse_issue_data(&self.call(Call::issue(id))?)
-    }
-
-    /// Creates an Agent Session on the issue and returns its ID.
-    /// The issue's newest open session of this app: the one Linear created on
-    /// delegation, or one the plugin created earlier. Otherwise a new one.
-    pub fn open_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
-        let data = self.call(Call::sessions())?;
-        match newest_open_session(&data, issue_id)? {
-            Some(session) => Ok(session),
-            None => self.create_session(issue_id),
-        }
-    }
-
-    fn create_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
-        created_session(&self.call(Call::session_create(issue_id))?)
-    }
-
-    /// Sends an activity with the caller's UUID as its ID, so a lost response
-    /// can be checked with `activity_exists` before anything is sent again.
-    pub fn create_activity(
-        &mut self,
-        session_id: &str,
-        id: &str,
-        activity: &Activity,
-    ) -> Result<(), ApiError> {
-        self.call(Call::activity_create(session_id, id, activity)?)
-            .map(|_| ())
-    }
-
-    pub fn activity_exists(&mut self, session_id: &str, id: &str) -> Result<bool, ApiError> {
-        activity_found(&self.call(Call::activity_find(session_id, id))?, id)
-    }
-
-    /// Replaces the session's plan (Linear's list of `{content, status}`).
-    pub fn set_plan(&mut self, session_id: &str, plan: &Value) -> Result<(), ApiError> {
-        self.call(Call::set_plan(session_id, plan)).map(|_| ())
-    }
-
-    /// Replaces the session's external URLs with the full list.
-    pub fn set_external_urls(
-        &mut self,
-        session_id: &str,
-        urls: &[ExternalUrl],
-    ) -> Result<(), ApiError> {
-        self.call(Call::set_external_urls(session_id, urls))
-            .map(|_| ())
-    }
-
-    pub fn set_issue_state(&mut self, issue_id: &str, state_id: &str) -> Result<(), ApiError> {
-        self.call(Call::set_issue_state(issue_id, state_id))
-            .map(|_| ())
-    }
-
-    /// Every active run's issue state and new prompts, in one request.
-    pub fn run_updates(&mut self, runs: &[RunQuery]) -> Result<Vec<RunUpdate>, ApiError> {
-        if runs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let data = self.call(Call::run_updates(runs))?;
-        parse_run_updates(&data, runs.len())
-    }
 }
 
 fn parse_state(value: &Value) -> Result<WorkflowState, ApiError> {
@@ -691,7 +581,7 @@ fn parse_issue(issue: &Value) -> Result<IssueDetail, ApiError> {
 
 #[cfg(test)]
 pub mod fake {
-    //! An in-memory Linear behind the `Transport` boundary. It answers the
+    //! An in-memory Linear behind the client's `execute`. It answers the
     //! operations this module sends by name, keeps the issues, sessions and
     //! activities a test sets up, and records every call.
 
@@ -1042,8 +932,8 @@ pub mod fake {
         }
     }
 
-    impl Transport for FakeLinear {
-        fn execute(
+    impl FakeLinear {
+        pub fn execute(
             &mut self,
             operation: &str,
             _query: &str,
@@ -1062,43 +952,28 @@ pub mod fake {
             answer
         }
     }
-
-    /// A fake shared between a test and the ticker that owns the transport.
-    #[derive(Clone, Default)]
-    pub struct Shared(pub std::rc::Rc<std::cell::RefCell<FakeLinear>>);
-
-    impl Transport for Shared {
-        fn execute(
-            &mut self,
-            operation: &str,
-            query: &str,
-            variables: Value,
-            write: bool,
-        ) -> Result<Value, ApiError> {
-            self.0
-                .borrow_mut()
-                .execute(operation, query, variables, write)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::fake::FakeLinear;
     use super::*;
+    use crate::linear::client::LinearApi;
 
-    #[test]
-    fn reads_parse_into_typed_records() {
+    #[tokio::test]
+    async fn reads_parse_into_typed_records() {
         let mut fake = FakeLinear::default();
         let id = fake.add_issue("DATA-1", "DATA", "First");
         fake.add_issue("OTHER-1", "OTHER", "Elsewhere");
         fake.add_issue("DATA-2", "DATA", "Done already");
         fake.issue_mut("DATA-2")["state"]["type"] = json!("completed");
         fake.issue_mut("DATA-1")["labels"] = json!({ "nodes": [{ "name": "S", "parent": { "name": "size" } }, { "name": "bug", "parent": null }] });
-        let mut linear = Linear::new(fake);
+        let linear = Mutex::new(fake);
 
-        assert_eq!(linear.viewer().unwrap().id, fake::APP_USER);
-        let issues = linear.delegated_issues(&["DATA".into()]).unwrap();
+        assert_eq!(linear.viewer().await.unwrap().id, fake::APP_USER);
+        let issues = linear.delegated_issues(&["DATA".into()]).await.unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(
             (
@@ -1109,7 +984,7 @@ mod tests {
             ("DATA-1", "DATA", "unstarted")
         );
 
-        let detail = linear.issue(&id).unwrap();
+        let detail = linear.issue(&id).await.unwrap();
         assert_eq!(detail.team.states.len(), 5);
         assert_eq!(
             detail.labels[0],
@@ -1120,21 +995,36 @@ mod tests {
         );
         assert_eq!(detail.labels[1].group, None);
         assert_eq!(detail.delegate_id.as_deref(), Some(fake::APP_USER));
-        assert!(linear.transport().calls.iter().all(|(_, _, write)| !write));
+        assert!(
+            linear
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .all(|(_, _, write)| !write)
+        );
     }
 
-    #[test]
-    fn writes_and_run_updates_round_trip() {
+    #[tokio::test]
+    async fn writes_and_run_updates_round_trip() {
         let mut fake = FakeLinear::default();
         let issue = fake.add_issue("DATA-1", "DATA", "First");
-        let mut linear = Linear::new(fake);
-        let session = linear.open_session(&issue).unwrap();
+        let linear = Mutex::new(fake);
+        assert_eq!(linear.find_session(&issue).await.unwrap(), None);
+        let session = linear.create_session(&issue).await.unwrap();
+        assert_eq!(
+            linear.find_session(&issue).await.unwrap().as_deref(),
+            Some(session.as_str())
+        );
         let thought = Activity::new(Content::Thought {
             body: "Picked up".into(),
         });
-        linear.create_activity(&session, "a-1", &thought).unwrap();
-        assert!(linear.activity_exists(&session, "a-1").unwrap());
-        assert!(!linear.activity_exists(&session, "a-2").unwrap());
+        linear
+            .create_activity(&session, "a-1", &thought)
+            .await
+            .unwrap();
+        assert!(linear.activity_exists(&session, "a-1").await.unwrap());
+        assert!(!linear.activity_exists(&session, "a-2").await.unwrap());
         let ask = Activity {
             signal: Some("select".into()),
             signal_metadata: Some(json!({ "options": [{ "label": "Yes", "value": "yes" }] })),
@@ -1142,12 +1032,13 @@ mod tests {
                 body: "Proceed?".into(),
             })
         };
-        linear.create_activity(&session, "a-2", &ask).unwrap();
+        linear.create_activity(&session, "a-2", &ask).await.unwrap();
         linear
             .set_plan(
                 &session,
                 &json!([{ "content": "Plan", "status": "pending" }]),
             )
+            .await
             .unwrap();
         linear
             .set_external_urls(
@@ -1157,27 +1048,33 @@ mod tests {
                     url: "https://github.com/o/r/pull/1".into(),
                 }],
             )
+            .await
             .unwrap();
-        linear.set_issue_state(&issue, "state-progress").unwrap();
+        linear
+            .set_issue_state(&issue, "state-progress")
+            .await
+            .unwrap();
 
-        let fake = linear.transport();
-        let stored = &fake.sessions[0];
-        assert_eq!(stored.sent_types(), ["thought", "elicitation"]);
-        assert_eq!(
-            stored.sent("elicitation")[0]["signalMetadata"]["options"][0]["value"],
-            "yes"
-        );
-        assert_eq!(stored.plan.as_ref().unwrap()[0]["status"], "pending");
-        assert_eq!(fake.issue("DATA-1")["state"]["name"], "In Progress");
-        fake.add_prompt("DATA-1", "user-1", "first", None);
-        fake.add_prompt("DATA-1", "user-2", "stop now", Some("stop"));
+        {
+            let mut fake = linear.lock().unwrap();
+            let stored = &fake.sessions[0];
+            assert_eq!(stored.sent_types(), ["thought", "elicitation"]);
+            assert_eq!(
+                stored.sent("elicitation")[0]["signalMetadata"]["options"][0]["value"],
+                "yes"
+            );
+            assert_eq!(stored.plan.as_ref().unwrap()[0]["status"], "pending");
+            assert_eq!(fake.issue("DATA-1")["state"]["name"], "In Progress");
+            fake.add_prompt("DATA-1", "user-1", "first", None);
+            fake.add_prompt("DATA-1", "user-2", "stop now", Some("stop"));
+        }
 
         let query = RunQuery {
             issue_id: issue.clone(),
             session_id: session.clone(),
             cursor: "2026-09-24T00:00:00Z".into(),
         };
-        let updates = linear.run_updates(&[query.clone(), query]).unwrap();
+        let updates = linear.run_updates(&[query.clone(), query]).await.unwrap();
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].issue.state_type, "started");
         assert_eq!(updates[0].prompts.len(), 2);
@@ -1188,8 +1085,12 @@ mod tests {
             session_id: session,
             cursor: updates[0].prompts[1].created_at.clone(),
         };
-        assert!(linear.run_updates(&[later]).unwrap()[0].prompts.is_empty());
-        assert!(linear.run_updates(&[]).unwrap().is_empty());
+        assert!(
+            linear.run_updates(&[later]).await.unwrap()[0]
+                .prompts
+                .is_empty()
+        );
+        assert!(linear.run_updates(&[]).await.unwrap().is_empty());
     }
 
     #[test]

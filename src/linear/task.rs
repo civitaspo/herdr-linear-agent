@@ -307,8 +307,7 @@ impl LinearTask {
                 false
             } else if let Some(session) = self.session_for_flush(client, query, events).await {
                 let sent =
-                    outbox::send_async(&run, &session, &query.issue_id, &self.review_state, client)
-                        .await;
+                    outbox::send(&run, &session, &query.issue_id, &self.review_state, client).await;
                 if sent.activity_sent {
                     events.push(LinearEvent::ActivitySent {
                         issue_id: query.issue_id.clone(),

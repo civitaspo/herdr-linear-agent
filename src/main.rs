@@ -1,3 +1,7 @@
+// The reconciler and its test World are not written yet, so the helpers
+// and fakes they will call are unused; writing them removes this allow.
+#![allow(dead_code)]
+
 mod actions;
 mod agents;
 mod claude_trust;
@@ -7,22 +11,15 @@ mod config;
 mod coordinator;
 mod files;
 mod herdr;
-// The doctor no longer asks `herdr --version`; the module goes away once the
-// ticker moves to the socket client.
-#[allow(dead_code)]
-mod herdr_cli;
 mod inbox;
 mod linear;
 mod names;
 mod outbox;
 mod paths;
+mod process;
 mod progress;
 mod routing;
 mod run;
-mod runner;
-#[cfg(test)]
-mod scenarios;
-mod steps;
 mod ticker;
 mod worker;
 
