@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::herdr::{self, Client};
+use crate::herdr::{self, Client, HerdrError};
 use crate::herdr_cli::{self, Herdr};
 use crate::linear::api::Linear;
 use crate::linear::credentials::{CredentialManager, CredentialStatus};
@@ -271,11 +271,43 @@ fn on_path(program: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
 }
 
+/// The version the session reports, and the error that kept its snapshot
+/// from being read. An old Herdr whose snapshot no longer parses still gives
+/// its version.
+async fn herdr_version(client: Client) -> (Option<String>, Option<HerdrError>) {
+    match client.snapshot().await {
+        Ok(snapshot) => (Some(snapshot.version), None),
+        Err(error @ HerdrError::Protocol(_)) => (client.version().await.ok(), Some(error)),
+        Err(error) => (None, Some(error)),
+    }
+}
+
 /// Checks the setup and lists every problem found.
 fn doctor(ctx: &Ctx) -> Result<String> {
     let mut ok = Vec::new();
     let mut problems = Vec::new();
-    let config = match Config::load(&ctx.config_dir()) {
+    let config = Config::load(&ctx.config_dir());
+    // Without a config this is the default session.
+    let session = config.as_ref().ok().and_then(|c| c.herdr.session.clone());
+    let socket = block_on(herdr::session_socket(
+        &ctx.env.herdr_bin(),
+        session.as_deref(),
+    ));
+    let (version, error) = match &socket {
+        Ok(socket) => block_on(herdr_version(Client::new(socket))),
+        Err(_) => (None, None),
+    };
+    match (&version, &error, &socket) {
+        (Some(v), _, _) if !herdr::version_at_least(v, herdr::MIN_VERSION) => {
+            problems.push(format!("herdr {v} is older than {}", herdr::MIN_VERSION))
+        }
+        (_, Some(error), _) => problems.push(format!("herdr: {error}")),
+        (Some(v), None, _) => ok.push(format!("herdr {v}")),
+        // With a config the session line below reports this.
+        (None, None, Err(error)) if config.is_err() => problems.push(format!("herdr: {error:#}")),
+        (None, None, _) => {}
+    }
+    let config = match config {
         Ok(config) => {
             ok.push(format!(
                 "config {}",
@@ -289,32 +321,13 @@ fn doctor(ctx: &Ctx) -> Result<String> {
         }
     };
     if let Some(config) = &config {
-        let session = config.herdr.session.as_deref();
-        match block_on(herdr::session_socket(&ctx.env.herdr_bin(), session)) {
-            Ok(socket) => match block_on(Client::new(socket).snapshot()) {
-                Ok(snapshot) => {
-                    ok.push(format!(
-                        "Herdr session `{}` is reachable",
-                        session.unwrap_or("default")
-                    ));
-                    if herdr::version_at_least(&snapshot.version, herdr::MIN_VERSION) {
-                        ok.push(format!(
-                            "herdr {} (protocol {})",
-                            snapshot.version, snapshot.protocol
-                        ));
-                    } else {
-                        problems.push(format!(
-                            "herdr {} is older than {}",
-                            snapshot.version,
-                            herdr::MIN_VERSION
-                        ));
-                    }
-                }
-                Err(error) => problems.push(format!(
-                    "the configured Herdr session does not answer: {error}"
-                )),
-            },
-            Err(error) => problems.push(format!("{error:#}")),
+        match (&socket, &version) {
+            (Err(error), _) => problems.push(format!("{error:#}")),
+            (Ok(_), Some(_)) => ok.push(format!(
+                "Herdr session `{}` is reachable",
+                session.as_deref().unwrap_or("default")
+            )),
+            (Ok(_), None) => problems.push("the configured Herdr session does not answer".into()),
         }
         let mut kinds: Vec<&str> = config
             .profiles

@@ -6,29 +6,32 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::time::{Instant, timeout_at};
 
-use super::{Agent, Event, HerdrError, Pane, PaneId, RawPane, parse_event};
+use super::{Agent, Event, HerdrError, Pane, PaneId, parse_event};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Client {
     pub socket: PathBuf,
 }
 
-/// `session.snapshot`, with each pane's agent taken from the `agents` list.
+/// `session.snapshot`: the complete view a decision reads. Entries that do
+/// not parse are left out and counted in `skipped`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub version: String,
     pub protocol: u32,
     pub panes: BTreeMap<PaneId, Pane>,
+    pub agents: Vec<Agent>,
+    pub skipped: usize,
 }
 
 /// An `events.subscribe` connection after its acknowledgement. Herdr closes
@@ -44,10 +47,6 @@ fn request_line(method: &str, params: Value) -> String {
     let mut line = json!({"id": id, "method": method, "params": params}).to_string();
     line.push('\n');
     line
-}
-
-fn io_error(error: std::io::Error) -> HerdrError {
-    HerdrError::Protocol(error.to_string())
 }
 
 fn parse_response<R: DeserializeOwned>(line: &str) -> Result<R, HerdrError> {
@@ -73,12 +72,20 @@ fn parse_response<R: DeserializeOwned>(line: &str) -> Result<R, HerdrError> {
     serde_json::from_value(result).map_err(|e| HerdrError::Protocol(format!("{e}: {line}")))
 }
 
-async fn first_line(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<String, HerdrError> {
-    lines
-        .next_line()
-        .await
-        .map_err(io_error)?
-        .ok_or(HerdrError::Unreachable)
+fn unknown(error: impl std::fmt::Display) -> HerdrError {
+    HerdrError::OutcomeUnknown(error.to_string())
+}
+
+/// Keeps the entries of `values` that parse as `T`, counting the others.
+fn lenient<T: DeserializeOwned>(values: Vec<Value>, skipped: &mut usize) -> Vec<T> {
+    values
+        .into_iter()
+        .filter_map(|v| {
+            let parsed = serde_json::from_value(v).ok();
+            *skipped += usize::from(parsed.is_none());
+            parsed
+        })
+        .collect()
 }
 
 impl Client {
@@ -88,20 +95,33 @@ impl Client {
         }
     }
 
+    /// Connects and writes one request, then reads its first line, all
+    /// before `deadline`.
     async fn open(
         &self,
         method: &str,
         params: Value,
-    ) -> Result<(Lines<BufReader<OwnedReadHalf>>, OwnedWriteHalf), HerdrError> {
-        let stream = UnixStream::connect(&self.socket)
+        deadline: Instant,
+    ) -> Result<(String, Lines<BufReader<OwnedReadHalf>>, OwnedWriteHalf), HerdrError> {
+        let stream = timeout_at(deadline, UnixStream::connect(&self.socket))
             .await
-            .map_err(|_| HerdrError::Unreachable)?;
+            .map_err(|_| HerdrError::NotSent("connecting timed out".into()))?
+            .map_err(|e| HerdrError::NotSent(e.to_string()))?;
         let (read, mut write) = stream.into_split();
-        write
-            .write_all(request_line(method, params).as_bytes())
+        timeout_at(
+            deadline,
+            write.write_all(request_line(method, params).as_bytes()),
+        )
+        .await
+        .map_err(|_| unknown("writing timed out"))?
+        .map_err(unknown)?;
+        let mut lines = BufReader::new(read).lines();
+        let line = timeout_at(deadline, lines.next_line())
             .await
-            .map_err(io_error)?;
-        Ok((BufReader::new(read).lines(), write))
+            .map_err(|_| unknown("no answer in time"))?
+            .map_err(unknown)?
+            .ok_or_else(|| unknown("the connection closed without an answer"))?;
+        Ok((line, lines, write))
     }
 
     pub async fn call<R: DeserializeOwned>(
@@ -109,33 +129,36 @@ impl Client {
         method: &str,
         params: Value,
     ) -> Result<R, HerdrError> {
-        tokio::time::timeout(TIMEOUT, async {
-            let (mut lines, _write) = self.open(method, params).await?;
-            parse_response(&first_line(&mut lines).await?)
-        })
-        .await
-        .map_err(|_| HerdrError::Timeout)?
+        self.call_with_timeout(method, params, DEFAULT_TIMEOUT)
+            .await
+    }
+
+    pub async fn call_with_timeout<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<R, HerdrError> {
+        let (line, _, _) = self.open(method, params, Instant::now() + timeout).await?;
+        parse_response(&line)
     }
 
     /// Opens `events.subscribe` on a new connection and waits for its
     /// acknowledgement, so no event pushed after this returns is missed.
     pub async fn subscribe(&self, subscriptions: Vec<Value>) -> Result<Subscription, HerdrError> {
-        tokio::time::timeout(TIMEOUT, async {
-            let params = json!({"subscriptions": subscriptions});
-            let (mut lines, write) = self.open("events.subscribe", params).await?;
-            let ack: Value = parse_response(&first_line(&mut lines).await?)?;
-            if ack["type"] != "subscription_started" {
-                return Err(HerdrError::Protocol(format!(
-                    "not an acknowledgement: {ack}"
-                )));
-            }
-            Ok(Subscription {
-                lines,
-                _write: write,
-            })
+        let params = json!({"subscriptions": subscriptions});
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        let (line, lines, write) = self.open("events.subscribe", params, deadline).await?;
+        let ack: Value = parse_response(&line)?;
+        if ack["type"] != "subscription_started" {
+            return Err(HerdrError::Protocol(format!(
+                "not an acknowledgement: {ack}"
+            )));
+        }
+        Ok(Subscription {
+            lines,
+            _write: write,
         })
-        .await
-        .map_err(|_| HerdrError::Timeout)?
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot, HerdrError> {
@@ -147,43 +170,38 @@ impl Client {
         struct Raw {
             version: String,
             protocol: u32,
-            panes: Vec<RawPane>,
-            agents: Vec<RawPane>,
+            panes: Vec<Value>,
+            agents: Vec<Value>,
         }
         let Answer { snapshot } = self.call("session.snapshot", json!({})).await?;
-        let now = Timestamp::now();
-        let mut agents: BTreeMap<String, Option<Agent>> = snapshot
-            .agents
-            .iter()
-            .map(|a| (a.pane_id.clone(), a.agent(now)))
-            .collect();
-        let panes = snapshot
-            .panes
+        let mut skipped = 0;
+        let panes = lenient::<Pane>(snapshot.panes, &mut skipped)
             .into_iter()
-            .map(|raw| {
-                let agent = match agents.remove(&raw.pane_id) {
-                    Some(agent) => agent,
-                    None => raw.agent(now),
-                };
-                let pane = raw.into_pane(agent);
-                (pane.id.clone(), pane)
-            })
+            .map(|pane| (pane.id.clone(), pane))
             .collect();
+        let agents = lenient(snapshot.agents, &mut skipped);
         Ok(Snapshot {
             version: snapshot.version,
             protocol: snapshot.protocol,
             panes,
+            agents,
+            skipped,
         })
     }
 
-    /// The agent in `pane`, looked up by pane id.
-    pub async fn agent_get(&self, pane: &PaneId) -> Result<Option<Agent>, HerdrError> {
+    /// Only the snapshot's `version`, for telling an old Herdr whose snapshot
+    /// no longer parses.
+    pub async fn version(&self) -> Result<String, HerdrError> {
         #[derive(Deserialize)]
         struct Answer {
-            agent: RawPane,
+            snapshot: Version,
         }
-        let Answer { agent } = self.call("agent.get", json!({"target": pane})).await?;
-        Ok(agent.agent(Timestamp::now()))
+        #[derive(Deserialize)]
+        struct Version {
+            version: String,
+        }
+        let Answer { snapshot } = self.call("session.snapshot", json!({})).await?;
+        Ok(snapshot.version)
     }
 
     pub async fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
@@ -194,22 +212,14 @@ impl Client {
 }
 
 impl Subscription {
-    /// The next event the mirror cares about; `None` when Herdr closed the
-    /// connection.
+    /// The next pushed event; `Ok(None)` when Herdr closed the connection. A
+    /// line that is not an event is a `Protocol` error and the subscription
+    /// stays usable.
     pub async fn next(&mut self) -> Result<Option<Event>, HerdrError> {
-        loop {
-            // `next_line` is cancel safe, so this can sit in a `select!`.
-            let Some(line) = self.lines.next_line().await.map_err(io_error)? else {
-                return Ok(None);
-            };
-            let value: Value = serde_json::from_str(&line)
-                .map_err(|e| HerdrError::Protocol(format!("{e}: {line}")))?;
-            if value.get("error").is_some() {
-                return parse_response::<Value>(&line).map(|_| None);
-            }
-            if let Some(event) = parse_event(&value, Timestamp::now())? {
-                return Ok(Some(event));
-            }
+        // `next_line` is cancel safe, so this can sit in a `select!`.
+        match self.lines.next_line().await.map_err(unknown)? {
+            Some(line) => parse_event(&line).map(Some),
+            None => Ok(None),
         }
     }
 }
@@ -217,7 +227,7 @@ impl Subscription {
 /// Asks `herdr session list --json` for a session's socket path.
 pub async fn session_socket(herdr_bin: &str, session: Option<&str>) -> Result<PathBuf> {
     let output = tokio::time::timeout(
-        TIMEOUT,
+        DEFAULT_TIMEOUT,
         tokio::process::Command::new(herdr_bin)
             .args(["session", "list", "--json"])
             .kill_on_drop(true)
@@ -266,8 +276,11 @@ fn socket_in_list(json: &[u8], session: Option<&str>) -> Result<PathBuf> {
 mod tests {
     use std::path::Path;
 
+    use tokio::net::UnixListener;
+
     use super::*;
-    use crate::herdr::fake::FakeHerdr;
+    use crate::herdr::AgentStatus;
+    use crate::herdr::fake::{FakeHerdr, agent_json, pane_json};
 
     #[test]
     fn a_session_socket_comes_from_the_session_list() {
@@ -300,27 +313,103 @@ mod tests {
                 message: "try again later".into(),
             }
         );
-        let error = fake
-            .client()
-            .agent_get(&PaneId("w9:p9".into()))
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_is_not_sent_and_a_hang_up_is_outcome_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let client = Client::new(&socket);
+        let error = client.notification_show("t", "b").await.unwrap_err();
+        assert!(matches!(error, HerdrError::NotSent(_)), "{error:?}");
+
+        // A server that reads the whole request and closes without answering.
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            lines.next_line().await.unwrap().unwrap()
+        });
+        let error = client.notification_show("t", "b").await.unwrap_err();
+        assert_eq!(
+            error,
+            HerdrError::OutcomeUnknown("the connection closed without an answer".into())
+        );
+        let request: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(request["method"], "notification.show");
+    }
+
+    #[tokio::test]
+    async fn a_call_times_out_as_outcome_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let _server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let error = Client::new(&socket)
+            .call_with_timeout::<Value>("agent.start", json!({}), Duration::from_millis(50))
             .await
             .unwrap_err();
         assert_eq!(
             error,
-            HerdrError::Api {
-                code: "agent_not_found".into(),
-                message: "agent target w9:p9 not found".into(),
-            }
+            HerdrError::OutcomeUnknown("no answer in time".into())
         );
     }
 
     #[tokio::test]
-    async fn a_missing_socket_is_unreachable() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = Client::new(dir.path().join("herdr.sock"));
-        assert_eq!(
-            client.notification_show("t", "b").await.unwrap_err(),
-            HerdrError::Unreachable
+    async fn a_malformed_snapshot_entry_is_skipped() {
+        let fake = FakeHerdr::start().await;
+        let mut broken = agent_json("w1:p2", "codex", "idle", None);
+        broken.as_object_mut().unwrap().remove("terminal_id");
+        fake.set_snapshot(
+            vec![
+                pane_json("w1:p1", "/a"),
+                pane_json("w1:p2", "/b"),
+                json!({"pane_id": 3}),
+            ],
+            vec![
+                agent_json("w1:p1", "claude", "blocked", Some("coordinator")),
+                broken,
+            ],
         );
+        let snapshot = fake.client().snapshot().await.unwrap();
+        assert_eq!(snapshot.skipped, 2);
+        assert_eq!(
+            snapshot
+                .panes
+                .keys()
+                .map(|p| p.0.as_str())
+                .collect::<Vec<_>>(),
+            ["w1:p1", "w1:p2"]
+        );
+        assert_eq!(
+            snapshot.panes[&PaneId("w1:p2".into())].cwd.as_deref(),
+            Some("/b")
+        );
+        let [agent] = snapshot.agents.as_slice() else {
+            panic!("{:?}", snapshot.agents);
+        };
+        assert_eq!(agent.pane, PaneId("w1:p1".into()));
+        assert_eq!(agent.name.as_deref(), Some("coordinator"));
+        assert_eq!(agent.status, AgentStatus::Blocked);
+        assert_eq!(
+            (snapshot.version.as_str(), snapshot.protocol),
+            ("0.9.1", 22)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_snapshot_still_gives_its_version() {
+        let fake = FakeHerdr::start().await;
+        fake.set_raw_snapshot(json!({"version": "0.8.0", "protocol": 20, "panes": {}}));
+        let client = fake.client();
+        assert!(matches!(
+            client.snapshot().await,
+            Err(HerdrError::Protocol(_))
+        ));
+        assert_eq!(client.version().await.unwrap(), "0.8.0");
     }
 }

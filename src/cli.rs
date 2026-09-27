@@ -2,7 +2,6 @@
 //! are for the plugin manifest, the ticker and the agents it starts, so every
 //! name is spelled out in full.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -12,7 +11,7 @@ use crate::actions::{self, Action};
 use crate::commands::{self, WorkerStart};
 use crate::config::Config;
 use crate::files::read_text_arg;
-use crate::herdr::{self, HerdrView, PaneId};
+use crate::herdr;
 use crate::paths::{Ctx, Env};
 use crate::runner::RealRunner;
 use crate::{progress, ticker};
@@ -81,7 +80,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DebugCommand {
-    /// Mirror the Herdr session and print one JSON line per change.
+    /// Follow the Herdr session and print one JSON line per wake.
     HerdrWatch {
         /// The socket to watch; the configured session's by default.
         #[arg(long)]
@@ -200,28 +199,36 @@ async fn herdr_watch(socket: Option<PathBuf>) -> Result<()> {
             herdr::session_socket(&env.herdr_bin(), config.herdr.session.as_deref()).await?
         }
     };
-    let mut rx = herdr::watch(herdr::Client::new(socket));
-    let mut previous = rx.borrow_and_update().clone();
+    let client = herdr::Client::new(socket);
+    let mut rx = herdr::wake(client.clone());
+    let mut printed = None;
     while rx.changed().await.is_ok() {
-        let view = rx.borrow_and_update().clone();
+        let link = rx.borrow_and_update().clone();
+        // A new error alone is not a wake.
+        if printed == Some((link.connected, link.wakes)) {
+            continue;
+        }
+        printed = Some((link.connected, link.wakes));
+        let snapshot = client.snapshot().await.ok();
+        let agents: Vec<_> = snapshot
+            .iter()
+            .flat_map(|s| &s.agents)
+            .map(|a| {
+                serde_json::json!({
+                    "pane": a.pane, "name": a.name, "status": a.status, "seq": a.state_change_seq,
+                })
+            })
+            .collect();
         let line = serde_json::json!({
             "at": jiff::Timestamp::now().to_string(),
-            "connected": view.connected,
-            "panes": view.panes.len(),
-            "changed": changed_panes(&previous, &view),
+            "connected": link.connected,
+            "wakes": link.wakes,
+            "panes": snapshot.as_ref().map(|s| s.panes.len()),
+            "agents": agents,
         });
         println!("{line}");
-        previous = view;
     }
     Ok(())
-}
-
-fn changed_panes(before: &HerdrView, after: &HerdrView) -> Vec<PaneId> {
-    let ids: BTreeSet<&PaneId> = before.panes.keys().chain(after.panes.keys()).collect();
-    ids.into_iter()
-        .filter(|id| before.panes.get(*id) != after.panes.get(*id))
-        .cloned()
-        .collect()
 }
 
 fn run_blocking(command: Command) -> Result<()> {

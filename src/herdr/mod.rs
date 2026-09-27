@@ -1,18 +1,20 @@
-//! Herdr over its unix socket: a request client and a task that mirrors the
-//! session's panes and agents.
+//! Herdr over its unix socket: a request client, `session.snapshot` as the
+//! view every decision reads, and a task that turns pushed events into wakes.
 
 mod client;
 #[cfg(test)]
 mod fake;
-mod watch;
+mod wake;
 
 pub use client::{Client, Subscription, session_socket};
-pub use watch::watch;
+pub use wake::wake;
+// Returned by the functions above; the ticker names them.
+#[allow(unused_imports)]
+pub use {client::Snapshot, wake::Link};
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -55,7 +57,8 @@ impl fmt::Display for WorkspaceId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Idle,
     Working,
@@ -76,187 +79,137 @@ impl AgentStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Agent {
-    /// Herdr's `agent`, for example `claude`.
-    pub kind: String,
-    pub name: Option<String>,
-    pub status: AgentStatus,
-    pub status_since: Timestamp,
-    /// `agent_session.value`.
-    pub session: Option<String>,
-    /// Herdr's `state_labels` map as `status=label`, in key order.
-    pub state_labels: Vec<String>,
+impl<'de> Deserialize<'de> for AgentStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(deserializer)?))
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An entry of the snapshot's `panes`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Pane {
+    #[serde(rename = "pane_id")]
     pub id: PaneId,
+    #[serde(rename = "workspace_id")]
     pub workspace: WorkspaceId,
+    #[serde(rename = "tab_id")]
     pub tab: String,
-    pub cwd: String,
+    #[serde(rename = "terminal_id")]
+    pub terminal: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
     pub foreground_cwd: Option<String>,
-    pub agent: Option<Agent>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HerdrView {
-    pub connected: bool,
-    /// When `connected` last changed.
-    pub since: Timestamp,
-    pub version: Option<String>,
-    pub protocol: Option<u32>,
-    pub panes: BTreeMap<PaneId, Pane>,
+/// An entry of the snapshot's `agents`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Agent {
+    #[serde(rename = "pane_id")]
+    pub pane: PaneId,
+    /// Herdr's `agent`, for example `claude`.
+    #[serde(rename = "agent", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "agent_status")]
+    pub status: AgentStatus,
+    /// `agent_session.value`.
+    #[serde(rename = "agent_session", default, deserialize_with = "session_value")]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub foreground_cwd: Option<String>,
+    #[serde(rename = "terminal_id")]
+    pub terminal: String,
+    #[serde(default)]
+    pub interactive_ready: bool,
+    #[serde(default)]
+    pub launch_pending: bool,
+    /// Grows with every state change, so an equal status with a higher
+    /// sequence is a new episode.
+    #[serde(default)]
+    pub state_change_seq: u64,
+    /// Herdr's `state_labels`, status to label.
+    #[serde(default)]
+    pub state_labels: BTreeMap<String, String>,
 }
 
-/// A pushed event the mirror cares about.
+fn session_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct Session {
+        value: String,
+    }
+    Ok(Option::<Session>::deserialize(deserializer)?.map(|s| s.value))
+}
+
+/// A pushed event, read only far enough to know whether the pane set may
+/// have changed. The data is not kept: decisions read a fresh snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
-    PaneCreated(Pane),
-    PaneUpdated(Pane),
-    /// A move can give the pane a new id.
-    PaneMoved {
-        previous: PaneId,
-        pane: Pane,
-    },
-    PaneClosed(PaneId),
-    PaneExited(PaneId),
-    AgentDetected {
-        pane: PaneId,
-        agent: Option<String>,
-        released: bool,
-    },
-    WorkspaceClosed(WorkspaceId),
-    AgentStatusChanged {
-        pane: PaneId,
-        agent: Option<String>,
-        status: AgentStatus,
-    },
+pub struct Event {
+    /// The event name in the underscore spelling, for example `pane_closed`.
+    pub name: String,
+}
+
+impl Event {
+    /// Whether a pane may have appeared, gone, or changed its id.
+    pub fn changes_panes(&self) -> bool {
+        matches!(
+            self.name.as_str(),
+            "pane_created" | "pane_closed" | "pane_moved" | "tab_closed" | "workspace_closed"
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HerdrError {
-    /// The socket is missing, refuses connections, or the connection ended.
-    Unreachable,
+    /// The request never reached Herdr (socket missing, connect refused or
+    /// timed out), so retrying it is safe.
+    NotSent(String),
+    /// The connection ended or timed out after the request was written:
+    /// Herdr may have acted on it.
+    OutcomeUnknown(String),
     /// A line that is not JSON or not of the expected shape.
     Protocol(String),
     /// Herdr answered with an error.
-    Api {
-        code: String,
-        message: String,
-    },
-    Timeout,
+    Api { code: String, message: String },
 }
 
 impl fmt::Display for HerdrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unreachable => f.write_str("the Herdr socket is unreachable"),
+            Self::NotSent(detail) => write!(f, "could not reach the Herdr socket: {detail}"),
+            Self::OutcomeUnknown(detail) => {
+                write!(f, "Herdr did not answer the request: {detail}")
+            }
             Self::Protocol(detail) => write!(f, "unexpected answer from Herdr: {detail}"),
             Self::Api { code, message } => {
                 write!(f, "Herdr refused the request ({code}): {message}")
             }
-            Self::Timeout => f.write_str("Herdr did not answer in time"),
         }
     }
 }
 
 impl std::error::Error for HerdrError {}
 
-/// The fields of Herdr's `PaneInfo` and `AgentInfo` this crate reads.
-#[derive(Debug, Deserialize)]
-struct RawPane {
-    pane_id: String,
-    workspace_id: String,
-    tab_id: String,
-    cwd: Option<String>,
-    foreground_cwd: Option<String>,
-    agent: Option<String>,
-    agent_status: Option<String>,
-    agent_session: Option<RawAgentSession>,
-    #[serde(default)]
-    state_labels: BTreeMap<String, String>,
-    /// Only `AgentInfo` has a name.
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAgentSession {
-    value: String,
-}
-
-impl RawPane {
-    fn agent(&self, now: Timestamp) -> Option<Agent> {
-        Some(Agent {
-            kind: self.agent.clone()?,
-            name: self.name.clone(),
-            status: AgentStatus::parse(self.agent_status.as_deref().unwrap_or_default()),
-            status_since: now,
-            session: self.agent_session.as_ref().map(|s| s.value.clone()),
-            state_labels: self
-                .state_labels
-                .iter()
-                .map(|(status, label)| format!("{status}={label}"))
-                .collect(),
-        })
-    }
-
-    fn into_pane(self, agent: Option<Agent>) -> Pane {
-        Pane {
-            id: PaneId(self.pane_id),
-            workspace: WorkspaceId(self.workspace_id),
-            tab: self.tab_id,
-            cwd: self.cwd.unwrap_or_default(),
-            foreground_cwd: self.foreground_cwd,
-            agent,
-        }
-    }
-
-    fn pane(self, now: Timestamp) -> Pane {
-        let agent = self.agent(now);
-        self.into_pane(agent)
-    }
-}
-
-fn field<T: serde::de::DeserializeOwned>(data: &Value, name: &str) -> Result<T, HerdrError> {
-    serde_json::from_value(data.get(name).cloned().unwrap_or(Value::Null))
-        .map_err(|e| HerdrError::Protocol(format!("`{name}`: {e}")))
-}
-
-/// Parses one pushed `{"event", "data"}` line; `None` for events the mirror
-/// ignores.
-fn parse_event(line: &Value, now: Timestamp) -> Result<Option<Event>, HerdrError> {
-    let Some(name) = line.get("event").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let data = line.get("data").unwrap_or(&Value::Null);
-    let pane = |key: &str| field::<RawPane>(data, key).map(|p| p.pane(now));
-    let pane_id = || field::<PaneId>(data, "pane_id");
+/// Parses one pushed `{"event", "data"}` line.
+fn parse_event(line: &str) -> Result<Event, HerdrError> {
+    let value: Value =
+        serde_json::from_str(line).map_err(|e| HerdrError::Protocol(format!("{e}: {line}")))?;
+    let name = value
+        .get("event")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HerdrError::Protocol(format!("not an event: {line}")))?;
     // Herdr pushes global events with underscores and subscription events
     // dotted; accept either spelling for every name.
-    let event = match name.replace('.', "_").as_str() {
-        "pane_created" => Event::PaneCreated(pane("pane")?),
-        "pane_updated" => Event::PaneUpdated(pane("pane")?),
-        "pane_moved" => Event::PaneMoved {
-            previous: field(data, "previous_pane_id")?,
-            pane: pane("pane")?,
-        },
-        "pane_closed" => Event::PaneClosed(pane_id()?),
-        "pane_exited" => Event::PaneExited(pane_id()?),
-        "pane_agent_detected" => Event::AgentDetected {
-            pane: pane_id()?,
-            agent: field(data, "agent")?,
-            released: field::<Option<bool>>(data, "released")?.unwrap_or(false),
-        },
-        "workspace_closed" => Event::WorkspaceClosed(field(data, "workspace_id")?),
-        "pane_agent_status_changed" => Event::AgentStatusChanged {
-            pane: pane_id()?,
-            agent: field(data, "agent")?,
-            status: AgentStatus::parse(&field::<String>(data, "agent_status")?),
-        },
-        _ => return Ok(None),
-    };
-    Ok(Some(event))
+    Ok(Event {
+        name: name.replace('.', "_"),
+    })
 }
 
 #[cfg(test)]
@@ -275,45 +228,53 @@ mod tests {
     }
 
     #[test]
-    fn events_parse_in_both_spellings_and_unknown_ones_are_ignored() {
-        let now = Timestamp::UNIX_EPOCH;
-        for name in ["pane_closed", "pane.closed"] {
-            let line = json!({"event": name, "data": {"pane_id": "w1:p1", "workspace_id": "w1"}});
-            assert_eq!(
-                parse_event(&line, now).unwrap(),
-                Some(Event::PaneClosed(PaneId("w1:p1".into())))
-            );
+    fn events_parse_in_both_spellings() {
+        for name in [
+            "pane_closed",
+            "pane.closed",
+            "tab.closed",
+            "workspace_closed",
+        ] {
+            let line = json!({"event": name, "data": {"pane_id": "w1:p1"}}).to_string();
+            assert!(parse_event(&line).unwrap().changes_panes(), "{name}");
         }
-        let line = json!({"event": "pane.agent_status_changed", "data": {
-            "pane_id": "w1:p1", "workspace_id": "w1", "agent": "claude", "agent_status": "done"}});
-        assert_eq!(
-            parse_event(&line, now).unwrap(),
-            Some(Event::AgentStatusChanged {
-                pane: PaneId("w1:p1".into()),
-                agent: Some("claude".into()),
-                status: AgentStatus::Done,
-            })
-        );
-        let line = json!({"event": "tab_focused", "data": {"tab_id": "w1:t1"}});
-        assert_eq!(parse_event(&line, now).unwrap(), None);
+        let line = json!({"event": "pane.agent_status_changed", "data": {}}).to_string();
+        let event = parse_event(&line).unwrap();
+        assert_eq!(event.name, "pane_agent_status_changed");
+        assert!(!event.changes_panes());
+        assert!(matches!(
+            parse_event("{\"data\": {}}"),
+            Err(HerdrError::Protocol(_))
+        ));
+        assert!(matches!(parse_event("nope"), Err(HerdrError::Protocol(_))));
     }
 
     #[test]
-    fn a_pane_carries_its_agent_and_labels() {
-        let raw: RawPane = serde_json::from_value(json!({
-            "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "cwd": "/src",
-            "agent": "claude", "agent_status": "napping", "name": "coordinator",
+    fn an_agent_carries_its_session_labels_and_sequence() {
+        let agent: Agent = serde_json::from_value(json!({
+            "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "terminal_id": "t-1",
+            "cwd": "/src", "agent": "claude", "agent_status": "napping", "name": "coordinator",
             "agent_session": {"agent": "claude", "kind": "id", "source": "x", "value": "s-1"},
-            "state_labels": {"working": "Testing", "idle": "Waiting"}
+            "state_labels": {"working": "Testing"}, "state_change_seq": 7,
+            "interactive_ready": true, "launch_pending": false, "focused": false, "revision": 3
         }))
         .unwrap();
-        let pane = raw.pane(Timestamp::UNIX_EPOCH);
-        let agent = pane.agent.unwrap();
-        assert_eq!(agent.status, AgentStatus::Unknown);
-        assert_eq!(agent.name.as_deref(), Some("coordinator"));
-        assert_eq!(agent.session.as_deref(), Some("s-1"));
-        assert_eq!(agent.state_labels, ["idle=Waiting", "working=Testing"]);
-        assert_eq!(pane.tab, "w1:t1");
-        assert_eq!(pane.foreground_cwd, None);
+        assert_eq!(
+            agent,
+            Agent {
+                pane: PaneId("w1:p1".into()),
+                kind: Some("claude".into()),
+                name: Some("coordinator".into()),
+                status: AgentStatus::Unknown,
+                session: Some("s-1".into()),
+                cwd: Some("/src".into()),
+                foreground_cwd: None,
+                terminal: "t-1".into(),
+                interactive_ready: true,
+                launch_pending: false,
+                state_change_seq: 7,
+                state_labels: BTreeMap::from([("working".into(), "Testing".into())]),
+            }
+        );
     }
 }

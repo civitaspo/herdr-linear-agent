@@ -32,12 +32,18 @@ pub fn agent_json(pane: &str, agent: &str, status: &str, name: Option<&str>) -> 
     value
 }
 
+/// A line to write and a signal that it was written.
+type Push = (String, oneshot::Sender<()>);
+
 #[derive(Default)]
 struct State {
     snapshot: Value,
     errors: BTreeMap<String, (String, String)>,
+    /// Refuses subscriptions that name panes with this code.
+    refuse_status: Option<String>,
     hold_snapshot: Option<oneshot::Receiver<()>>,
-    subscribers: Vec<(Vec<Value>, mpsc::UnboundedSender<String>)>,
+    hold_status: Option<oneshot::Receiver<()>>,
+    subscribers: Vec<(Vec<Value>, mpsc::UnboundedSender<Push>)>,
 }
 
 struct Shared {
@@ -73,26 +79,44 @@ impl FakeHerdr {
         Client::new(&self.socket)
     }
 
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.shared.state.lock().unwrap()
+    }
+
     pub fn set_snapshot(&self, panes: Vec<Value>, agents: Vec<Value>) {
-        self.shared.state.lock().unwrap().snapshot = json!({
+        self.state().snapshot = json!({
             "version": "0.9.1", "protocol": 22, "workspaces": [], "tabs": [],
             "layouts": [], "panes": panes, "agents": agents
         });
     }
 
+    pub fn set_raw_snapshot(&self, snapshot: Value) {
+        self.state().snapshot = snapshot;
+    }
+
     pub fn fail(&self, method: &str, code: &str, message: &str) {
-        self.shared
-            .state
-            .lock()
-            .unwrap()
+        self.state()
             .errors
             .insert(method.into(), (code.into(), message.into()));
     }
 
-    /// Holds the next snapshot answer until the returned sender fires.
+    pub fn refuse_status(&self, code: Option<&str>) {
+        self.state().refuse_status = code.map(Into::into);
+    }
+
+    /// Holds the next snapshot answer, with the content it had when asked,
+    /// until the returned sender fires.
     pub fn hold_snapshot(&self) -> oneshot::Sender<()> {
         let (tx, rx) = oneshot::channel();
-        self.shared.state.lock().unwrap().hold_snapshot = Some(rx);
+        self.state().hold_snapshot = Some(rx);
+        tx
+    }
+
+    /// Holds the next subscription that names panes: it is neither
+    /// registered nor acknowledged until the returned sender fires.
+    pub fn hold_status(&self) -> oneshot::Sender<()> {
+        let (tx, rx) = oneshot::channel();
+        self.state().hold_status = Some(rx);
         tx
     }
 
@@ -108,24 +132,44 @@ impl FakeHerdr {
         .unwrap();
     }
 
-    /// Pushes an event to every subscription that asked for it.
-    pub fn push(&self, event: &str, data: Value) {
-        let line = format!("{}\n", json!({"event": event, "data": data}));
+    /// Pushes an event to every subscription that asked for it and returns
+    /// once it was written to each.
+    pub async fn push(&self, event: &str, data: Value) {
         let name = event.replace('.', "_");
-        self.shared
-            .state
-            .lock()
-            .unwrap()
-            .subscribers
-            .retain(|(subscriptions, tx)| {
-                let wanted = subscriptions.iter().any(|s| {
-                    s["type"]
-                        .as_str()
-                        .is_some_and(|t| t.replace('.', "_") == name)
-                        && s.get("pane_id").is_none_or(|p| *p == data["pane_id"])
-                });
-                !wanted || tx.send(line.clone()).is_ok()
+        let wanted = |subscriptions: &[Value]| {
+            subscriptions.iter().any(|s| {
+                s["type"]
+                    .as_str()
+                    .is_some_and(|t| t.replace('.', "_") == name)
+                    && s.get("pane_id").is_none_or(|p| *p == data["pane_id"])
+            })
+        };
+        let line = json!({"event": event, "data": data}).to_string();
+        self.send(&line, wanted).await;
+    }
+
+    /// Writes a raw line to every subscription.
+    pub async fn push_line(&self, line: &str) {
+        self.send(line, |_| true).await;
+    }
+
+    async fn send(&self, line: &str, wanted: impl Fn(&[Value]) -> bool) {
+        let written: Vec<oneshot::Receiver<()>> = {
+            let mut state = self.state();
+            let mut written = Vec::new();
+            state.subscribers.retain(|(subscriptions, tx)| {
+                if !wanted(subscriptions) {
+                    return true;
+                }
+                let (done, rx) = oneshot::channel();
+                written.push(rx);
+                tx.send((format!("{line}\n"), done)).is_ok()
             });
+            written
+        };
+        for rx in written {
+            let _ = rx.await;
+        }
     }
 
     /// Like `herdr server stop`: every connection ends and the socket goes away.
@@ -134,7 +178,7 @@ impl FakeHerdr {
             server.abort();
             let _ = server.await;
         }
-        self.shared.state.lock().unwrap().subscribers.clear();
+        self.state().subscribers.clear();
         let _ = std::fs::remove_file(&self.socket);
     }
 
@@ -170,20 +214,40 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
     let log = |request: &Value| shared.requests.send_modify(|r| r.push(request.clone()));
     let id = request["id"].clone();
     let method = request["method"].as_str().unwrap_or_default().to_string();
+    let error = |code: &str, message: String| json!({"id": id, "error": {"code": code, "message": message}});
     if method == "events.subscribe" {
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let subscriptions = request["params"]["subscriptions"]
             .as_array()
             .cloned()
             .unwrap_or_default();
+        let names_panes = subscriptions.iter().any(|s| s.get("pane_id").is_some());
+        let (refused, hold) = {
+            let mut state = shared.state.lock().unwrap();
+            let refused = state.refuse_status.clone().filter(|_| names_panes);
+            let hold = if names_panes {
+                state.hold_status.take()
+            } else {
+                None
+            };
+            (refused, hold)
+        };
+        log(&request);
+        if let Some(code) = refused {
+            let response = error(&code, "pane not found".into());
+            let _ = write.write_all(format!("{response}\n").as_bytes()).await;
+            return;
+        }
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Push>();
+        // Registered before the ack, so a test that saw the ack can push.
         shared
             .state
             .lock()
             .unwrap()
             .subscribers
             .push((subscriptions, tx));
-        // Logged after registering, so a test that waits for it can push.
-        log(&request);
         let ack = json!({"id": id, "result": {"type": "subscription_started"}});
         if write
             .write_all(format!("{ack}\n").as_bytes())
@@ -194,8 +258,10 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
         }
         loop {
             tokio::select! {
-                line = rx.recv() => match line {
-                    Some(line) if write.write_all(line.as_bytes()).await.is_ok() => {}
+                push = rx.recv() => match push {
+                    Some((line, done)) if write.write_all(line.as_bytes()).await.is_ok() => {
+                        let _ = done.send(());
+                    }
                     _ => return,
                 },
                 // A second subscribe, or the client going away, ends it.
@@ -204,48 +270,27 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
         }
     }
     log(&request);
-    let response = respond(&shared, &id, &method, &request["params"]).await;
-    let _ = write.write_all(format!("{response}\n").as_bytes()).await;
-}
-
-async fn respond(shared: &Shared, id: &Value, method: &str, params: &Value) -> Value {
-    let error = |code: &str, message: String| json!({"id": id, "error": {"code": code, "message": message}});
-    let hold = {
+    let (response, hold) = {
         let mut state = shared.state.lock().unwrap();
-        if let Some((code, message)) = state.errors.get(method) {
-            return error(code, message.clone());
-        }
-        if method == "session.snapshot" {
-            state.hold_snapshot.take()
-        } else {
-            None
+        let ok = |result: Value| json!({"id": id, "result": result});
+        match (state.errors.get(&method), method.as_str()) {
+            (Some((code, message)), _) => (error(code, message.clone()), None),
+            (None, "session.snapshot") => (
+                ok(json!({"type": "session_snapshot", "snapshot": state.snapshot})),
+                state.hold_snapshot.take(),
+            ),
+            (None, "notification.show") => (
+                ok(json!({"type": "notification_show", "shown": true, "reason": "shown"})),
+                None,
+            ),
+            (None, other) => (
+                error("unknown_method", format!("unknown method {other}")),
+                None,
+            ),
         }
     };
     if let Some(hold) = hold {
         let _ = hold.await;
     }
-    let state = shared.state.lock().unwrap();
-    let result = match method {
-        "session.snapshot" => json!({"type": "session_snapshot", "snapshot": state.snapshot}),
-        "agent.get" => {
-            let target = &params["target"];
-            match state.snapshot["agents"]
-                .as_array()
-                .and_then(|a| a.iter().find(|a| a["pane_id"] == *target))
-            {
-                Some(agent) => json!({"type": "agent_info", "agent": agent}),
-                None => {
-                    return error(
-                        "agent_not_found",
-                        format!("agent target {} not found", target.as_str().unwrap_or("")),
-                    );
-                }
-            }
-        }
-        "notification.show" => {
-            json!({"type": "notification_show", "shown": true, "reason": "shown"})
-        }
-        other => return error("unknown_method", format!("unknown method {other}")),
-    };
-    json!({"id": id, "result": result})
+    let _ = write.write_all(format!("{response}\n").as_bytes()).await;
 }
