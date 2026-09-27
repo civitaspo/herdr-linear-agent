@@ -1290,6 +1290,40 @@ async fn panes_left_out_of_a_partly_parsed_snapshot_are_not_judged() {
 }
 
 #[tokio::test]
+async fn an_agent_whose_entry_does_not_parse_is_not_started_again() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    // The started agent is there, but its one entry does not parse.
+    world.herdr.unparsed_agent(&w.agent.pane_id, true);
+    world.settle().await;
+    for _ in 0..3 {
+        world.later(61);
+        world.settle().await;
+    }
+    let starts = |world: &World| {
+        world
+            .herdr
+            .starts()
+            .into_iter()
+            .filter(|s| s.name == "data-1-w1")
+            .count()
+    };
+    assert_eq!(starts(&world), 1);
+    assert_eq!(world.worker(KEY, "w1").agent.launch_attempts, 0);
+    assert!(
+        to(&world, &w.agent.pane_id).is_empty(),
+        "not found, not prompted"
+    );
+
+    world.herdr.unparsed_agent(&w.agent.pane_id, false);
+    world.later(5);
+    world.settle().await;
+    assert_eq!(starts(&world), 1);
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+}
+
+#[tokio::test]
 async fn a_waiting_self_report_wakes_the_ticker_when_it_expires() {
     let mut world = World::sample();
     world.running_issue().await;
@@ -1369,4 +1403,38 @@ async fn the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task() {
     assert!(outbox.join("9999999999.json").is_file());
     world.settle().await;
     assert!(outbox.join("failed/9999999999.json").is_file());
+}
+
+#[tokio::test]
+async fn a_run_under_every_lag_knob_writes_each_fact_once() {
+    let mut world = World::sample();
+    world.query_lag = 2;
+    world.hold_activity_sent = true;
+    world.split_level = true;
+    world.every_pass_twice = true;
+    let coordinator = world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.report(&w, &format!("PR: {PR}\n"));
+    world.settle().await;
+    world.message(KEY, "user-1", "Thanks.", None);
+    world.settle().await;
+    world.later(21 * 60);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(to(&world, &coordinator)[0], LAUNCH);
+    assert_eq!(count(&to(&world, &coordinator), LAUNCH), 1);
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert_eq!(count(&world.bodies(KEY, "thought"), "Picked up DATA-1."), 1);
+    let relayed = world.text(KEY, "conversation.md");
+    assert_eq!(relayed.matches("Thanks.").count(), 1);
+    let heartbeats = world
+        .sent(KEY, "thought")
+        .into_iter()
+        .filter(|a| a["ephemeral"] == json!(true))
+        .count();
+    assert_eq!(heartbeats, 1);
+    assert_eq!(world.sessions(), 1);
 }

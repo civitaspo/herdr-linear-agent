@@ -1025,6 +1025,7 @@ report [--percent N | --unknown] --activity TEXT
 - The fake Linear (`src/linear/api.rs` `fake`) is kept, with its clock that stamps each activity after the present.
 - `World::tick` becomes `World::settle`: Linear step and pass alternate, with both Linear intervals due, until a round changes no run-folder file, makes no Herdr request other than `session.snapshot` and `pane.report_metadata`, leaves the Linear queries as they were and has nothing in flight; it fails after 50 rounds. Assertions that count ticks become assertions on the order of effects (placement, then one start, then one prompt).
 - Durations use an injected clock. The World advances its clock instead of rewriting recorded timestamps, and the fake Linear stamps activities after that clock.
+- Knobs that make the World fail where the ticker would: the Linear task steps with the queries of an earlier round (`query_lag`), `ActivitySent` arrives a round after its flush, the level reaches the pass after the events, every pass runs twice, the fake Herdr holds a snapshot's answer while a subcommand runs, leaves entries unparsed, loses the answers of placements and prompts, and drops starts. `tests/scenarios:a_run_under_every_lag_knob_writes_each_fact_once`
 
 ## Decisions for the questions the inputs left open
 

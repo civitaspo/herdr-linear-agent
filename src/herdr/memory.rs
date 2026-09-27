@@ -75,6 +75,8 @@ struct Model {
     /// Panes whose entries (the pane and its agent) do not parse: left out
     /// of snapshots and counted in `skipped`.
     unparsed: Vec<PaneId>,
+    /// Panes whose agent entry alone does not parse.
+    unparsed_agents: Vec<PaneId>,
 }
 
 #[derive(Clone)]
@@ -165,6 +167,11 @@ impl Model {
         let mut panes = panes;
         for pane in &self.unparsed {
             skipped += usize::from(panes.remove(pane).is_some());
+            let before = agents.len();
+            agents.retain(|a| a.pane != *pane);
+            skipped += before - agents.len();
+        }
+        for pane in &self.unparsed_agents {
             let before = agents.len();
             agents.retain(|a| a.pane != *pane);
             skipped += before - agents.len();
@@ -310,6 +317,17 @@ impl FakeHerdr {
         model.unparsed.retain(|p| *p != pane);
         if unparsed {
             model.unparsed.push(pane);
+        }
+    }
+
+    /// The agent entry of the pane stops parsing (`true`) or parses again;
+    /// the pane itself still does.
+    pub fn unparsed_agent(&self, pane: &str, unparsed: bool) {
+        let mut model = self.model();
+        let pane = PaneId(pane.into());
+        model.unparsed_agents.retain(|p| *p != pane);
+        if unparsed {
+            model.unparsed_agents.push(pane);
         }
     }
 
