@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - record the behavior the async rewrite keeps (#31)
 
+
+### Maintenance
+
+- lock file maintenance (#34)
+
 ## [0.1.0] - 2026-09-27
 
 
