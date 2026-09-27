@@ -8,9 +8,6 @@ mod wake;
 
 pub use client::{Client, Subscription, session_socket};
 pub use wake::wake;
-// Returned by the functions above; the ticker names them.
-#[allow(unused_imports)]
-pub use {client::Snapshot, wake::Link};
 
 use std::collections::BTreeMap;
 use std::fmt;
