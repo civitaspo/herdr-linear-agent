@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- make the ticker event-driven on the Herdr socket (#35)
 - run on tokio and read Herdr over its socket (#32)
 
 
