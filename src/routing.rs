@@ -6,7 +6,7 @@
 //! issue text says, the profile it leads to stays within the config's rules.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -164,14 +164,14 @@ pub fn command(profile: &Profile, schema_path: &Path, output_path: &Path) -> (St
     (profile.kind.clone(), args)
 }
 
-/// Starts the routing agent as a child process with the issue's title and
-/// description on standard input, and returns where its answer lands. The
-/// child is killed when it is dropped, so a caller that gives up on it (a
-/// timeout, a ticker exit) never leaves it running.
+/// Starts the routing agent as a child process and returns where its
+/// answer lands. The child is killed when it is dropped, so a caller that
+/// gives up on it (a timeout, a ticker exit) never leaves it running. The
+/// issue goes to its standard input in [`answer`], inside the caller's
+/// timeout, since a child that never reads would block the write.
 pub async fn spawn(
     profile: &Profile,
     state_dir: &Path,
-    issue: &IssueDetail,
     path_var: Option<&str>,
 ) -> Result<(PathBuf, Child)> {
     let output = state_dir.join("routing.out");
@@ -193,15 +193,21 @@ pub async fn spawn(
     if let Some(path) = path_var {
         cmd.env("PATH", path);
     }
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("could not start the routing agent `{program}`"))?;
+    Ok((output, child))
+}
+
+/// Writes the issue's title and description to the child's standard input
+/// and waits for it to exit.
+pub async fn answer(child: &mut Child, issue: &IssueDetail) -> std::io::Result<ExitStatus> {
     if let Some(mut stdin) = child.stdin.take() {
         // A child that exits early closes the pipe; the answer then reads as unknown.
         let text = format!("Title: {}\n\n{}\n", issue.title, issue.description);
         let _ = stdin.write_all(text.as_bytes()).await;
     }
-    Ok((output, child))
+    child.wait().await
 }
 
 /// The size in the routing agent's output, checked against the same schema.
@@ -225,22 +231,6 @@ pub fn parse_output(text: &str) -> Size {
         .filter(|_| valid)
         .and_then(Size::parse)
         .unwrap_or(Size::Unknown)
-}
-
-/// Whether a process that is not our child (a routing agent an older build
-/// started) still runs.
-pub fn process_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
-}
-
-pub fn kill(pid: u32) {
-    if pid != 0 {
-        // SAFETY: a plain kill(2) of the routing agent's pid.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -409,14 +399,11 @@ mod tests {
         }))
         .unwrap();
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        let (output, mut child) = spawn(&profile, dir.path(), &issue, Some(&path))
-            .await
-            .unwrap();
-        child.wait().await.unwrap();
+        let (output, mut child) = spawn(&profile, dir.path(), Some(&path)).await.unwrap();
+        answer(&mut child, &issue).await.unwrap();
         assert_eq!(
             parse_output(&std::fs::read_to_string(&output).unwrap()),
             Size::XS
         );
-        assert!(!process_alive(0));
     }
 }

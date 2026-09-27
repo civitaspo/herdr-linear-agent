@@ -12,7 +12,7 @@ mod wake;
 pub use client::{Client, Snapshot, Subscription, session_socket};
 #[cfg(test)]
 pub use memory::FakeHerdr;
-pub use requests::{Herdr, Placed};
+pub use requests::{Herdr, Late, Placed};
 pub use wake::{Link, wake};
 
 use std::collections::BTreeMap;

@@ -66,8 +66,9 @@ pub struct Inputs<'a, H> {
     pub ctx: &'a Ctx<'a>,
     pub config: &'a Config,
     pub herdr: H,
-    /// The configured session's socket path, which keys progress records.
-    pub socket: String,
+    /// The configured session's socket path, which keys progress records;
+    /// empty until the session is found.
+    pub socket: watch::Receiver<String>,
     pub log: Arc<Log>,
     /// Wakes on every Herdr event.
     pub link: watch::Receiver<Link>,
@@ -79,6 +80,8 @@ pub struct Inputs<'a, H> {
     pub linear_wake: Arc<Notify>,
     /// Becomes `true` when the ticker should exit.
     pub shutdown: watch::Receiver<bool>,
+    /// Notified when a subcommand wrote run files the ticker acts on.
+    pub poke: Arc<Notify>,
     /// The present; nothing in a pass reads the wall clock.
     pub clock: fn() -> Timestamp,
 }
@@ -213,6 +216,10 @@ pub struct Reconciler {
     pub(super) prompted: BTreeSet<String>,
     /// Agents whose last placement or start never reached Herdr, and when.
     pub(super) not_sent: BTreeMap<AgentKey, Timestamp>,
+    /// Whether this pass's snapshot parsed completely.
+    pub(super) trusted: bool,
+    /// The count of unparsed snapshot entries last logged.
+    pub(super) skipped: usize,
     pub(super) queued: bool,
     pub(super) queries: Vec<RunQuery>,
 }
@@ -357,6 +364,8 @@ impl Reconciler {
             heartbeats: BTreeMap::new(),
             prompted: BTreeSet::new(),
             not_sent: BTreeMap::new(),
+            trusted: false,
+            skipped: 0,
             queued: false,
             queries: Vec::new(),
         })
@@ -366,6 +375,22 @@ impl Reconciler {
     #[cfg(test)]
     pub fn busy(&self) -> bool {
         !self.in_flight.is_empty() || !self.routing.is_empty()
+    }
+
+    /// Entries per in-memory map.
+    #[cfg(test)]
+    pub fn remembered(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("launched", self.launched.len()),
+            ("seen_panes", self.seen_panes.len()),
+            ("missing_since", self.missing_since.len()),
+            ("nudged", self.nudged.len()),
+            ("reported", self.reported.len()),
+            ("changed_at", self.changed_at.len()),
+            ("failing", self.failing.len()),
+            ("heartbeats", self.heartbeats.len()),
+            ("not_sent", self.not_sent.len()),
+        ]
     }
 
     #[cfg(test)]
@@ -451,9 +476,21 @@ impl Reconciler {
                 self.seen_panes.insert(pane.0.clone());
                 self.missing_since.remove(&pane.0);
             }
+            if snapshot.skipped != self.skipped {
+                self.skipped = snapshot.skipped;
+                d.log.line(&format!(
+                    "the Herdr snapshot has {} entries that do not parse; panes it lacks are not judged gone or empty",
+                    snapshot.skipped
+                ));
+            }
         }
+        // A partly parsed snapshot may lack a pane that exists: it serves
+        // the rules that find agents, never those that judge a pane gone
+        // or empty or prune what belongs to a pane.
+        self.trusted = snap.is_some_and(|s| s.skipped == 0);
+        let whole = snap.filter(|s| s.skipped == 0);
         for event in wake.events {
-            self.apply_event(d, level, snap, event, now).await;
+            self.apply_event(d, level, whole, event, now).await;
         }
         self.intake(d, level, now).await;
         if let Some(snapshot) = snap {
@@ -481,7 +518,7 @@ impl Reconciler {
                     d.fail(&run.key, &error);
                 }
             }
-            if let Err(error) = self.heartbeat(d, snap, &run, now).await {
+            if let Err(error) = self.heartbeat(d, whole, &run, now).await {
                 d.fail(&run.key, &error);
             }
             let pruned = run.clone();
@@ -492,22 +529,57 @@ impl Reconciler {
             .await;
         }
         self.write_failure_notice(d, now).await;
-        if let Some(snapshot) = snap {
+        if let Some(snapshot) = whole {
             let live: Vec<String> = snapshot.panes.keys().map(|p| p.0.clone()).collect();
             progress::prune(&d.ctx.state_dir(), d.socket, &live);
         }
+        self.forget(d, whole);
         self.queries = self.compute_queries(d);
     }
 
-    /// A routing job an older build recorded is not this ticker's child:
-    /// kill it when it still runs and route the run again.
+    /// Drops what the in-memory maps hold for runs that are no longer active
+    /// and, with a whole snapshot, for panes that are gone and no active
+    /// agent records. A run's status change is kept until a delegated list
+    /// read after it was handled, since only an older read or list could
+    /// undo it.
+    fn forget<H>(&mut self, d: &Deps<'_, H>, whole: Option<&Snapshot>) {
+        let mut active = BTreeSet::new();
+        let mut issues = BTreeSet::new();
+        let mut recorded = BTreeSet::new();
+        for run in Run::list(&d.ctx.runs_dir()) {
+            let Ok(record) = run.record() else { continue };
+            issues.insert(record.issue_id.clone());
+            if record.status != Status::Active {
+                continue;
+            }
+            recorded.insert(record.coordinator.pane_id.clone());
+            recorded.extend(worker::list(&run).into_iter().map(|w| w.agent.pane_id));
+            active.insert(run.key);
+        }
+        self.launched.retain(|key, _| active.contains(&key.run));
+        self.not_sent.retain(|key, _| active.contains(&key.run));
+        self.nudged.retain(|key, _| active.contains(key));
+        self.heartbeats.retain(|key, _| active.contains(key));
+        let read = self.intake_read;
+        self.changed_at.retain(|issue_id, at| {
+            issues.contains(issue_id) && read.is_none_or(|read| *at >= read)
+        });
+        if let Some(snapshot) = whole {
+            let live = |pane: &String| snapshot.panes.contains_key(&PaneId(pane.clone()));
+            self.reported.retain(|pane, _| live(pane));
+            self.seen_panes
+                .retain(|pane| live(pane) || recorded.contains(pane));
+            self.missing_since.retain(|pane, _| recorded.contains(pane));
+        }
+    }
+
+    /// A routing job an older build recorded is not this ticker's child,
+    /// and its pid may belong to another process by now: it is only
+    /// forgotten, and the run is routed again.
     async fn clear_old_routing<H>(&mut self, d: &Deps<'_, H>) {
         for run in Run::list(&d.ctx.runs_dir()) {
-            let Some(job) = run.record().ok().and_then(|r| r.routing) else {
+            if !run.record().is_ok_and(|r| r.routing.is_some()) {
                 continue;
-            };
-            if crate::routing::process_alive(job.pid) {
-                crate::routing::kill(job.pid);
             }
             if let Err(error) = update_run(&run, |r| r.routing = None).await {
                 d.fail(&run.key, &error);
@@ -548,7 +620,7 @@ impl Reconciler {
             .filter_map(|run| {
                 let record = run.record().ok()?;
                 let active = record.status == Status::Active;
-                if !active && outbox::pending(&run).is_empty() {
+                if !active && outbox::is_empty(&run) {
                     return None;
                 }
                 let undecided = active
@@ -581,6 +653,16 @@ impl Reconciler {
             agents.extend(worker::list(&run).into_iter().map(|w| w.agent));
             for agent in &agents {
                 agent_deadlines(agent, &mut times);
+                // A `Waiting for you` self-report stops counting after 5 min.
+                if agent.status == AgentStatus::Open
+                    && let Some(report) =
+                        progress::load(&d.ctx.state_dir(), d.socket, &agent.pane_id)
+                    && report.waiting()
+                {
+                    times.extend(Timestamp::from_second(
+                        report.reported_at + worker::SELF_REPORT_SECS,
+                    ));
+                }
             }
             if matches!(record.coordinator.last_state.as_str(), "idle" | "done") {
                 times.extend(after(
@@ -703,19 +785,13 @@ pub async fn run<H: Herdr + Clone + 'static>(inputs: Inputs<'_, H>) -> Result<()
         queries,
         linear_wake,
         mut shutdown,
+        poke,
         clock,
     } = inputs;
     let (effects_tx, mut effects) = mpsc::channel(EFFECT_QUEUE);
     let (routing_tx, mut routing) = mpsc::channel(EFFECT_QUEUE);
     let mut reconciler = Reconciler::new(effects_tx, routing_tx)
         .context("the reconciler could not find its binary")?;
-    let deps = Deps {
-        ctx,
-        config,
-        herdr: &herdr,
-        socket: &socket,
-        log: &log,
-    };
     let mut deadline = tokio::time::Instant::now();
     loop {
         let mut wake = Wake::default();
@@ -743,6 +819,7 @@ pub async fn run<H: Herdr + Clone + 'static>(inputs: Inputs<'_, H>) -> Result<()
             // The reconciler holds a sender of both, so they never close.
             Some(done) = effects.recv() => wake.effects.push(done),
             Some(done) = routing.recv() => wake.routing.push(done),
+            () = poke.notified() => {}
             () = tokio::time::sleep_until(deadline) => {}
         }
         while let Ok(event) = events.try_recv() {
@@ -757,6 +834,14 @@ pub async fn run<H: Herdr + Clone + 'static>(inputs: Inputs<'_, H>) -> Result<()
         drop(link.borrow_and_update());
         let current = level.borrow_and_update().clone();
         let now = clock();
+        let socket_now = socket.borrow().clone();
+        let deps = Deps {
+            ctx,
+            config,
+            herdr: &herdr,
+            socket: &socket_now,
+            log: &log,
+        };
         reconciler.pass(&deps, &current, wake, now).await;
         let next = reconciler.queries().to_vec();
         queries.send_if_modified(|published| {
@@ -859,7 +944,7 @@ mod tests {
             ctx: &ctx,
             config: &rig.config,
             herdr: herdr.clone(),
-            socket: "/tmp/loop.sock".into(),
+            socket: watch::channel("/tmp/loop.sock".to_string()).1,
             log,
             link,
             level,
@@ -867,6 +952,7 @@ mod tests {
             queries,
             linear_wake: linear_wake.clone(),
             shutdown,
+            poke: Arc::new(Notify::new()),
             clock: t0,
         });
         let driver = async {
@@ -895,6 +981,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_poke_wakes_a_pass() {
+        let rig = rig();
+        let ctx = Ctx {
+            env: &rig.env,
+            runner: &rig.runner,
+            detached_ticker: false,
+        };
+        let herdr = FakeHerdr::new(rig.home.path());
+        let (_link_tx, link) = watch::channel(Link {
+            connected: true,
+            since: t0(),
+            wakes: 0,
+            last_error: None,
+        });
+        let (_level_tx, level) = watch::channel(LinearLevel::default());
+        let (events_tx, events) = mpsc::channel(8);
+        let (queries, _published) = watch::channel(Vec::new());
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let poke = Arc::new(Notify::new());
+        let passes = || {
+            herdr
+                .requests()
+                .iter()
+                .filter(|m| *m == "session.snapshot")
+                .count()
+        };
+        let reconciler = run(Inputs {
+            ctx: &ctx,
+            config: &rig.config,
+            herdr: herdr.clone(),
+            socket: watch::channel("/tmp/loop.sock".to_string()).1,
+            log: Arc::new(Log::new(rig.home.path().join("ticker.log"))),
+            link,
+            level,
+            events,
+            queries,
+            linear_wake: Arc::new(Notify::new()),
+            shutdown,
+            poke: poke.clone(),
+            clock: t0,
+        });
+        let driver = async {
+            while passes() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            poke.notify_one();
+            let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while passes() < 2 && tokio::time::Instant::now() < give_up {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let woken = passes() >= 2;
+            shutdown_tx.send(true).unwrap();
+            drop(events_tx);
+            woken
+        };
+        let (result, woken) = tokio::join!(reconciler, driver);
+        result.unwrap();
+        assert!(woken, "the poke ran a pass");
+    }
+
+    #[tokio::test]
     async fn a_linear_task_that_ends_ends_the_loop_with_an_error() {
         let rig = rig();
         let ctx = Ctx {
@@ -917,7 +1064,7 @@ mod tests {
             ctx: &ctx,
             config: &rig.config,
             herdr: FakeHerdr::new(rig.home.path()),
-            socket: "/tmp/loop.sock".into(),
+            socket: watch::channel("/tmp/loop.sock".to_string()).1,
             log: Arc::new(Log::new(rig.home.path().join("ticker.log"))),
             link,
             level,
@@ -925,6 +1072,7 @@ mod tests {
             queries,
             linear_wake: Arc::new(Notify::new()),
             shutdown,
+            poke: Arc::new(Notify::new()),
             clock: t0,
         })
         .await

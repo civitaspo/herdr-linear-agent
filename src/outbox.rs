@@ -77,8 +77,7 @@ pub fn push_held(run: &Run, _lock: &RunLock, op: Op) -> Result<String> {
     Ok(request.id)
 }
 
-/// Queued requests, oldest first. A file that does not parse is moved aside.
-pub fn pending(run: &Run) -> Vec<(PathBuf, Request)> {
+fn queued_paths(run: &Run) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(outbox_dir(run)) else {
         return Vec::new();
     };
@@ -89,6 +88,26 @@ pub fn pending(run: &Run) -> Vec<(PathBuf, Request)> {
         .collect();
     paths.sort();
     paths
+}
+
+/// Whether any request file waits, parsed or not. Read-only: the Linear
+/// task alone moves, rewrites or removes outbox files.
+pub fn is_empty(run: &Run) -> bool {
+    queued_paths(run).is_empty()
+}
+
+/// The requests that parse, oldest first, read-only like [`is_empty`].
+pub fn queued(run: &Run) -> Vec<Request> {
+    queued_paths(run)
+        .iter()
+        .filter_map(|path| files::read_json::<Request>(path))
+        .collect()
+}
+
+/// Queued requests, oldest first. A file that does not parse is moved
+/// aside. Only the Linear task calls it.
+pub fn pending(run: &Run) -> Vec<(PathBuf, Request)> {
+    queued_paths(run)
         .into_iter()
         .filter_map(|path| match files::read_json::<Request>(&path) {
             Some(request) => Some((path, request)),

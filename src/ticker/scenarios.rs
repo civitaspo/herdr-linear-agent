@@ -59,6 +59,8 @@ fn mentions(texts: &[String], part: &str) -> bool {
     texts.iter().any(|t| t.contains(part))
 }
 
+const WAITING_TOO_LONG: i64 = 280;
+
 // ---------------------------------------------------------------- claiming
 
 #[tokio::test]
@@ -204,7 +206,7 @@ async fn an_unsized_issue_is_sized_by_the_routing_agent() {
 }
 
 #[tokio::test]
-async fn a_routing_job_an_older_build_recorded_is_killed_and_routed_again() {
+async fn a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again() {
     let mut world = World::sample();
     world.delegate(KEY, "Old", None);
     world.refuse_sessions(true);
@@ -228,10 +230,9 @@ async fn a_routing_job_an_older_build_recorded_is_killed_and_routed_again() {
 
     world.restart_ticker();
     world.settle().await;
-    assert!(
-        !leftover.wait().unwrap().success(),
-        "the old agent was killed"
-    );
+    // Its pid may belong to another process by now.
+    assert_eq!(leftover.try_wait().unwrap(), None, "not killed");
+    leftover.kill().unwrap();
     let routed = world.record(KEY);
     assert_eq!(
         (routed.routing, routed.coordinator.profile),
@@ -1248,4 +1249,124 @@ async fn a_start_result_for_a_pane_the_worker_left_is_dropped() {
         .filter(|p| p.0 == again.agent.pane_id)
         .collect();
     assert_eq!(in_new.len(), 1);
+}
+
+// ---------------------------------------------------------------- trust and lifetime
+
+#[tokio::test]
+async fn panes_left_out_of_a_partly_parsed_snapshot_are_not_judged() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    let state = world.ctx().state_dir();
+    crate::progress::save(
+        &state,
+        &crate::progress::Record {
+            socket: super::world::SOCKET.into(),
+            pane_id: w.agent.pane_id.clone(),
+            activity: "Reading".into(),
+            reported_at: world.now().as_second(),
+            ..crate::progress::Record::default()
+        },
+    )
+    .unwrap();
+    world.herdr.unparsed(&pane, true);
+    world.herdr.unparsed(&w.agent.pane_id, true);
+    world.later(5);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(!mentions(&world.inbox(KEY), "closed before"));
+    assert!(crate::progress::load(&state, super::world::SOCKET, &w.agent.pane_id).is_some());
+
+    world.herdr.unparsed(&pane, false);
+    world.herdr.unparsed(&w.agent.pane_id, false);
+    world.later(5);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert_eq!(world.herdr.starts().len(), 2, "nothing is started again");
+}
+
+#[tokio::test]
+async fn a_waiting_self_report_wakes_the_ticker_when_it_expires() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    crate::progress::save(
+        &world.ctx().state_dir(),
+        &crate::progress::Record {
+            socket: super::world::SOCKET.into(),
+            pane_id: w.agent.pane_id.clone(),
+            activity: crate::progress::WAITING.into(),
+            reported_at: world.now().as_second() - WAITING_TOO_LONG,
+            ..crate::progress::Record::default()
+        },
+    )
+    .unwrap();
+    world.settle().await;
+    let expiry = worker::SELF_REPORT_SECS - WAITING_TOO_LONG;
+    assert_eq!(
+        world.deadline(),
+        world.now() + jiff::SignedDuration::from_secs(expiry)
+    );
+}
+
+#[tokio::test]
+async fn a_routing_agent_that_never_reads_its_input_times_out() {
+    let mut world =
+        World::with(|c| c + "\n[routing.agent]\nprofile = \"router\"\ntimeout_seconds = 1\n");
+    let bin = world.script("claude", "#!/bin/sh\nsleep 30\n");
+    world.put_on_path(&bin);
+    world.delegate(KEY, "Huge", None);
+    world.fake().issue_mut(KEY)["description"] = json!("x".repeat(1 << 20));
+    world.settle().await;
+    let routed = world.record(KEY);
+    assert_eq!(
+        (routed.size, routed.size_source.as_str()),
+        (Size::Unknown, "agent (timed out)")
+    );
+}
+
+#[tokio::test]
+async fn the_reconciler_forgets_what_ended_runs_and_gone_panes_left() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    inbox::write(&world.run(KEY), "worker", "w1", "item").unwrap();
+    world.later(120);
+    world.settle().await;
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    let kept: Vec<(&str, usize)> = world
+        .remembered()
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    assert_eq!(kept, []);
+}
+
+#[tokio::test]
+async fn the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    // A closed run's outbox is listed to decide whether it is flushed.
+    let outbox = world.run(KEY).state_dir().join("outbox");
+    std::fs::write(outbox.join("9999999999.json"), "not json").unwrap();
+    world.pass_alone().await;
+    assert!(outbox.join("9999999999.json").is_file());
+    world.settle().await;
+    assert!(outbox.join("failed/9999999999.json").is_file());
 }

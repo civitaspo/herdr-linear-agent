@@ -180,6 +180,7 @@ pub async fn report_in_pane<H: Herdr>(
             reported_at: now,
         },
     )?;
+    crate::ticker::poke(state_dir);
     // The record is what the ticker reads; a token that did not reach Herdr
     // only leaves the pane's label stale.
     let _ = herdr

@@ -72,6 +72,9 @@ struct Model {
     /// The next snapshot is built, then answered only after the test let
     /// it go: whatever runs meanwhile is newer than the snapshot.
     hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    /// Panes whose entries (the pane and its agent) do not parse: left out
+    /// of snapshots and counted in `skipped`.
+    unparsed: Vec<PaneId>,
 }
 
 #[derive(Clone)]
@@ -158,6 +161,14 @@ impl Model {
             .map(|(id, pane)| (id.clone(), pane.clone()))
             .collect();
         agents.retain(|a| !hidden.contains(&a.pane));
+        let mut skipped = 0;
+        let mut panes = panes;
+        for pane in &self.unparsed {
+            skipped += usize::from(panes.remove(pane).is_some());
+            let before = agents.len();
+            agents.retain(|a| a.pane != *pane);
+            skipped += before - agents.len();
+        }
         let workspaces = panes
             .values()
             .map(|p| {
@@ -171,7 +182,7 @@ impl Model {
             panes,
             agents,
             workspaces,
-            skipped: 0,
+            skipped,
         })
     }
 
@@ -290,6 +301,16 @@ impl FakeHerdr {
         let (go, go_rx) = oneshot::channel();
         self.model().hold = Some((taken_tx, go_rx));
         (taken, go)
+    }
+
+    /// The pane's entries stop parsing (`true`) or parse again.
+    pub fn unparsed(&self, pane: &str, unparsed: bool) {
+        let mut model = self.model();
+        let pane = PaneId(pane.into());
+        model.unparsed.retain(|p| *p != pane);
+        if unparsed {
+            model.unparsed.push(pane);
+        }
     }
 
     pub fn set_down(&self, down: bool) {

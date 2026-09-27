@@ -50,6 +50,45 @@ pub fn log_path(state_dir: &Path) -> PathBuf {
     state_dir.join("ticker.log")
 }
 
+/// The datagram socket the ticker listens on for pokes.
+pub fn poke_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("ticker.sock")
+}
+
+/// Wakes a running ticker after a subcommand wrote run files it acts on.
+/// No ticker running is normal, so every error is ignored.
+pub fn poke(state_dir: &Path) {
+    if let Ok(socket) = std::os::unix::net::UnixDatagram::unbound() {
+        let _ = socket.set_nonblocking(true);
+        let _ = socket.send_to(b"!", poke_path(state_dir));
+    }
+}
+
+/// Listens for pokes and turns each into a wake of the reconciler. Without
+/// the socket (a path too long for one, say) the ticker still runs on its
+/// other wakes.
+fn listen(state_dir: &Path, log: &Log) -> Arc<Notify> {
+    let poked = Arc::new(Notify::new());
+    let path = poke_path(state_dir);
+    let _ = std::fs::remove_file(&path);
+    match tokio::net::UnixDatagram::bind(&path) {
+        Ok(socket) => {
+            let notify = poked.clone();
+            tokio::spawn(async move {
+                let mut byte = [0u8; 8];
+                while socket.recv(&mut byte).await.is_ok() {
+                    notify.notify_one();
+                }
+            });
+        }
+        Err(error) => log.line(&format!(
+            "cannot listen on {}: {error}; subcommands do not wake the ticker",
+            path.display()
+        )),
+    }
+    poked
+}
+
 /// What the lock holder writes into the lock file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -281,12 +320,27 @@ pub async fn run(ctx: &Ctx<'_>) -> Result<()> {
     }
 }
 
+/// Runs the Linear task and the reconciler at once. Until the configured
+/// session's socket is found the Herdr requests are `NotSent`, so the
+/// reconciler runs Linear-only passes; the link counts as down since the
+/// start, so the 5-minute unreachable exit still applies.
 async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>) -> Result<String> {
-    let Some(socket) = find_socket(ctx, config, state_dir, log).await else {
-        return Ok(stop_reason(state_dir).unwrap_or_else(|| unreachable_reason().into()));
-    };
-    let client = herdr::Client::new(&socket);
-    let link = herdr::wake(client.clone());
+    let herdr = herdr::Late::default();
+    let (link_tx, link) = watch::channel(Link {
+        connected: false,
+        since: Timestamp::now(),
+        wakes: 0,
+        last_error: Some("the configured Herdr session is not found yet".into()),
+    });
+    let (socket_tx, socket) = watch::channel(String::new());
+    let finder = tokio::spawn(connect(
+        ctx.env.herdr_bin(),
+        config.herdr.session.clone(),
+        herdr.clone(),
+        link_tx,
+        socket_tx,
+        log.clone(),
+    ));
     let (queries_tx, queries_rx) = watch::channel(Vec::new());
     let (level_tx, level_rx) = watch::channel(LinearLevel::default());
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
@@ -306,8 +360,8 @@ async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>)
     let reconciler = reconcile::run(reconcile::Inputs {
         ctx,
         config,
-        herdr: client,
-        socket: socket.to_string_lossy().into_owned(),
+        herdr,
+        socket,
         log: log.clone(),
         link: link.clone(),
         level: level_rx,
@@ -315,16 +369,22 @@ async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>)
         queries: queries_tx,
         linear_wake,
         shutdown: shutdown_rx,
+        poke: listen(state_dir, log),
         clock: Timestamp::now,
     });
     tokio::pin!(linear, reconciler);
     let reason = tokio::select! {
-        result = &mut reconciler => return result.map(|()| "the reconciler ended".into()),
+        result = &mut reconciler => {
+            finder.abort();
+            return result.map(|()| "the reconciler ended".into());
+        }
         reason = supervise(state_dir, link) => reason,
         () = &mut linear => "the Linear task ended".into(),
     };
+    finder.abort();
     let _ = shutdown_tx.send(true);
     reconciler.await?;
+    let _ = std::fs::remove_file(poke_path(state_dir));
     Ok(reason)
 }
 
@@ -338,31 +398,38 @@ fn stop_reason(state_dir: &Path) -> Option<String> {
         .then(|| "asked to stop".to_string())
 }
 
-/// The configured session's socket. `herdr session list` fails while Herdr
-/// is down, so it is retried until the ticker gives up.
-async fn find_socket(
-    ctx: &Ctx<'_>,
-    config: &Config,
-    state_dir: &Path,
-    log: &Log,
-) -> Option<PathBuf> {
-    let since = Timestamp::now();
+/// Finds the configured session's socket (`herdr session list` fails while
+/// Herdr is down, so it is retried), then hands the client to the
+/// reconciler and follows the session's events.
+async fn connect(
+    herdr_bin: String,
+    session: Option<String>,
+    herdr: herdr::Late<herdr::Client>,
+    link: watch::Sender<Link>,
+    socket_path: watch::Sender<String>,
+    log: Arc<Log>,
+) {
     let mut logged = false;
-    loop {
-        match herdr::session_socket(&ctx.env.herdr_bin(), config.herdr.session.as_deref()).await {
-            Ok(socket) => return Some(socket),
+    let socket = loop {
+        match herdr::session_socket(&herdr_bin, session.as_deref()).await {
+            Ok(socket) => break socket,
             Err(error) if !logged => {
                 log.line(&format!("Herdr is not reachable yet: {error:#}"));
                 logged = true;
             }
             Err(_) => {}
         }
-        if stop_reason(state_dir).is_some()
-            || Timestamp::now().duration_since(since) >= UNREACHABLE_FOR
-        {
-            return None;
-        }
         tokio::time::sleep(SOCKET_RETRY).await;
+    };
+    let client = herdr::Client::new(&socket);
+    herdr.set(client.clone());
+    let _ = socket_path.send(socket.to_string_lossy().into_owned());
+    let mut events = herdr::wake(client);
+    loop {
+        let current = events.borrow_and_update().clone();
+        if link.send(current).is_err() || events.changed().await.is_err() {
+            return;
+        }
     }
 }
 

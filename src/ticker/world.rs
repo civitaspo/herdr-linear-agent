@@ -384,6 +384,17 @@ impl World {
         restarted
     }
 
+    /// A pass with nothing from the Linear task.
+    pub async fn pass_alone(&mut self) {
+        let level = self.task.level().clone();
+        self.pass(Wake::default(), &level).await;
+    }
+
+    /// Entries per in-memory map of the reconciler.
+    pub fn remembered(&self) -> Vec<(&'static str, usize)> {
+        self.reconciler.remembered()
+    }
+
     /// The deadline the reconciler would sleep until after the last pass.
     pub fn deadline(&self) -> Timestamp {
         let ctx = self.ctx();

@@ -550,9 +550,9 @@ impl Reconciler {
             detail.state.r#type.as_str(),
             "started" | "completed" | "canceled"
         );
-        let queued = outbox::pending(run)
+        let queued = outbox::queued(run)
             .iter()
-            .any(|(_, request)| matches!(request.op, Op::IssueState { .. }));
+            .any(|request| matches!(request.op, Op::IssueState { .. }));
         let key = run.key.clone();
         self.update_and_push(run, move |r| {
             let mut ops = Vec::new();
@@ -593,11 +593,12 @@ impl Reconciler {
         let done = self.routing_done.clone();
         self.routing.insert(key.clone());
         tokio::spawn(async move {
-            let outcome = match routing::spawn(&profile, &state_dir, &issue, path.as_deref()).await
-            {
+            let outcome = match routing::spawn(&profile, &state_dir, path.as_deref()).await {
                 Err(error) => RoutingOutcome::Failed(format!("{error:#}")),
                 Ok((output, mut child)) => {
-                    match tokio::time::timeout(timeout, child.wait()).await {
+                    let answered =
+                        tokio::time::timeout(timeout, routing::answer(&mut child, &issue)).await;
+                    match answered {
                         Ok(Ok(_)) => {
                             let text = std::fs::read_to_string(&output).unwrap_or_default();
                             RoutingOutcome::Answered(routing::parse_output(&text))

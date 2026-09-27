@@ -107,7 +107,7 @@ impl Reconciler {
         let record = run.record()?;
         let label = coordinator::workspace_label(&record);
         let c = &record.coordinator;
-        if c.status == AgentStatus::Open {
+        if c.status == AgentStatus::Open && self.judged(d, snapshot, c, now) {
             let (mut next, live) = self.track(d, snapshot, c, now).await;
             let needs = worker::needs_person(&next, &live);
             let mut ops = Vec::new();
@@ -178,9 +178,27 @@ impl Reconciler {
                     continue;
                 }
             }
-            self.watch_worker(d, snapshot, run, &label, &w, now).await?;
+            if self.judged(d, snapshot, &w.agent, now) {
+                self.watch_worker(d, snapshot, run, &label, &w, now).await?;
+            }
         }
         Ok(())
+    }
+
+    /// Whether this pass may watch the agent: always with a whole snapshot;
+    /// with a partly parsed one only when our agent is found in it, since
+    /// its absence may be an entry that did not parse.
+    fn judged<H>(
+        &self,
+        d: &Deps<'_, H>,
+        snapshot: &Snapshot,
+        record: &AgentRecord,
+        now: Timestamp,
+    ) -> bool {
+        self.trusted
+            || worker::live_state(record, snapshot, now, &d.ctx.state_dir(), d.socket)
+                .agent
+                .is_some()
     }
 
     /// Whether a restarted worker's new pane is in a snapshot taken after
@@ -188,6 +206,9 @@ impl Reconciler {
     fn restart_landed(&mut self, snapshot: &Snapshot, pane: &str, now: Timestamp) -> bool {
         if snapshot.panes.contains_key(&PaneId(pane.to_string())) {
             return true;
+        }
+        if !self.trusted {
+            return false;
         }
         let first = *self.missing_since.entry(pane.to_string()).or_insert(now);
         now.duration_since(first) >= PANE_GRACE
@@ -370,7 +391,7 @@ impl Reconciler {
             .heartbeats
             .get(&run.key)
             .is_some_and(|at| now.duration_since(*at) < HEARTBEAT);
-        if quiet && !recent && outbox::pending(run).is_empty() {
+        if quiet && !recent && outbox::is_empty(run) {
             let mut counts: Vec<(Group, usize)> = Vec::new();
             for w in worker::list(run)
                 .iter()

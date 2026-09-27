@@ -109,6 +109,7 @@ pub fn inbox_done(ctx: &Ctx, key: &str, ids: &[String], all: bool) -> Result<()>
         bail!("name the inbox item ids, or pass --all");
     }
     let moved = inbox::done(&run, ids, all)?;
+    ticker::poke(&ctx.state_dir());
     println!("{moved} item(s) handled");
     Ok(())
 }
@@ -117,6 +118,7 @@ pub async fn plan_set(ctx: &Ctx<'_>, key: &str, text: &str) -> Result<()> {
     let (_, run, _) = load_active(ctx, key).await?;
     let plan = outbox::parse_plan(text)?;
     outbox::push(&run, Op::Plan { plan })?;
+    ticker::poke(&ctx.state_dir());
     println!("the plan is queued for Linear");
     Ok(())
 }
@@ -132,6 +134,7 @@ pub async fn say(ctx: &Ctx<'_>, key: &str, text: &str) -> Result<()> {
             }),
         },
     )?;
+    ticker::poke(&ctx.state_dir());
     println!("queued for the Linear session");
     Ok(())
 }
@@ -161,6 +164,7 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
         activity.signal_metadata = Some(serde_json::json!({ "options": options }));
     }
     outbox::push(&run, Op::Activity { activity })?;
+    ticker::poke(&ctx.state_dir());
     println!(
         "the question is queued for the Linear session; end your turn, the answer arrives in your inbox"
     );
@@ -216,6 +220,7 @@ pub async fn finish<H: Herdr>(
         },
     )?;
     run.update(|r| r.finished = true)?;
+    ticker::poke(&ctx.state_dir());
     println!(
         "the summary is queued; the issue moves to `{}`",
         config.linear.review_state
@@ -398,10 +403,12 @@ pub async fn worker_start<H: Herdr>(
                 w.agent.status = AgentStatus::Failed;
                 w.agent.error = format!("could not create the worktree: {error}");
             })?;
+            ticker::poke(&ctx.state_dir());
             bail!("could not create the worktree for {}: {error}", worker.id);
         }
     };
     let worker = place(ctx, &run, &record, worker, &placed, args.task.trim(), false).await?;
+    ticker::poke(&ctx.state_dir());
     println!(
         "{} is placed in {} on branch {}; herdr-linear-agent starts its agent shortly",
         worker.id, worker.worktree_path, worker.branch
@@ -501,6 +508,7 @@ pub async fn worker_prompt<H: Herdr>(
         .agent_prompt(&agent.pane, text.trim())
         .await
         .with_context(|| format!("could not prompt worker {id}"))?;
+    ticker::poke(&ctx.state_dir());
     println!("the follow-up is sent to {id}");
     Ok(())
 }
@@ -597,6 +605,7 @@ pub async fn worker_restart<H: Herdr>(
                 w.agent.status = AgentStatus::Failed;
                 w.agent.error = message;
             })?;
+            ticker::poke(&ctx.state_dir());
             return Err(error);
         }
     };
@@ -615,6 +624,7 @@ pub async fn worker_restart<H: Herdr>(
     })?;
     let task = std::fs::read_to_string(worker::task_path(&run, id)).unwrap_or_default();
     let worker = place(ctx, &run, &record, reset, &placed, task.trim(), true).await?;
+    ticker::poke(&ctx.state_dir());
     println!(
         "{id} restarts in {} with the `{profile_name}` profile",
         worker.worktree_path
@@ -1091,6 +1101,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, UNREACHABLE);
+    }
+
+    #[tokio::test]
+    async fn commands_that_write_run_files_poke_the_ticker() {
+        let setup = Setup::new(|c| c);
+        let listener =
+            std::os::unix::net::UnixDatagram::bind(ticker::poke_path(&setup.ctx().state_dir()))
+                .unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let poked = || {
+            let mut byte = [0u8; 8];
+            listener.recv(&mut byte).is_ok()
+        };
+        say(&setup.ctx(), "DATA-1", "Working on it.").await.unwrap();
+        assert!(poked(), "say");
+        plan_set(&setup.ctx(), "DATA-1", "- [ ] One").await.unwrap();
+        assert!(poked(), "plan set");
+        setup.start("api", "standard").await.unwrap();
+        assert!(poked(), "worker start");
+        inbox_done(&setup.ctx(), "DATA-1", &[], true).unwrap();
+        assert!(poked(), "inbox done");
+    }
+
+    #[tokio::test]
+    async fn a_poke_without_a_ticker_is_ignored() {
+        let setup = Setup::new(|c| c);
+        say(&setup.ctx(), "DATA-1", "Nobody listens.")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

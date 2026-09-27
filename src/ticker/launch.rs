@@ -307,11 +307,16 @@ impl Reconciler {
         if record.status != Status::Active {
             return Ok(());
         }
-        self.expire_undetected(snapshot, run, now).await?;
+        // Placing and starting judge panes absent or empty.
+        let trusted = self.trusted;
+        if trusted {
+            self.expire_undetected(snapshot, run, now).await?;
+        }
         let record = run.record()?;
         let coordinator_key = AgentKey::coordinator(&run.key);
         let c = &record.coordinator;
-        if c.status == AgentStatus::Pending
+        if trusted
+            && c.status == AgentStatus::Pending
             && !c.profile.is_empty()
             && !self.in_flight.contains_key(&coordinator_key)
         {
@@ -332,7 +337,7 @@ impl Reconciler {
                 vec![w.agent.cwd.clone(), w.repo_path.clone()],
             )
         }));
-        if !self.start_in_flight(&run.key) {
+        if trusted && !self.start_in_flight(&run.key) {
             for (key, agent, trusted) in &candidates {
                 if self.start(d, snapshot, key, agent, trusted, now)? {
                     break;

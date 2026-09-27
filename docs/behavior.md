@@ -131,6 +131,7 @@ State directory:
   runs/<KEY>/                 one run per Linear issue
   ticker.lock                 the ticker's lock and its {"version","pid"}
   ticker.log                  the ticker's log, capped
+  ticker.sock                 the datagram socket subcommands poke the ticker through
   <stop file>                 asks the running ticker to exit (name: open question)
   paused                      intake is paused while this file exists
   progress/                   progress records written by `report`
@@ -323,6 +324,7 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 - When the pane set changes it opens the new status subscription, waits for its ack, drops the old one, and wakes the ticker once more, so a status change that reached only the old connection is seen in the next snapshot.
 - An event that does not parse is skipped. A refused status subscription or a failed snapshot is retried (200 ms doubling to 5 s) without counting as a disconnect. Only a failed connect, EOF or I/O error on the global subscription marks Herdr disconnected; the reconnect backoff (200 ms doubling to 5 s) resets after the connection stayed up 30 s.
 - Rules that read panes or agents run only in a pass whose snapshot succeeded. Without one, a pass still applies Linear facts: relay, close (closing the recorded workspaces of open agents), detach and the heartbeat (groups from `last_group`).
+- A snapshot with entries that do not parse (`skipped > 0`) may lack a pane that exists. It serves the rules that find an agent (prompts, nudges, interrupts, renames, tokens); for every rule that judges a pane gone or empty (a lost coordinator, a lost worker, placement and adoption, starts, an undetected start) or prunes what belongs to a pane (progress records, the in-memory maps), the pass runs as if the snapshot had failed, and an agent the snapshot does not show is not watched. The skip count is logged once per change. `tests/scenarios:panes_left_out_of_a_partly_parsed_snapshot_are_not_judged`
 - The snapshot's workspaces give each workspace's label, which finds a coordinator placement whose answer was lost.
 - A recorded pane the ticker has never seen in a snapshot counts as present and empty for 30 s after it was first missed (Herdr may answer a placement before its pane list shows the pane). A pane seen before is gone as soon as a snapshot lacks it.
 - **Timing change:** Herdr is no longer polled. The snapshot replaces the old per-tick `agent list` and `pane list`.
@@ -388,6 +390,7 @@ An agent in Herdr is the recorded agent only when pane id, working directory, ki
 - Spawning: a new session (`setsid`) with null stdio, running `<binary> ticker run`. The startup hook returns at once; Herdr runs at most 32 plugin commands at a time, so a hook must never stay resident.
 - Version handoff: `VERSION` is the release version plus a build id, so a rebuilt binary always differs from the running one. A start from another version stops the old ticker and spawns the new one.
 - The ticker exits only when the stop file exists or the configured Herdr session has been unreachable for 5 minutes. It keeps reading Linear while no run exists.
+- The Linear task and the reconciler start at once. Until the configured session's socket is found (retried every 5 s), every Herdr request is `NotSent`, so passes run the Linear-only steps; the link counts as down since the start, so the 5-minute exit applies. `src/herdr/requests.rs:a_late_herdr_is_not_sent_until_its_session_is_found`
 - A crashed ticker comes back on the next startup hook or the next agent-facing subcommand (`context`, `plan set`, `say`, `ask`, `finish`, `worker ...`), because each runs `ticker start` first.
 - Log: `<state_dir>/ticker.log`, one line per event. Its size stays at most `LOG_CAP` and, after it is trimmed, more than `LOG_CAP / 4` remains. After 150 lines of 10,000 characters the file obeys both bounds. `tests/ticker:log_is_capped`
 - Only one ticker may run per state directory. Running the same app on two machines would claim the same issue twice; the plugin does not guard against that.
@@ -395,6 +398,10 @@ An agent in Herdr is the recorded agent only when pane id, working directory, ki
 ### Pass structure
 
 A pass takes one snapshot, then: applies the Linear events (sessions, sent activities, write failures, run reads: close, detach, issue edits, relay); intake from a delegated list it has not seen; the results of effect tasks and routing agents; then per active run, with a snapshot, watch, launch (placement, start, prompt) and nudge, and with or without one the heartbeat and inbox pruning; then the write-failure notice and the pruning of progress records. Intake runs in the reconciler, which owns the run records and the limits; the Linear task only polls and flushes. A failure in one run is logged as `<KEY>: <error>` and never stops the others. After Herdr state changes, progress records of panes that no longer exist are pruned.
+
+Wakes: a Herdr event; a Linear event; the Linear level only when the app user or the delegated issue list changed, not when only its read time did (the latest level is still what the next pass reads) `src/linear/task.rs:a_new_read_time_alone_does_not_wake_the_reconciler`; an effect or routing result; a poke from a subcommand that wrote run files the ticker acts on (`say`, `ask`, `plan set`, `finish`, `worker start/prompt/restart`, `inbox done`, `report`), which sends one byte to `<state_dir>/ticker.sock` and ignores every error, since no ticker running is normal `src/commands.rs:commands_that_write_run_files_poke_the_ticker`, `src/ticker/reconcile.rs:a_poke_wakes_a_pass`; and the next deadline, which includes the expiry of a `Waiting for you` self-report (decision 11) `tests/scenarios:a_waiting_self_report_wakes_the_ticker_when_it_expires`.
+
+Once per pass the reconciler drops what its in-memory maps (launched starts, NotSent retries, nudges, heartbeats, seen and missing panes, reported tokens, status changes) hold for runs that are no longer active and, with a whole snapshot, for panes that are gone and no active agent records. A run's status change is kept until a delegated list read after it was handled, since only an older read or list could undo it. `tests/scenarios:the_reconciler_forgets_what_ended_runs_and_gone_panes_left`
 
 **Timing change:** passes are driven by events and timers, not by a 15 second loop. After a pass the reconciler sleeps until the earliest future time a rule may become due, at most 150 s. Time rules read an injected `now`; nothing in a pass reads the wall clock. Time-based rules (30 s blocked, 60 s launch dialog, 60 s idle nudge, 20 min heartbeat, run timeout, routing timeout, 10 min write failure) must be re-evaluated by timers at least as often as they would have been at 15 s.
 
@@ -541,7 +548,8 @@ Rules pinned:
 - Schema: object with one required property `size`, a string enum of the 8 size names, no additional properties. It is written to `.state/routing.schema.json`.
 - The child runs in `.state/`, with the ticker's `PATH`, stderr discarded, stdin `Title: <title>\n\n<description>\n`. For `claude`, stdout goes to `.state/routing.out`; for `codex`, stdout is discarded and `-o` writes that file. A child that exits before reading closes the pipe; that is not an error and the answer reads as unknown. `src/routing.rs:the_agent_gets_the_issue_on_standard_input`
 - `parse_output`: take `structured_output` when it is an object, else parse the string `result` as JSON, else the whole value. The answer must be an object with exactly one key, `size`, whose value is a size name; anything else is `unknown`. `src/routing.rs:outputs_are_checked_against_the_schema`
-- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. Routing jobs are in memory, so a ticker restart routes again. A record written by an older build with `routing` set: when its pid is alive, kill it with SIGKILL; clear `routing`; route again.
+- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. Routing jobs are in memory, so a ticker restart routes again. A record written by an older build with `routing` set: clear `routing` and route again. **Spec change:** the recorded pid is never signalled, since pids are reused and the record may predate a reboot; an old child ends by itself. `tests/scenarios:a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again`
+- The issue goes to the child's standard input under the same timeout as the wait, so a child that never reads cannot hold the job past it. `tests/scenarios:a_routing_agent_that_never_reads_its_input_times_out`
 - With `tokio::process`, wait on the child with a timeout in its own task and hand the result to the run's pass. `tests/scenarios:the_routing_agent_decides_an_unsized_issue` (fake `claude` answers XS: size XS, source `agent`, profile `coordinator-light`).
 
 ## Reading runs: close, detach, issue edits
@@ -759,7 +767,7 @@ The kept module `src/outbox.rs` defines the queue.
 
 - `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, op...}`, return the id. Requests are sent in the order written.
 - Ops (`op` tag): `activity {activity}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`.
-- `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`.
+- `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`. Only the Linear task calls it: it alone moves, rewrites or removes outbox files. The reconciler lists them read-only (`queued`, the requests that parse; `is_empty`, any file). `tests/scenarios:the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task`
 
 ### Send
 

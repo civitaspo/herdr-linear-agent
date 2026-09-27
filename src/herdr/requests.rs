@@ -2,6 +2,7 @@
 //! subcommands are generic over, and its implementation on the socket client.
 
 use std::future::Future;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -101,6 +102,116 @@ pub trait Herdr: Send + Sync {
         &self,
         caller: &PaneId,
     ) -> impl Future<Output = Result<Pane, HerdrError>> + Send;
+}
+
+/// A Herdr that exists once the configured session's socket is found; until
+/// then every request fails as `NotSent`, so callers run as while Herdr is
+/// down.
+pub struct Late<H> {
+    inner: Arc<OnceLock<H>>,
+}
+
+impl<H> Clone for Late<H> {
+    fn clone(&self) -> Self {
+        Late {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<H> Default for Late<H> {
+    fn default() -> Self {
+        Late {
+            inner: Arc::new(OnceLock::new()),
+        }
+    }
+}
+
+impl<H> Late<H> {
+    /// The first call wins.
+    pub fn set(&self, herdr: H) {
+        let _ = self.inner.set(herdr);
+    }
+
+    fn get(&self) -> Result<&H, HerdrError> {
+        self.inner.get().ok_or_else(|| {
+            HerdrError::NotSent("the configured Herdr session is not found yet".into())
+        })
+    }
+}
+
+impl<H: Herdr> Herdr for Late<H> {
+    async fn snapshot(&self) -> Result<Snapshot, HerdrError> {
+        self.get()?.snapshot().await
+    }
+
+    async fn workspace_create(&self, cwd: &str, label: &str) -> Result<Placed, HerdrError> {
+        self.get()?.workspace_create(cwd, label).await
+    }
+
+    async fn worktree_create(
+        &self,
+        cwd: &str,
+        branch: &str,
+        base: &str,
+    ) -> Result<Placed, HerdrError> {
+        self.get()?.worktree_create(cwd, branch, base).await
+    }
+
+    async fn worktree_open(&self, path: &str) -> Result<Placed, HerdrError> {
+        self.get()?.worktree_open(path).await
+    }
+
+    async fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane: &PaneId,
+        args: &[String],
+    ) -> Result<(), HerdrError> {
+        self.get()?.agent_start(name, kind, pane, args).await
+    }
+
+    async fn agent_prompt(&self, pane: &PaneId, text: &str) -> Result<(), HerdrError> {
+        self.get()?.agent_prompt(pane, text).await
+    }
+
+    async fn send_escape(&self, pane: &PaneId) -> Result<(), HerdrError> {
+        self.get()?.send_escape(pane).await
+    }
+
+    async fn agent_rename(&self, pane: &PaneId, name: &str) -> Result<(), HerdrError> {
+        self.get()?.agent_rename(pane, name).await
+    }
+
+    async fn workspace_close(&self, workspace: &WorkspaceId) -> Result<(), HerdrError> {
+        self.get()?.workspace_close(workspace).await
+    }
+
+    async fn workspace_focus(&self, workspace: &WorkspaceId) -> Result<(), HerdrError> {
+        self.get()?.workspace_focus(workspace).await
+    }
+
+    async fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
+        self.get()?.notification_show(title, body).await
+    }
+
+    async fn report_metadata(
+        &self,
+        pane: &PaneId,
+        source: &str,
+        display_agent: &str,
+        tokens: &[(String, String)],
+        ttl_ms: u64,
+    ) -> Result<(), HerdrError> {
+        self.get()?
+            .report_metadata(pane, source, display_agent, tokens, ttl_ms)
+            .await
+    }
+
+    async fn pane_current(&self, caller: &PaneId) -> Result<Pane, HerdrError> {
+        self.get()?.pane_current(caller).await
+    }
 }
 
 #[derive(Deserialize)]
@@ -253,6 +364,19 @@ impl Herdr for Client {
 mod tests {
     use super::*;
     use crate::herdr::fake::{FakeHerdrServer, pane_json};
+
+    #[tokio::test]
+    async fn a_late_herdr_is_not_sent_until_its_session_is_found() {
+        let home = tempfile::tempdir().unwrap();
+        let late = Late::default();
+        let error = late.snapshot().await.unwrap_err();
+        assert!(matches!(error, HerdrError::NotSent(_)), "{error}");
+        let found = crate::herdr::FakeHerdr::new(home.path());
+        late.clone().set(found.clone());
+        late.workspace_create("/run", "DATA-1 Fix").await.unwrap();
+        assert_eq!(late.snapshot().await.unwrap().panes.len(), 1);
+        assert_eq!(found.requests(), ["workspace.create", "session.snapshot"]);
+    }
 
     fn last_request(fake: &FakeHerdrServer, method: &str) -> Value {
         fake.requests()

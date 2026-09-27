@@ -474,12 +474,16 @@ impl LinearTask {
             if matches!(out, Out::Send { closed: true, .. }) || links.events.is_closed() {
                 return;
             }
+            // The latest level is always stored, but it wakes the
+            // reconciler only when the app user or the delegated issues
+            // changed: a new read time alone is no news.
             links.level.send_if_modified(|level| {
-                let changed = *level != self.level;
-                if changed {
-                    *level = self.level.clone();
-                }
-                changed
+                let issues = |l: &LinearLevel| l.delegated.as_ref().map(|d| d.issues.clone());
+                let news = level.app_user != self.level.app_user
+                    || issues(level) != issues(&self.level)
+                    || level.budget != self.level.budget;
+                *level = self.level.clone();
+                news
             });
             let now = clock();
             let wait = std::time::Duration::try_from(self.next_due(now).duration_since(now))
@@ -835,6 +839,68 @@ mod tests {
             }]
         );
         assert_eq!(task.step(&s.linear, &[], at(3)).await, []);
+    }
+
+    #[tokio::test]
+    async fn a_new_read_time_alone_does_not_wake_the_reconciler() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let s = Arc::new(setup(&["DATA-1"], true));
+        let (_queries_tx, queries) =
+            watch::channel(vec![s.query(0, Some("session-1"), Some(UPDATED))]);
+        let (level, mut level_rx) = watch::channel(LinearLevel::default());
+        let (events, mut events_rx) = mpsc::channel(16);
+        let wake = Arc::new(Notify::new());
+        let links = Links {
+            queries,
+            level,
+            events,
+            wake: wake.clone(),
+        };
+        let clock = Arc::new(AtomicI64::new(0));
+        let (shared, time) = (s.clone(), clock.clone());
+        let running = tokio::spawn(async move {
+            task()
+                .run(
+                    &shared.linear,
+                    links,
+                    move || at(time.load(Ordering::SeqCst)),
+                    |_| {},
+                )
+                .await;
+        });
+        level_rx.changed().await.unwrap();
+        assert_eq!(
+            level_rx
+                .borrow_and_update()
+                .delegated
+                .as_ref()
+                .unwrap()
+                .read_at,
+            at(0)
+        );
+        events_rx.recv().await.unwrap();
+
+        clock.store(10, Ordering::SeqCst);
+        wake.notify_one();
+        events_rx.recv().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!level_rx.has_changed().unwrap(), "only read_at changed");
+        assert_eq!(
+            level_rx.borrow().delegated.as_ref().unwrap().read_at,
+            at(10)
+        );
+
+        s.fake().add_issue("DATA-2", "DATA", "Second");
+        clock.store(20, Ordering::SeqCst);
+        wake.notify_one();
+        level_rx.changed().await.unwrap();
+        assert_eq!(
+            level_rx.borrow().delegated.as_ref().unwrap().issues.len(),
+            2
+        );
+        drop(events_rx);
+        wake.notify_one();
+        running.await.unwrap();
     }
 
     #[tokio::test]
