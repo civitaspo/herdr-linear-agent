@@ -699,3 +699,208 @@ pub async fn run<H: Herdr + Clone + 'static>(inputs: Inputs<'_, H>) -> Result<()
             tokio::time::Instant::now() + std::time::Duration::try_from(wait).unwrap_or_default();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::FakeHerdr;
+    use crate::linear::api::IssueRef;
+    use crate::linear::task::Delegated;
+    use crate::paths::Env;
+    use crate::process::fake::FakeRunner;
+
+    const T0: &str = "2026-09-28T09:00:00Z";
+
+    fn t0() -> Timestamp {
+        T0.parse().unwrap()
+    }
+
+    fn delegated(key: &str) -> LinearLevel {
+        LinearLevel {
+            app_user: Some("app".into()),
+            delegated: Some(Delegated {
+                read_at: t0(),
+                issues: vec![IssueRef {
+                    id: format!("id-{key}"),
+                    identifier: key.into(),
+                    title: "Loop".into(),
+                    url: format!("https://linear.app/acme/issue/{key}"),
+                    updated_at: T0.into(),
+                    state: "unstarted".into(),
+                    team: "DATA".into(),
+                }],
+            }),
+            ..LinearLevel::default()
+        }
+    }
+
+    struct Rig {
+        home: tempfile::TempDir,
+        env: Env,
+        runner: FakeRunner,
+        config: Config,
+    }
+
+    fn rig() -> Rig {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().to_string_lossy().into_owned();
+        let env = Env::for_test(
+            home.path(),
+            &[
+                ("XDG_STATE_HOME", &format!("{root}/state")),
+                ("XDG_CONFIG_HOME", &format!("{root}/config")),
+            ],
+        );
+        Rig {
+            config: Config::parse(crate::config::tests::SAMPLE).unwrap(),
+            runner: FakeRunner::new(),
+            env,
+            home,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wake_runs_a_pass_that_publishes_queries_and_wakes_the_linear_task() {
+        let rig = rig();
+        let ctx = Ctx {
+            env: &rig.env,
+            runner: &rig.runner,
+            detached_ticker: false,
+        };
+        let herdr = FakeHerdr::new(rig.home.path());
+        let (_link_tx, link) = watch::channel(Link {
+            connected: true,
+            since: t0(),
+            wakes: 0,
+            last_error: None,
+        });
+        let (level_tx, level) = watch::channel(LinearLevel::default());
+        let (events_tx, events) = mpsc::channel(8);
+        let (queries, mut published) = watch::channel(Vec::new());
+        let linear_wake = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let log = Arc::new(Log::new(rig.home.path().join("ticker.log")));
+        let reconciler = run(Inputs {
+            ctx: &ctx,
+            config: &rig.config,
+            herdr: herdr.clone(),
+            socket: "/tmp/loop.sock".into(),
+            log,
+            link,
+            level,
+            events,
+            queries,
+            linear_wake: linear_wake.clone(),
+            shutdown,
+            clock: t0,
+        });
+        let driver = async {
+            level_tx.send(delegated("DATA-7")).unwrap();
+            published.changed().await.unwrap();
+            let queries = published.borrow_and_update().clone();
+            assert_eq!(queries.len(), 1);
+            assert_eq!(queries[0].issue_id, "id-DATA-7");
+            assert_eq!(
+                queries[0].issue_updated_at, None,
+                "the claim asks for the detail"
+            );
+            linear_wake.notified().await;
+            shutdown_tx.send(true).unwrap();
+            drop(events_tx);
+        };
+        let (result, ()) = tokio::join!(reconciler, driver);
+        result.unwrap();
+        let run = Run::load(&ctx.runs_dir(), "DATA-7").unwrap();
+        assert_eq!(
+            outbox::pending(&run).len(),
+            2,
+            "the thought and the started state"
+        );
+        assert!(herdr.requests().contains(&"session.snapshot".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_linear_task_that_ends_ends_the_loop_with_an_error() {
+        let rig = rig();
+        let ctx = Ctx {
+            env: &rig.env,
+            runner: &rig.runner,
+            detached_ticker: false,
+        };
+        let (_link_tx, link) = watch::channel(Link {
+            connected: false,
+            since: t0(),
+            wakes: 0,
+            last_error: None,
+        });
+        let (_level_tx, level) = watch::channel(LinearLevel::default());
+        let (events_tx, events) = mpsc::channel(8);
+        let (queries, _published) = watch::channel(Vec::new());
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        drop(events_tx);
+        let error = run(Inputs {
+            ctx: &ctx,
+            config: &rig.config,
+            herdr: FakeHerdr::new(rig.home.path()),
+            socket: "/tmp/loop.sock".into(),
+            log: Arc::new(Log::new(rig.home.path().join("ticker.log"))),
+            link,
+            level,
+            events,
+            queries,
+            linear_wake: Arc::new(Notify::new()),
+            shutdown,
+            clock: t0,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "the Linear task ended");
+    }
+
+    #[test]
+    fn attempts_are_spaced_fifteen_seconds_doubling() {
+        let table = [(0, 15), (1, 15), (2, 30), (3, 60), (4, 120)];
+        for (attempts, seconds) in table {
+            assert_eq!(
+                spacing(attempts),
+                SignedDuration::from_secs(seconds),
+                "{attempts}"
+            );
+        }
+        let record = AgentRecord {
+            launch_attempts: 2,
+            last_attempt_at: T0.into(),
+            ..AgentRecord::default()
+        };
+        assert_eq!(
+            attempt_due(&record),
+            Some(t0() + SignedDuration::from_secs(30))
+        );
+        assert_eq!(attempt_due(&AgentRecord::default()), None, "never tried");
+    }
+
+    #[test]
+    fn a_tracked_update_keeps_fields_another_process_wrote() {
+        let before = AgentRecord {
+            last_state: "idle".into(),
+            prompt_pending: true,
+            ..AgentRecord::default()
+        };
+        let mut after = before.clone();
+        after.last_state = "working".into();
+        after.last_state_seq = 4;
+        // Meanwhile `worker restart` changed the profile and the pane.
+        let mut stored = before.clone();
+        stored.profile = "deep".into();
+        stored.pane_id = "w9:p1".into();
+        apply_tracked(&mut stored, &before, &after);
+        assert_eq!(
+            (stored.last_state.as_str(), stored.last_state_seq),
+            ("working", 4)
+        );
+        assert_eq!(
+            (stored.profile.as_str(), stored.pane_id.as_str()),
+            ("deep", "w9:p1")
+        );
+    }
+}

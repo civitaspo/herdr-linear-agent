@@ -6,7 +6,11 @@
 mod intake;
 mod launch;
 pub mod reconcile;
+#[cfg(test)]
+mod scenarios;
 mod watching;
+#[cfg(test)]
+mod world;
 
 use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, Write};
