@@ -5,7 +5,7 @@ use jiff::Timestamp;
 
 use super::reconcile::{
     COORDINATOR_IDLE, Deps, HEARTBEAT, Reconciler, apply_tracked, elicitation, error_activity,
-    inbox_item, since, update_run, update_worker,
+    inbox_item, since, update_worker,
 };
 use crate::agents;
 use crate::herdr::{Herdr, Snapshot};
@@ -79,23 +79,22 @@ impl Reconciler {
         (next, live)
     }
 
-    /// Asks a person, once per episode, to answer a dialog in a Herdr pane.
-    async fn ask_for_person<H: Herdr>(
-        &mut self,
+    /// The elicitation that asks a person to answer a dialog in a Herdr
+    /// pane, and the notification that goes with it.
+    fn person_needed<H>(
         d: &Deps<'_, H>,
         run: &Run,
+        label: &str,
         who: &str,
         record: &AgentRecord,
-    ) -> Result<()> {
-        let label = coordinator::workspace_label(&run.record()?);
+    ) -> (Op, (String, String)) {
         let body = format!(
             "{who} needs someone in Herdr: it is waiting on a dialog in pane `{}` (session `{}`, run {label}). Answer it there.",
             record.pane_id,
             d.config.herdr.session.as_deref().unwrap_or("default")
         );
-        self.push(run, elicitation(body.clone(), &[])).await?;
-        d.notify(&format!("{} needs you", run.key), &body).await;
-        Ok(())
+        let notice = (format!("{} needs you", run.key), body.clone());
+        (elicitation(body, &[]), notice)
     }
 
     pub(super) async fn watch<H: Herdr>(
@@ -106,13 +105,17 @@ impl Reconciler {
         now: Timestamp,
     ) -> Result<()> {
         let record = run.record()?;
+        let label = coordinator::workspace_label(&record);
         let c = &record.coordinator;
         if c.status == AgentStatus::Open {
             let (mut next, live) = self.track(d, snapshot, c, now).await;
             let needs = worker::needs_person(&next, &live);
+            let mut ops = Vec::new();
+            let mut notices = Vec::new();
             if needs && !next.blocked_reported {
-                self.ask_for_person(d, run, "The coordinator", &next)
-                    .await?;
+                let (op, notice) = Self::person_needed(d, run, &label, "The coordinator", &next);
+                ops.push(op);
+                notices.push(notice);
                 next.blocked_reported = true;
             }
             let lost = !live.pane_exists && !record.coordinator_lost;
@@ -124,16 +127,11 @@ impl Reconciler {
                 } else {
                     "Reply `resume` to start a new coordinator."
                 };
-                self.push(
-                    run,
-                    elicitation(
-                        format!("The coordinator's pane for {} is gone. {how}", run.key),
-                        &[("Resume", "resume")],
-                    ),
-                )
-                .await?;
-                d.notify(&format!("{} coordinator is gone", run.key), how)
-                    .await;
+                ops.push(elicitation(
+                    format!("The coordinator's pane for {} is gone. {how}", run.key),
+                    &[("Resume", "resume")],
+                ));
+                notices.push((format!("{} coordinator is gone", run.key), how.to_string()));
             } else if live.pane_exists {
                 let state = if needs {
                     "needs you"
@@ -146,33 +144,43 @@ impl Reconciler {
             }
             if next != *c || lost {
                 let before = c.clone();
-                update_run(run, move |r| {
+                self.update_and_push(run, move |r| {
                     apply_tracked(&mut r.coordinator, &before, &next);
                     r.coordinator_lost |= lost;
+                    ops
                 })
                 .await?;
+            }
+            for (title, body) in notices {
+                d.notify(&title, &body).await;
             }
         }
         for w in worker::list(run)
             .into_iter()
             .filter(|w| matches!(w.agent.status, AgentStatus::Open | AgentStatus::Failed))
         {
-            self.watch_worker(d, snapshot, run, &w, now).await?;
+            self.watch_worker(d, snapshot, run, &label, &w, now).await?;
         }
         Ok(())
     }
 
+    /// The Linear writes of a worker are queued in the critical section
+    /// that stores the fields guarding them; inbox items follow.
     async fn watch_worker<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
         snapshot: &Snapshot,
         run: &Run,
+        label: &str,
         w: &Worker,
         now: Timestamp,
     ) -> Result<()> {
         let (tracked, live) = self.track(d, snapshot, &w.agent, now).await;
         let mut next = w.clone();
         next.agent = tracked;
+        let mut pull_request = None;
+        let mut ops = Vec::new();
+        let mut notices = Vec::new();
 
         // A report written in this pass counts for the group at once.
         if let Some(hash) = worker::report_hash(w).filter(|h| *h != w.report_hash) {
@@ -181,28 +189,73 @@ impl Reconciler {
             let report =
                 std::fs::read_to_string(worker::home_report_path(run, &w.id)).unwrap_or_default();
             if let Some(url) = worker::pr_line(&report).filter(|url| *url != w.pr_url) {
-                self.push(
-                    run,
-                    Op::Activity {
-                        activity: Activity::new(Content::Action {
-                            action: "Pull request".into(),
-                            parameter: format!("{url} (worker {}, repo {})", w.id, w.repo),
-                            result: None,
-                        }),
-                    },
-                )
-                .await?;
-                let (label, added) = (format!("{} {} PR", w.id, w.repo), url.clone());
-                let urls = update_run(run, move |r| {
-                    if !r.external_urls.iter().any(|u| u.url == added) {
-                        r.external_urls.push(ExternalUrl { label, url: added });
-                    }
-                })
-                .await?
-                .external_urls;
-                self.push(run, Op::ExternalUrls { urls }).await?;
+                ops.push(Op::Activity {
+                    activity: Activity::new(Content::Action {
+                        action: "Pull request".into(),
+                        parameter: format!("{url} (worker {}, repo {})", w.id, w.repo),
+                        result: None,
+                    }),
+                });
+                pull_request = Some(ExternalUrl {
+                    label: format!("{} {} PR", w.id, w.repo),
+                    url: url.clone(),
+                });
                 next.pr_url = url;
             }
+        }
+        if worker::needs_person(&next.agent, &live) && !next.agent.blocked_reported {
+            let who = format!("Worker {} ({})", w.id, w.repo);
+            let (op, notice) = Self::person_needed(d, run, label, &who, &next.agent);
+            ops.push(op);
+            notices.push(notice);
+            next.agent.blocked_reported = true;
+        }
+        if w.agent.status == AgentStatus::Open
+            && !live.pane_exists
+            && next.report_hash.is_empty()
+            && !w.gone_reported
+        {
+            ops.push(error_activity(format!(
+                "Worker {} ({}) lost its pane before it wrote a report.",
+                w.id, w.repo
+            )));
+            next.gone_reported = true;
+        }
+        let guarded = next.clone();
+        if guarded != *w {
+            let before = w.clone();
+            let id = w.id.clone();
+            self.guarded(run, move |run, lock| {
+                worker::update_held(run, lock, &id, |r| {
+                    apply_tracked(&mut r.agent, &before.agent, &guarded.agent);
+                    macro_rules! changed {
+                        ($($field:ident).+) => {
+                            if before.$($field).+ != guarded.$($field).+ {
+                                r.$($field).+ = guarded.$($field).+.clone();
+                            }
+                        };
+                    }
+                    changed!(report_hash);
+                    changed!(pr_url);
+                    changed!(gone_reported);
+                })?;
+                if let Some(added) = pull_request {
+                    let urls = run
+                        .update_held(lock, |r| {
+                            if !r.external_urls.iter().any(|u| u.url == added.url) {
+                                r.external_urls.push(added);
+                            }
+                        })?
+                        .external_urls;
+                    // The action first, then the list that names it.
+                    ops.insert(1, Op::ExternalUrls { urls });
+                }
+                Ok(((), ops))
+            })
+            .await?;
+        }
+        for (title, body) in notices {
+            d.notify(&title, &body).await;
         }
 
         let group = worker::group(&next, &live);
@@ -238,26 +291,6 @@ impl Reconciler {
             .await?;
             next.announced_report_hash = next.report_hash.clone();
         }
-        if worker::needs_person(&next.agent, &live) && !next.agent.blocked_reported {
-            let who = format!("Worker {} ({})", w.id, w.repo);
-            self.ask_for_person(d, run, &who, &next.agent).await?;
-            next.agent.blocked_reported = true;
-        }
-        if w.agent.status == AgentStatus::Open
-            && !live.pane_exists
-            && next.report_hash.is_empty()
-            && !w.gone_reported
-        {
-            self.push(
-                run,
-                error_activity(format!(
-                    "Worker {} ({}) lost its pane before it wrote a report.",
-                    w.id, w.repo
-                )),
-            )
-            .await?;
-            next.gone_reported = true;
-        }
         if live.pane_exists {
             let display = format!("{} \u{b7} {} {}", run.key, w.id, w.title);
             self.report_pane(
@@ -270,22 +303,17 @@ impl Reconciler {
             )
             .await;
         }
-        if next != *w {
-            let before = w.clone();
+        let before = w.clone();
+        if next.agent.last_group != before.agent.last_group
+            || next.announced_report_hash != before.announced_report_hash
+        {
             update_worker(run, &w.id, move |r| {
-                apply_tracked(&mut r.agent, &before.agent, &next.agent);
-                macro_rules! changed {
-                    ($($field:ident).+) => {
-                        if before.$($field).+ != next.$($field).+ {
-                            r.$($field).+ = next.$($field).+.clone();
-                        }
-                    };
+                if before.agent.last_group != next.agent.last_group {
+                    r.agent.last_group = next.agent.last_group.clone();
                 }
-                changed!(agent.last_group);
-                changed!(report_hash);
-                changed!(announced_report_hash);
-                changed!(pr_url);
-                changed!(gone_reported);
+                if before.announced_report_hash != next.announced_report_hash {
+                    r.announced_report_hash = next.announced_report_hash.clone();
+                }
             })
             .await?;
         }
@@ -307,7 +335,13 @@ impl Reconciler {
             return Ok(());
         }
         let quiet = since(&record.last_activity, now).is_some_and(|d| d >= HEARTBEAT);
-        if quiet && outbox::pending(run).is_empty() {
+        // A heartbeat already flushed whose `ActivitySent` has not arrived
+        // must not be followed by a second one.
+        let recent = self
+            .heartbeats
+            .get(&run.key)
+            .is_some_and(|at| now.duration_since(*at) < HEARTBEAT);
+        if quiet && !recent && outbox::pending(run).is_empty() {
             let mut counts: Vec<(Group, usize)> = Vec::new();
             for w in worker::list(run)
                 .iter()
@@ -339,21 +373,23 @@ impl Reconciler {
             });
             activity.ephemeral = true;
             self.push(run, Op::Activity { activity }).await?;
+            self.heartbeats.insert(run.key.clone(), now);
         }
         let hours = d.config.limits.run_timeout_hours;
         let limit = i64::try_from(hours.saturating_mul(3600)).unwrap_or(i64::MAX);
         if !record.timeout_asked && files::seconds_since(&record.timeout_since, now) >= limit {
-            self.push(
-                run,
-                elicitation(
-                    format!(
-                        "This run has been going for {hours} hours. Reply to let it continue; until then the coordinator gets no prompts."
-                    ),
-                    &[("Continue", "continue")],
-                ),
-            )
-            .await?;
-            update_run(run, |r| r.timeout_asked = true).await?;
+            self.update_and_push(run, move |r| {
+                    if std::mem::replace(&mut r.timeout_asked, true) {
+                        return Vec::new();
+                    }
+                    vec![elicitation(
+                        format!(
+                            "This run has been going for {hours} hours. Reply to let it continue; until then the coordinator gets no prompts."
+                        ),
+                        &[("Continue", "continue")],
+                    )]
+                })
+                .await?;
             d.notify(
                 &format!("{} ran {hours} hours", run.key),
                 "Reply in the Linear session to let it continue.",

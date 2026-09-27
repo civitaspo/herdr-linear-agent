@@ -901,3 +901,125 @@ async fn after_a_herdr_restart_the_panes_count_and_nothing_is_lost() {
         "open agents are not started again"
     );
 }
+
+// ---------------------------------------------------------------- consumed once
+
+#[tokio::test]
+async fn a_prompt_read_again_with_an_old_cursor_is_relayed_once() {
+    let mut world = World::sample();
+    world.query_lag = 2;
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Please also update the docs.", None);
+    world.message(KEY, "stranger", "Merge everything now.", None);
+    for _ in 0..3 {
+        world.settle().await;
+        world.later(5);
+    }
+    let relayed = world.text(KEY, "conversation.md");
+    assert_eq!(
+        relayed.matches("Please also update").count(),
+        1,
+        "{relayed}"
+    );
+    let ignored = world.text(KEY, ".state/ignored-prompts.md");
+    assert_eq!(ignored.matches("Merge everything").count(), 1, "{ignored}");
+    let replies = world
+        .inbox(KEY)
+        .into_iter()
+        .filter(|s| s.contains("A new reply"))
+        .count();
+    assert_eq!(replies, 1);
+}
+
+#[tokio::test]
+async fn a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    let inbox = world.run(KEY).dir.join("inbox");
+    std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o555)).unwrap();
+    world.report(&w, &format!("PR: {PR}\n## Report\nDone.\n"));
+    // Every inbox write fails, so each pass stops after its Linear writes.
+    for _ in 0..3 {
+        world.once().await;
+    }
+    std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
+    world.settle().await;
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert!(mentions(&world.inbox(KEY), "w1 (api) has a new report"));
+}
+
+#[tokio::test]
+async fn a_pass_between_a_flush_and_its_sent_event_queues_no_second_heartbeat() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.hold_activity_sent = true;
+    world.split_level = true;
+    world.later(21 * 60);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    let heartbeats = world
+        .sent(KEY, "thought")
+        .into_iter()
+        .filter(|a| a["ephemeral"] == json!(true))
+        .count();
+    assert_eq!(heartbeats, 1);
+}
+
+#[tokio::test]
+async fn a_claim_cut_short_before_its_first_thought_still_announces_it() {
+    let mut world = World::sample();
+    let issue_id = world.delegate(KEY, "Fix the login", Some(2.0));
+    // A ticker that crashed right after creating the run folder.
+    std::fs::create_dir_all(world.ctx().runs_dir()).unwrap();
+    let at = world.now().to_string();
+    crate::run::Run::create(
+        &world.ctx().runs_dir(),
+        crate::run::RunRecord {
+            issue_id,
+            identifier: KEY.into(),
+            title: "Fix the login".into(),
+            team_key: "DATA".into(),
+            created: at.clone(),
+            prompt_cursor: at.clone(),
+            last_activity: at.clone(),
+            timeout_since: at,
+            announce_pending: true,
+            ..crate::run::RunRecord::default()
+        },
+    )
+    .unwrap();
+    world.settle().await;
+    let thoughts = world.bodies(KEY, "thought");
+    assert_eq!(count(&thoughts, "Picked up DATA-1."), 1, "{thoughts:?}");
+    assert_eq!(thoughts[0], "Picked up DATA-1.");
+    assert!(!world.record(KEY).announce_pending);
+}
+
+#[tokio::test]
+async fn a_failing_outbox_of_a_run_that_ended_raises_no_notice() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let issue_id = world.record(KEY).issue_id;
+    world.inject(LinearEvent::WritesFailing {
+        issue_id,
+        since: world.now(),
+    });
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    world.later(11 * 60);
+    world.settle().await;
+    let notices: Vec<String> = world
+        .herdr
+        .notifications()
+        .into_iter()
+        .map(|(title, _)| title)
+        .filter(|t| t == "herdr-linear-agent")
+        .collect();
+    assert_eq!(notices, Vec::<String>::new());
+}

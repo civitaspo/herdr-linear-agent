@@ -16,7 +16,7 @@ use crate::files;
 use crate::linear::ApiError;
 use crate::linear::api::{Activity, ExternalUrl, IssueDetail};
 use crate::linear::client::LinearApi;
-use crate::run::Run;
+use crate::run::{Run, RunLock};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -57,7 +57,13 @@ fn outbox_dir(run: &Run) -> PathBuf {
 /// Queues one request. File names carry a counter allocated under the run
 /// lock, so requests are sent in the order they were written.
 pub fn push(run: &Run, op: Op) -> Result<String> {
-    let _lock = run.lock()?;
+    let lock = run.lock()?;
+    push_held(run, &lock, op)
+}
+
+/// `push` for a caller that holds the run lock, so a request is queued in
+/// the same critical section as the record field that guards it.
+pub fn push_held(run: &Run, _lock: &RunLock, op: Op) -> Result<String> {
     let counter_path = run.state_dir().join("outbox-counter.json");
     let n: u64 = files::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
     files::write_json(&counter_path, &n)?;

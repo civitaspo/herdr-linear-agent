@@ -164,6 +164,9 @@ pub struct RunRecord {
     /// A person pressed stop: no prompt or heartbeat goes out until they
     /// reply again. Inbox items are still written.
     pub stopped: bool,
+    /// The claim's `Picked up <KEY>.` thought is not queued yet. A record
+    /// of an older build lacks the field and reads as announced.
+    pub announce_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +274,17 @@ impl Run {
     /// Read-modify-write of the record under the lock: `change` touches only
     /// the fields its step owns.
     pub fn update(&self, change: impl FnOnce(&mut RunRecord)) -> Result<RunRecord> {
-        let _lock = self.lock()?;
+        let lock = self.lock()?;
+        self.update_held(&lock, change)
+    }
+
+    /// `update` for a caller that holds the lock, so several writes form one
+    /// critical section.
+    pub fn update_held(
+        &self,
+        _lock: &RunLock,
+        change: impl FnOnce(&mut RunRecord),
+    ) -> Result<RunRecord> {
         let mut record = self.record()?;
         change(&mut record);
         files::write_json(&self.record_path(), &record)?;
@@ -279,8 +292,13 @@ impl Run {
     }
 
     /// Appends one allowed reply to `conversation.md`.
-    pub fn append_conversation(&self, created: &str, user_id: &str, body: &str) -> Result<()> {
-        let _lock = self.lock()?;
+    pub fn append_conversation_held(
+        &self,
+        _lock: &RunLock,
+        created: &str,
+        user_id: &str,
+        body: &str,
+    ) -> Result<()> {
         let path = self.conversation_md();
         let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| "# Conversation\n\nReplies from allowed users in the issue's Agent Session, oldest first.\n".to_string());
         text.push_str(&format!(
@@ -291,8 +309,13 @@ impl Run {
     }
 
     /// Records a reply from a user who is not allowed; it never reaches the coordinator.
-    pub fn record_ignored_prompt(&self, created: &str, user_id: &str, body: &str) -> Result<()> {
-        let _lock = self.lock()?;
+    pub fn record_ignored_prompt_held(
+        &self,
+        _lock: &RunLock,
+        created: &str,
+        user_id: &str,
+        body: &str,
+    ) -> Result<()> {
         let path = self.state_dir().join("ignored-prompts.md");
         let mut text = std::fs::read_to_string(&path).unwrap_or_default();
         text.push_str(&format!(
@@ -420,10 +443,17 @@ mod tests {
         assert_eq!(Run::list(dir.path()).len(), 1);
         assert!(Run::load(dir.path(), "DATA-2").is_err());
 
-        run.append_conversation("2026-09-25T00:00:01Z", "user-1", "Please also fix B.\n")
+        let lock = run.lock().unwrap();
+        run.append_conversation_held(
+            &lock,
+            "2026-09-25T00:00:01Z",
+            "user-1",
+            "Please also fix B.\n",
+        )
+        .unwrap();
+        run.append_conversation_held(&lock, "2026-09-25T00:00:02Z", "user-1", "Thanks")
             .unwrap();
-        run.append_conversation("2026-09-25T00:00:02Z", "user-1", "Thanks")
-            .unwrap();
+        drop(lock);
         let text = std::fs::read_to_string(run.conversation_md()).unwrap();
         assert!(text.starts_with("# Conversation"));
         assert!(text.find("Please also fix B.").unwrap() < text.find("Thanks").unwrap());

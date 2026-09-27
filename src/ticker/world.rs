@@ -3,7 +3,7 @@
 //! trait-level Herdr fake and the fake Linear. Time is a clock the test
 //! moves; nothing ages records by rewriting them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -18,7 +18,7 @@ use crate::commands::{self, Session, WorkerStart};
 use crate::config::Config;
 use crate::herdr::FakeHerdr;
 use crate::linear::api::fake::FakeLinear;
-use crate::linear::task::{LinearEvent, LinearTask};
+use crate::linear::task::{LinearEvent, LinearLevel, LinearTask, RunQuery};
 use crate::paths::{Ctx, Env};
 use crate::process::fake::{FakeRunner, fail, ok};
 use crate::run::{Run, RunRecord};
@@ -47,6 +47,18 @@ pub struct World {
     /// Every pass is followed by a second one with nothing new, which must
     /// change nothing.
     pub every_pass_twice: bool,
+    /// The Linear task steps with the queries of this many rounds before
+    /// the latest, as a task that reads while the reconciler moves on.
+    pub query_lag: usize,
+    published: VecDeque<Vec<RunQuery>>,
+    /// `ActivitySent` reaches the reconciler one round after its flush, so
+    /// a pass runs between the two.
+    pub hold_activity_sent: bool,
+    held: Vec<LinearEvent>,
+    /// The events of a round go to one pass with the level the reconciler
+    /// had before, and the new level to the next pass.
+    pub split_level: bool,
+    seen_level: LinearLevel,
 }
 
 /// Every file under the runs folder with its bytes.
@@ -129,6 +141,12 @@ impl World {
             now: Timestamp::now().round(jiff::Unit::Second).unwrap(),
             injected: Vec::new(),
             every_pass_twice: false,
+            query_lag: 0,
+            published: VecDeque::new(),
+            hold_activity_sent: false,
+            held: Vec::new(),
+            split_level: false,
+            seen_level: LinearLevel::default(),
             home,
             env,
             runner,
@@ -146,6 +164,9 @@ impl World {
         self.effects = effects;
         self.routing = routing;
         self.task = LinearTask::new(&self.config.linear);
+        self.published.clear();
+        self.held.clear();
+        self.seen_level = LinearLevel::default();
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
@@ -193,14 +214,19 @@ impl World {
             let before = files_under(&self.ctx().runs_dir());
             let asked = self.herdr.requests().len();
             let queries = self.reconciler.queries().to_vec();
-            let wake = self.round().await;
-            self.pass(wake).await;
+            self.once().await;
             let effects = self.herdr.requests()[asked..]
                 .iter()
                 .filter(|method| !READS.contains(&method.as_str()))
                 .count();
             if effects == 0
                 && !self.reconciler.busy()
+                && self.held.is_empty()
+                && self.published.len() > self.query_lag
+                && self
+                    .published
+                    .iter()
+                    .all(|q| q == self.reconciler.queries())
                 && queries == self.reconciler.queries()
                 && before == files_under(&self.ctx().runs_dir())
             {
@@ -210,14 +236,45 @@ impl World {
         panic!("the ticker did not settle within {ROUNDS} rounds");
     }
 
+    /// One round: a Linear step and the pass it wakes.
+    pub async fn once(&mut self) {
+        let wake = self.round().await;
+        if self.split_level {
+            let before = self.seen_level.clone();
+            self.pass(wake, &before).await;
+            let level = self.task.level().clone();
+            self.pass(Wake::default(), &level).await;
+        } else {
+            let level = self.task.level().clone();
+            self.pass(wake, &level).await;
+        }
+        self.seen_level = self.task.level().clone();
+    }
+
+    /// The queries the Linear task steps with, `query_lag` rounds old.
+    fn queries_for_step(&mut self) -> Vec<RunQuery> {
+        self.published.push_back(self.reconciler.queries().to_vec());
+        while self.published.len() > self.query_lag + 1 {
+            self.published.pop_front();
+        }
+        self.published.front().cloned().unwrap_or_default()
+    }
+
     /// One Linear step, then the results of effect tasks and routing agents
     /// that are still out.
     async fn round(&mut self) -> Wake {
         self.task.force_due();
         self.fake().present = Some(self.now);
-        let queries = self.reconciler.queries().to_vec();
+        let queries = self.queries_for_step();
         let mut events = std::mem::take(&mut self.injected);
-        events.extend(self.task.step(&self.linear, &queries, self.now).await);
+        events.append(&mut self.held);
+        for event in self.task.step(&self.linear, &queries, self.now).await {
+            if self.hold_activity_sent && matches!(event, LinearEvent::ActivitySent { .. }) {
+                self.held.push(event);
+            } else {
+                events.push(event);
+            }
+        }
         for line in self.task.take_log() {
             self.log.line(&line);
         }
@@ -242,8 +299,7 @@ impl World {
         wake
     }
 
-    async fn pass(&mut self, wake: Wake) {
-        let level = self.task.level().clone();
+    async fn pass(&mut self, wake: Wake, level: &LinearLevel) {
         let ctx = Ctx {
             env: &self.env,
             runner: &self.runner,
@@ -256,7 +312,7 @@ impl World {
             socket: SOCKET,
             log: &self.log,
         };
-        self.reconciler.pass(&deps, &level, wake, self.now).await;
+        self.reconciler.pass(&deps, level, wake, self.now).await;
         if !self.every_pass_twice {
             return;
         }
@@ -267,7 +323,7 @@ impl World {
         let asked = self.herdr.requests().len();
         let in_flight = self.reconciler.effects_in_flight();
         self.reconciler
-            .pass(&deps, &level, Wake::default(), self.now)
+            .pass(&deps, level, Wake::default(), self.now)
             .await;
         assert_eq!(
             in_flight,

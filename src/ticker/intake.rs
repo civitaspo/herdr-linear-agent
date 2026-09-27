@@ -16,6 +16,15 @@ use crate::outbox::{self, Op, StateTarget};
 use crate::run::{AgentRecord, AgentStatus, Run, RunRecord, Status};
 use crate::{coordinator, files, routing, worker};
 
+/// Whether a prompt created at `created` is newer than the cursor. Both are
+/// RFC 3339; text that does not parse is compared as text.
+fn after_cursor(created: &str, cursor: &str) -> bool {
+    match (created.parse::<Timestamp>(), cursor.parse::<Timestamp>()) {
+        (Ok(created), Ok(cursor)) => created > cursor,
+        _ => cursor.is_empty() || created > cursor,
+    }
+}
+
 fn run_of<H>(d: &Deps<'_, H>, issue_id: &str) -> Option<(Run, RunRecord)> {
     Run::list(&d.ctx.runs_dir()).into_iter().find_map(|run| {
         let record = run.record().ok()?;
@@ -47,9 +56,18 @@ impl Reconciler {
                 _ => Ok(()),
             },
             LinearEvent::ActivitySent { issue_id, at } => match run_of(d, &issue_id) {
-                Some((run, _)) => update_run(&run, move |r| r.last_activity = at.to_string())
-                    .await
-                    .map(|_| ()),
+                Some((run, _)) => {
+                    if self
+                        .heartbeats
+                        .get(&run.key)
+                        .is_some_and(|queued| *queued <= at)
+                    {
+                        self.heartbeats.remove(&run.key);
+                    }
+                    update_run(&run, move |r| r.last_activity = at.to_string())
+                        .await
+                        .map(|_| ())
+                }
                 None => Ok(()),
             },
             LinearEvent::WritesFailing { issue_id, since } => {
@@ -170,7 +188,10 @@ impl Reconciler {
 
     /// Replies from allowed users reach the coordinator through
     /// `conversation.md` and the inbox; a stop signal interrupts the run's
-    /// agents; anyone else's message is only recorded.
+    /// agents; anyone else's message is only recorded. The Linear task may
+    /// read with an older cursor, so a prompt at or before the record's
+    /// cursor was handled already; each prompt moves the cursor in the
+    /// critical section that records it.
     async fn relay<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
@@ -179,37 +200,46 @@ impl Reconciler {
         prompts: &[Prompt],
         now: Timestamp,
     ) -> Result<()> {
-        let Some(last) = prompts.last() else {
-            return Ok(());
-        };
         for prompt in prompts {
             let (created, user, body) = (
                 prompt.created_at.clone(),
                 prompt.user_id.clone(),
                 prompt.body.clone(),
             );
+            if !after_cursor(&created, &run.record()?.prompt_cursor) {
+                continue;
+            }
             if !d.config.linear.allowed_user_ids.contains(&prompt.user_id) {
-                let target = run.clone();
-                blocking(move || target.record_ignored_prompt(&created, &user, &body)).await?;
+                self.guarded(run, move |run, lock| {
+                    if after_cursor(&created, &run.record()?.prompt_cursor) {
+                        run.record_ignored_prompt_held(lock, &created, &user, &body)?;
+                        run.update_held(lock, |r| r.prompt_cursor = created)?;
+                    }
+                    Ok(((), Vec::new()))
+                })
+                .await?;
                 continue;
             }
             if prompt.signal.as_deref() == Some("stop") {
                 let stopped = self.interrupt_agents(d, snap, run).await;
-                update_run(run, |r| r.stopped = true).await?;
-                let body = format!(
-                    "Stopped {stopped} agent(s) as asked. Their worktrees are kept; reply here to continue."
-                );
-                self.push(
-                    run,
-                    Op::Activity {
+                self.update_and_push(run, move |r| {
+                    if !after_cursor(&created, &r.prompt_cursor) {
+                        return Vec::new();
+                    }
+                    r.prompt_cursor = created;
+                    r.stopped = true;
+                    let body = format!(
+                        "Stopped {stopped} agent(s) as asked. Their worktrees are kept; reply here to continue."
+                    );
+                    vec![Op::Activity {
                         activity: Activity::new(Content::Response { body }),
-                    },
-                )
+                    }]
+                })
                 .await?;
                 continue;
             }
-            let target = run.clone();
-            blocking(move || target.append_conversation(&created, &user, &body)).await?;
+            // The inbox item comes first: a failure before the cursor moves
+            // may repeat it, never the conversation entry.
             inbox_item(
                 run,
                 "reply",
@@ -222,24 +252,30 @@ impl Reconciler {
             .await?;
             let resume = prompt.body.trim().eq_ignore_ascii_case("resume");
             let restart_window = now.to_string();
-            update_run(run, move |r| {
-                r.stopped = false;
-                if r.timeout_asked {
-                    r.timeout_asked = false;
-                    r.timeout_since = restart_window;
+            self.guarded(run, move |run, lock| {
+                if !after_cursor(&created, &run.record()?.prompt_cursor) {
+                    return Ok(((), Vec::new()));
                 }
-                if r.coordinator_lost && resume {
-                    r.coordinator_lost = false;
-                    r.coordinator.status = AgentStatus::Pending;
-                    r.coordinator.resume = !r.coordinator.agent_session.is_empty();
-                    r.coordinator.launch_attempts = 0;
-                    r.coordinator.last_attempt_at.clear();
-                }
+                run.append_conversation_held(lock, &created, &user, &body)?;
+                run.update_held(lock, move |r| {
+                    r.prompt_cursor = created;
+                    r.stopped = false;
+                    if r.timeout_asked {
+                        r.timeout_asked = false;
+                        r.timeout_since = restart_window;
+                    }
+                    if r.coordinator_lost && resume {
+                        r.coordinator_lost = false;
+                        r.coordinator.status = AgentStatus::Pending;
+                        r.coordinator.resume = !r.coordinator.agent_session.is_empty();
+                        r.coordinator.launch_attempts = 0;
+                        r.coordinator.last_attempt_at.clear();
+                    }
+                })?;
+                Ok(((), Vec::new()))
             })
             .await?;
         }
-        let cursor = last.created_at.clone();
-        update_run(run, move |r| r.prompt_cursor = cursor).await?;
         Ok(())
     }
 
@@ -406,7 +442,10 @@ impl Reconciler {
             return Ok(());
         }
         self.changed_at.insert(record.issue_id.clone(), read_at);
-        update_run(run, |r| {
+        self.update_and_push(run, |r| {
+            if r.status == Status::Active {
+                return Vec::new();
+            }
             r.status = Status::Active;
             // A closed run's coordinator was stopped: bring it back.
             if r.coordinator.status == AgentStatus::Stopped {
@@ -415,12 +454,8 @@ impl Reconciler {
                 r.coordinator.launch_attempts = 0;
                 r.coordinator.last_attempt_at.clear();
             }
+            vec![thought("The issue was delegated again; the run continues.")]
         })
-        .await?;
-        self.push(
-            run,
-            thought("The issue was delegated again; the run continues."),
-        )
         .await?;
         inbox_item(
             run,
@@ -455,25 +490,30 @@ impl Reconciler {
             prompt_cursor: now.clone(),
             last_activity: now.clone(),
             timeout_since: now,
+            announce_pending: true,
             ..RunRecord::default()
         };
         let runs_dir = d.ctx.runs_dir();
         let run = blocking(move || Run::create(&runs_dir, record)).await?;
         self.changed_at.insert(issue.id.clone(), read_at);
         d.log.line(&format!("{}: picked up", run.key));
-        self.push(&run, thought(format!("Picked up {}.", run.key)))
-            .await?;
-        self.push(
-            &run,
-            Op::IssueState {
-                target: StateTarget::Started,
-            },
-        )
+        let key = run.key.clone();
+        self.update_and_push(&run, move |r| {
+            r.announce_pending = false;
+            vec![
+                thought(format!("Picked up {key}.")),
+                Op::IssueState {
+                    target: StateTarget::Started,
+                },
+            ]
+        })
         .await
+        .map(|_| ())
     }
 
-    /// A run without a decided coordinator: moves the issue to a started
-    /// state unless that is queued or done, and routes it.
+    /// A run without a decided coordinator: queues the claim's first thought
+    /// when a crash cut the claim short, moves the issue to a started state
+    /// unless that is queued or done, and routes it.
     async fn finish_claim<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
@@ -487,15 +527,20 @@ impl Reconciler {
         let queued = outbox::pending(run)
             .iter()
             .any(|(_, request)| matches!(request.op, Op::IssueState { .. }));
-        if !moved && !queued {
-            self.push(
-                run,
-                Op::IssueState {
+        let key = run.key.clone();
+        self.update_and_push(run, move |r| {
+            let mut ops = Vec::new();
+            if std::mem::take(&mut r.announce_pending) {
+                ops.push(thought(format!("Picked up {key}.")));
+            }
+            if !moved && !queued {
+                ops.push(Op::IssueState {
                     target: StateTarget::Started,
-                },
-            )
-            .await?;
-        }
+                });
+            }
+            ops
+        })
+        .await?;
         self.route(d, run, detail).await
     }
 
@@ -588,25 +633,25 @@ impl Reconciler {
         let mut pending = coordinator::pending_record(&record, &name, &profile.kind);
         pending.agent_session = record.coordinator.agent_session.clone();
         let stored_source = source.to_string();
-        update_run(run, move |r| {
-            r.size = size;
-            r.size_source = stored_source;
-            r.routing = None;
-            r.coordinator = pending;
-        })
-        .await?;
         let why = match (size, source) {
             (Size::Unknown, "default") => "size unknown".to_string(),
             (Size::Unknown, source) => format!("size unknown after the routing {source}"),
             (size, "agent") => format!("size {size} from the routing agent"),
             (size, source) => format!("size {size} from the {source}"),
         };
-        self.push(
-            run,
-            thought(format!(
+        self.update_and_push(run, move |r| {
+            if !r.coordinator.profile.is_empty() {
+                return Vec::new();
+            }
+            r.size = size;
+            r.size_source = stored_source;
+            r.routing = None;
+            r.coordinator = pending;
+            vec![thought(format!(
                 "The coordinator uses the `{name}` profile ({why})."
-            )),
-        )
+            ))]
+        })
         .await
+        .map(|_| ())
     }
 }

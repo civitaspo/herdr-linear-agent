@@ -86,6 +86,31 @@ impl RunQuery {
     }
 }
 
+/// Where a step's events go: collected, or sent at once, so the reconciler
+/// sees a run's flush as soon as it finishes.
+pub enum Out<'a> {
+    #[cfg(test)]
+    Collect(Vec<LinearEvent>),
+    Send {
+        to: &'a mpsc::Sender<LinearEvent>,
+        closed: bool,
+    },
+}
+
+impl Out<'_> {
+    async fn push(&mut self, event: LinearEvent) {
+        match self {
+            #[cfg(test)]
+            Out::Collect(events) => events.push(event),
+            Out::Send { to, closed } => {
+                if !*closed && to.send(event).await.is_err() {
+                    *closed = true;
+                }
+            }
+        }
+    }
+}
+
 /// The channels the task talks through.
 pub struct Links {
     pub queries: watch::Receiver<Vec<RunQuery>>,
@@ -160,20 +185,42 @@ impl LinearTask {
     /// One round: the viewer while unknown, the delegated poll and the run
     /// read when their intervals are due, then the flush. It neither sleeps
     /// nor reads the clock.
+    #[cfg(test)]
     pub async fn step(
         &mut self,
         client: &impl LinearApi,
         queries: &[RunQuery],
         now: Timestamp,
     ) -> Vec<LinearEvent> {
-        let mut events = Vec::new();
+        let mut out = Out::Collect(Vec::new());
+        self.step_into(client, queries, now, &mut out).await;
+        match out {
+            Out::Collect(events) => events,
+            Out::Send { .. } => Vec::new(),
+        }
+    }
+
+    /// `step`, handing each event to `out` as soon as it happened.
+    pub async fn step_into(
+        &mut self,
+        client: &impl LinearApi,
+        queries: &[RunQuery],
+        now: Timestamp,
+        events: &mut Out<'_>,
+    ) {
         self.sessions.retain(|issue_id, _| {
             queries
                 .iter()
                 .any(|q| &q.issue_id == issue_id && q.session_id.is_none())
         });
-        self.failing
-            .retain(|issue_id, _| queries.iter().any(|q| &q.issue_id == issue_id));
+        // A run that left the queries is no longer flushed: its failure ends.
+        let (kept, gone): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.failing)
+            .into_iter()
+            .partition(|(issue_id, _)| queries.iter().any(|q| &q.issue_id == issue_id));
+        self.failing = kept;
+        for issue_id in gone.into_keys() {
+            events.push(LinearEvent::WritesRecovered { issue_id }).await;
+        }
 
         // The viewer is retried on the run-read interval; run reads wait for it.
         let read_due = due(self.last_read, self.run_read_interval, now);
@@ -198,10 +245,9 @@ impl LinearTask {
             }
         }
         if read_due && self.level.app_user.is_some() {
-            self.read_runs(client, queries, now, &mut events).await;
+            self.read_runs(client, queries, now, events).await;
         }
-        self.flush(client, queries, now, &mut events).await;
-        events
+        self.flush(client, queries, now, events).await;
     }
 
     fn session_of(&self, query: &RunQuery) -> Option<String> {
@@ -216,7 +262,7 @@ impl LinearTask {
         client: &impl LinearApi,
         queries: &[RunQuery],
         now: Timestamp,
-        events: &mut Vec<LinearEvent>,
+        events: &mut Out<'_>,
     ) {
         let (with_session, without): (Vec<_>, Vec<_>) = queries
             .iter()
@@ -248,12 +294,14 @@ impl LinearTask {
             } else {
                 None
             };
-            events.push(LinearEvent::RunRead {
-                issue_id: query.issue_id.clone(),
-                read_started_at: now,
-                update,
-                detail,
-            });
+            events
+                .push(LinearEvent::RunRead {
+                    issue_id: query.issue_id.clone(),
+                    read_started_at: now,
+                    update,
+                    detail,
+                })
+                .await;
         }
         // A fresh claim without a session still needs the detail for
         // `issue.md` and routing; its state comes from the detail.
@@ -273,12 +321,14 @@ impl LinearTask {
                 },
                 prompts: Vec::new(),
             };
-            events.push(LinearEvent::RunRead {
-                issue_id: query.issue_id.clone(),
-                read_started_at: now,
-                update,
-                detail: Some(detail),
-            });
+            events
+                .push(LinearEvent::RunRead {
+                    issue_id: query.issue_id.clone(),
+                    read_started_at: now,
+                    update,
+                    detail: Some(detail),
+                })
+                .await;
         }
     }
 
@@ -303,7 +353,7 @@ impl LinearTask {
         client: &impl LinearApi,
         queries: &[RunQuery],
         now: Timestamp,
-        events: &mut Vec<LinearEvent>,
+        events: &mut Out<'_>,
     ) {
         for query in queries {
             let key = query.key();
@@ -317,10 +367,12 @@ impl LinearTask {
                 let sent =
                     outbox::send(&run, &session, &query.issue_id, &self.review_state, client).await;
                 if sent.activity_sent {
-                    events.push(LinearEvent::ActivitySent {
-                        issue_id: query.issue_id.clone(),
-                        at: now,
-                    });
+                    events
+                        .push(LinearEvent::ActivitySent {
+                            issue_id: query.issue_id.clone(),
+                            at: now,
+                        })
+                        .await;
                 }
                 for (request, error) in &sent.refused {
                     self.log.push(format!(
@@ -342,16 +394,20 @@ impl LinearTask {
             match (blocked, self.failing.contains_key(&query.issue_id)) {
                 (true, false) => {
                     self.failing.insert(query.issue_id.clone(), now);
-                    events.push(LinearEvent::WritesFailing {
-                        issue_id: query.issue_id.clone(),
-                        since: now,
-                    });
+                    events
+                        .push(LinearEvent::WritesFailing {
+                            issue_id: query.issue_id.clone(),
+                            since: now,
+                        })
+                        .await;
                 }
                 (false, true) => {
                     self.failing.remove(&query.issue_id);
-                    events.push(LinearEvent::WritesRecovered {
-                        issue_id: query.issue_id.clone(),
-                    });
+                    events
+                        .push(LinearEvent::WritesRecovered {
+                            issue_id: query.issue_id.clone(),
+                        })
+                        .await;
                 }
                 _ => {}
             }
@@ -362,7 +418,7 @@ impl LinearTask {
         &mut self,
         client: &impl LinearApi,
         query: &RunQuery,
-        events: &mut Vec<LinearEvent>,
+        events: &mut Out<'_>,
     ) -> Option<String> {
         if let Some(session) = self.session_of(query) {
             return Some(session);
@@ -376,10 +432,12 @@ impl LinearTask {
             Ok(session) => {
                 self.sessions
                     .insert(query.issue_id.clone(), session.clone());
-                events.push(LinearEvent::SessionFound {
-                    issue_id: query.issue_id.clone(),
-                    session_id: session.clone(),
-                });
+                events
+                    .push(LinearEvent::SessionFound {
+                        issue_id: query.issue_id.clone(),
+                        session_id: session.clone(),
+                    })
+                    .await;
                 Some(session)
             }
             Err(error) => {
@@ -403,9 +461,18 @@ impl LinearTask {
     ) {
         loop {
             let queries = links.queries.borrow().clone();
-            let happened = self.step(client, &queries, clock()).await;
+            // Events go out as they happen and before the level, so a pass
+            // woken by the level has already seen what led to it.
+            let mut out = Out::Send {
+                to: &links.events,
+                closed: false,
+            };
+            self.step_into(client, &queries, clock(), &mut out).await;
             for line in self.take_log() {
                 log(&line);
+            }
+            if matches!(out, Out::Send { closed: true, .. }) || links.events.is_closed() {
+                return;
             }
             links.level.send_if_modified(|level| {
                 let changed = *level != self.level;
@@ -414,14 +481,6 @@ impl LinearTask {
                 }
                 changed
             });
-            for event in happened {
-                if links.events.send(event).await.is_err() {
-                    return;
-                }
-            }
-            if links.events.is_closed() {
-                return;
-            }
             let now = clock();
             let wait = std::time::Duration::try_from(self.next_due(now).duration_since(now))
                 .unwrap_or_default();
@@ -757,6 +816,25 @@ mod tests {
         );
         assert_eq!(task.step(&s.linear, &queries, at(4)).await, []);
         assert_eq!(s.fake().sessions[0].sent("thought").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_run_that_leaves_the_queries_is_reported_recovered() {
+        let s = setup(&["DATA-1"], true);
+        let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
+        let mut task = task();
+        task.step(&s.linear, &queries, at(0)).await;
+        outbox::push(&s.runs[0], thought("late")).unwrap();
+        s.fake().fail_next = Some(ApiError::HttpStatus(503));
+        task.step(&s.linear, &queries, at(1)).await;
+        let events = task.step(&s.linear, &[], at(2)).await;
+        assert_eq!(
+            events,
+            [LinearEvent::WritesRecovered {
+                issue_id: s.issues[0].clone()
+            }]
+        );
+        assert_eq!(task.step(&s.linear, &[], at(3)).await, []);
     }
 
     #[tokio::test]

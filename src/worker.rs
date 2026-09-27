@@ -13,7 +13,7 @@ use crate::herdr::{Agent, AgentStatus as HerdrStatus, Snapshot};
 use crate::linear::api::{Activity, Content};
 use crate::outbox::Op;
 use crate::progress;
-use crate::run::{AgentRecord, AgentStatus, Run, Status};
+use crate::run::{AgentRecord, AgentStatus, Run, RunLock, Status};
 
 /// Workers write their brief and report under this folder of the worktree.
 pub const BRIEF_FOLDER: &str = ".herdr-linear-agent";
@@ -148,7 +148,17 @@ pub fn allocate(
 
 /// Read-modify-write of one record under the run lock; `created` is kept.
 pub fn update(run: &Run, id: &str, change: impl FnOnce(&mut Worker)) -> Result<Worker> {
-    let _lock = run.lock()?;
+    let lock = run.lock()?;
+    update_held(run, &lock, id, change)
+}
+
+/// `update` for a caller that holds the run lock.
+pub fn update_held(
+    run: &Run,
+    _lock: &RunLock,
+    id: &str,
+    change: impl FnOnce(&mut Worker),
+) -> Result<Worker> {
     let mut worker = load(run, id)?;
     let created = worker.created.clone();
     change(&mut worker);

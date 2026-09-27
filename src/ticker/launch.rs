@@ -404,7 +404,11 @@ impl Reconciler {
         d.herdr
             .agent_prompt(&agent.pane, &worker::launch_prompt(&run.key, &w.id))
             .await?;
-        update_worker(run, &w.id, |w| w.agent.prompt_pending = false).await?;
-        self.push(run, worker::start_action(w)).await
+        let id = w.id.clone();
+        self.guarded(run, move |run, lock| {
+            let w = worker::update_held(run, lock, &id, |w| w.agent.prompt_pending = false)?;
+            Ok(((), vec![worker::start_action(&w)]))
+        })
+        .await
     }
 }

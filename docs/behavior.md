@@ -167,6 +167,7 @@ Rules:
 - The key is validated before any path is built: `TEAM-NUMBER`, team starts with an ASCII upper-case letter, then upper-case letters or digits, at most 16 characters; number 1 to 12 digits. Error: ``\`<key>\` is not a Linear issue key (expected the form TEAM-123)``. `src/run.rs:keys_are_validated_before_any_path_is_built`
 - The run lock is an exclusive file lock on `.state/lock`. It is held while reading and rewriting anything under `workers/`, `inbox/` or `.state/`, and never across a Herdr, git or Linear call. In the async rewrite, take it on a blocking thread or with an async file lock; never hold it across an `.await` on I/O to Herdr, git or Linear.
 - `update(change)` is a read-modify-write of the record under the lock; each step changes only the fields it owns.
+- A Linear write the reconciler queues is pushed in the same critical section (one hold of the run lock) that stores the field guarding it (`report_hash`, `pr_url`, `blocked_reported`, `gone_reported`, `coordinator_lost`, `timeout_asked`, `prompt_cursor`, `announce_pending`, the coordinator profile, `prompt_pending`), so a failure later in the pass never sends it twice. `tests/scenarios:a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails`
 - `canonical_dir` is the run folder with symlinks resolved (or the plain path when that fails). Herdr reports physical working directories and records compare against it.
 - JSON and text files are written atomically (temporary file and rename, no leftover). `tests/files:slugs_quotes_and_atomic_writes`
 
@@ -192,6 +193,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `timeout_asked` | the timeout question is open |
 | `coordinator_lost` | the coordinator's pane is gone and the resume question was asked |
 | `stopped` | a person pressed stop; no prompt or heartbeat goes out until they reply |
+| `announce_pending` | the claim's `Picked up <KEY>.` thought is not queued yet; missing in an older record, which reads as announced |
 
 Agent record (coordinator and every worker's `agent`):
 
@@ -488,16 +490,17 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 ### `claim(issue)`
 
 1. Validate the key; read the issue detail.
-2. Create the state and runs directories. Create the run with `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, and `prompt_cursor = last_activity = timeout_since = now`.
+2. Create the state and runs directories. Create the run with `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
 3. Log `<KEY>: picked up`.
-4. Queue the thought `Picked up <KEY>.` and the issue-state request with target `started`.
+4. Queue the thought `Picked up <KEY>.` and the issue-state request with target `started`, clearing `announce_pending` in the same critical section.
 5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. The session is opened by the flush (Linear's auto-created one, or a new one).
 
 ### `finish_claim(run, detail)`
 
 1. The session is opened by the flush, never here.
-2. Queue an issue-state request with target `started`, unless one is queued or the issue is already started, completed or canceled.
-3. Route.
+2. When `announce_pending` is still set (a crash between creating the run and queuing its first thought), queue `Picked up <KEY>.` and clear it. `tests/scenarios:a_claim_cut_short_before_its_first_thought_still_announces_it`
+3. Queue an issue-state request with target `started`, unless one is queued or the issue is already started, completed or canceled.
+4. Route.
 
 Rules pinned:
 
@@ -576,7 +579,7 @@ Checkouts and branches are never removed.
   3. Set `stopped = false`. When `timeout_asked`, clear it and set `timeout_since = now`.
   4. When `coordinator_lost` and the trimmed body equals `resume` case-insensitively: clear `coordinator_lost`, set the coordinator `pending`, `resume = agent_session non-empty`, `launch_attempts = 0`.
 
-After the loop, `prompt_cursor` becomes the last prompt's `createdAt`, ignored prompts included. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
+The Linear task may read with the query of an earlier pass, so a prompt created at or before the record's current `prompt_cursor` is dropped. Each prompt, ignored ones included, moves `prompt_cursor` to its `createdAt` in the critical section that records it (the conversation entry and the record fields, the ignored-prompts entry, or the stop and its response); a reply's inbox item is written just before. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`, `tests/scenarios:a_prompt_read_again_with_an_old_cursor_is_relayed_once`
 
 Interrupting sends `esc` to the coordinator's pane and to every `open` worker's pane, for each agent found by identity; the count is the number of successful sends. With a coordinator and one worker the count is 2. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
 
@@ -739,7 +742,7 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 
 Skipped entirely while the run has no session or is `stopped`.
 
-- Heartbeat: when `last_activity` is at least 20 minutes old and the outbox is empty, queue an ephemeral thought `Still on it: <summary>.` `<summary>` is `no workers`, or the counts of `open` workers by group in first-seen order, as `<n> <label in lower case>` joined by `, ` (for example `1 working, 1 waiting on you`). Linear marks a session `stale` after 30 minutes without an activity.
+- Heartbeat: when `last_activity` is at least 20 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 20 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought `Still on it: <summary>.` `<summary>` is `no workers`, or the counts of `open` workers by group in first-seen order, as `<n> <label in lower case>` joined by `, ` (for example `1 working, 1 waiting on you`). Linear marks a session `stale` after 30 minutes without an activity.
 - Run timeout: when not `timeout_asked` and `timeout_since` is at least `run_timeout_hours * 3600` s old, queue the elicitation `This run has been going for <h> hours. Reply to let it continue; until then the coordinator gets no prompts.` with option `Continue`=`continue`, set `timeout_asked`, and show the notification `<KEY> ran <h> hours` with body `Reply in the Linear session to let it continue.`
 - A reply clears `timeout_asked` and restarts the window. `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue`
 
@@ -763,6 +766,7 @@ The kept module `src/outbox.rs` defines the queue.
 4. A definitive refusal (`Graphql`, `Configuration`, HTTP 400 to 428 or 430 to 499): move the file to `outbox/failed/` and go on. HTTP 429 and `RATELIMITED` are not definitive (see above).
 5. Any other error: stop the queue; the rest waits for the next flush.
 
+- The Linear task hands each event to the reconciler as soon as it happened (an `ActivitySent` right after that run's flush) and publishes the level after the step's events. A run whose outbox was failing and that leaves the queries is reported with `WritesRecovered`. `src/linear/task.rs:a_failing_run_that_leaves_the_queries_is_reported_recovered`, `tests/scenarios:a_pass_between_a_flush_and_its_sent_event_queues_no_second_heartbeat`
 - A lost response is checked by a read and never sent twice. `src/outbox.rs:a_lost_response_is_checked_by_a_read_and_never_sent_twice`
 - A failure keeps the rest in order; a refusal is set aside and the next request still goes out. `src/outbox.rs:a_failure_keeps_the_rest_in_order_and_a_refusal_is_set_aside`
 - Requests go out in order and are removed. `src/outbox.rs:requests_go_out_in_order_and_are_removed`
@@ -786,7 +790,7 @@ For every run with queued requests, including detached and closed runs:
 
 1. No session: `open_session`, store it; on failure log and count the flush as blocked.
 2. Send. When an activity went out, set `last_activity = now`. Log refusals and a blocked queue.
-3. When any run was blocked, remember since when. When Linear has accepted no write for 10 minutes, show once the notification `herdr-linear-agent` / `Linear has not accepted writes for 10 minutes. They are kept and retried; see the ticker log.` A flush without a block resets the timer and the notice.
+3. When any run was blocked, remember since when. The reconciler forgets a blocked run that is no longer active. `tests/scenarios:a_failing_outbox_of_a_run_that_ended_raises_no_notice` When Linear has accepted no write for 10 minutes, show once the notification `herdr-linear-agent` / `Linear has not accepted writes for 10 minutes. They are kept and retried; see the ticker log.` A flush without a block resets the timer and the notice.
 
 Requests queued before the session existed wait and go out once it exists. `tests/scenarios:a_claim_without_a_session_still_decides_its_coordinator`
 

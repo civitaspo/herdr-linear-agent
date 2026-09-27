@@ -34,7 +34,7 @@ use crate::linear::api::{Activity, Content};
 use crate::linear::task::{LinearEvent, LinearLevel, RunQuery};
 use crate::outbox::{self, Op};
 use crate::paths::Ctx;
-use crate::run::{AgentRecord, AgentStatus, Run, RunRecord, Status};
+use crate::run::{AgentRecord, AgentStatus, Run, RunLock, RunRecord, Status};
 use crate::worker::{self, Live, Worker};
 use crate::{coordinator, inbox, progress};
 
@@ -206,6 +206,9 @@ pub struct Reconciler {
     /// Runs whose outbox is blocked, by issue id, and since when.
     pub(super) failing: BTreeMap<String, Timestamp>,
     pub(super) failure_notified: bool,
+    /// Per run, when a heartbeat was queued and no activity was reported
+    /// sent since; the flush and its `ActivitySent` may be a pass apart.
+    pub(super) heartbeats: BTreeMap<String, Timestamp>,
     pub(super) queued: bool,
     pub(super) queries: Vec<RunQuery>,
 }
@@ -335,6 +338,7 @@ impl Reconciler {
             intake_read: None,
             failing: BTreeMap::new(),
             failure_notified: false,
+            heartbeats: BTreeMap::new(),
             queued: false,
             queries: Vec::new(),
         })
@@ -371,6 +375,44 @@ impl Reconciler {
         blocking(move || outbox::push(&run, op).map(|_| ())).await?;
         self.queued = true;
         Ok(())
+    }
+
+    /// One critical section under the run lock: `work` writes the fields
+    /// that guard its Linear writes and returns those writes, which are
+    /// queued before the lock is released. A failure after a write is
+    /// queued can then never make the write go out twice.
+    pub(super) async fn guarded<T: Send + 'static>(
+        &mut self,
+        run: &Run,
+        work: impl FnOnce(&Run, &RunLock) -> Result<(T, Vec<Op>)> + Send + 'static,
+    ) -> Result<T> {
+        let run = run.clone();
+        let (value, queued) = blocking(move || {
+            let lock = run.lock()?;
+            let (value, ops) = work(&run, &lock)?;
+            let queued = !ops.is_empty();
+            for op in ops {
+                outbox::push_held(&run, &lock, op)?;
+            }
+            Ok((value, queued))
+        })
+        .await?;
+        self.queued |= queued;
+        Ok(value)
+    }
+
+    /// `update_run` whose change also returns the requests it guards.
+    pub(super) async fn update_and_push(
+        &mut self,
+        run: &Run,
+        change: impl FnOnce(&mut RunRecord) -> Vec<Op> + Send + 'static,
+    ) -> Result<RunRecord> {
+        self.guarded(run, move |run, lock| {
+            let mut ops = Vec::new();
+            let record = run.update_held(lock, |r| ops = change(r))?;
+            Ok((record, ops))
+        })
+        .await
     }
 
     pub async fn pass<H: Herdr + Clone + 'static>(
@@ -452,6 +494,13 @@ impl Reconciler {
     }
 
     async fn write_failure_notice<H: Herdr>(&mut self, d: &Deps<'_, H>, now: Timestamp) {
+        let active: BTreeSet<String> = Run::list(&d.ctx.runs_dir())
+            .iter()
+            .filter_map(|run| run.record().ok())
+            .filter(|r| r.status == Status::Active)
+            .map(|r| r.issue_id)
+            .collect();
+        self.failing.retain(|issue_id, _| active.contains(issue_id));
         let Some(since) = self.failing.values().min().copied() else {
             self.failure_notified = false;
             return;
