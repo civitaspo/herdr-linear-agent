@@ -604,6 +604,7 @@ mod tests {
             protocol: 22,
             panes: panes.iter().map(|p| listed_pane(p)).collect(),
             agents,
+            workspaces: BTreeMap::new(),
             skipped: 0,
         }
     }

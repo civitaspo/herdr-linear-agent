@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{Instant, timeout_at};
 
-use super::{Agent, Event, HerdrError, Pane, PaneId, parse_event};
+use super::{Agent, Event, HerdrError, Pane, PaneId, WorkspaceId, parse_event};
 
 pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -31,6 +31,9 @@ pub struct Snapshot {
     pub protocol: u32,
     pub panes: BTreeMap<PaneId, Pane>,
     pub agents: Vec<Agent>,
+    /// Each workspace's label, which the ticker gives a coordinator's
+    /// workspace so it can find one whose creation it did not hear back from.
+    pub workspaces: BTreeMap<WorkspaceId, String>,
     pub skipped: usize,
 }
 
@@ -172,6 +175,14 @@ impl Client {
             protocol: u32,
             panes: Vec<Value>,
             agents: Vec<Value>,
+            #[serde(default)]
+            workspaces: Vec<Value>,
+        }
+        #[derive(Deserialize)]
+        struct Workspace {
+            workspace_id: WorkspaceId,
+            #[serde(default)]
+            label: String,
         }
         let Answer { snapshot } = self.call("session.snapshot", json!({})).await?;
         let mut skipped = 0;
@@ -180,11 +191,16 @@ impl Client {
             .map(|pane| (pane.id.clone(), pane))
             .collect();
         let agents = lenient(snapshot.agents, &mut skipped);
+        let workspaces = lenient::<Workspace>(snapshot.workspaces, &mut skipped)
+            .into_iter()
+            .map(|w| (w.workspace_id, w.label))
+            .collect();
         Ok(Snapshot {
             version: snapshot.version,
             protocol: snapshot.protocol,
             panes,
             agents,
+            workspaces,
             skipped,
         })
     }

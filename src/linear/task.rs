@@ -133,6 +133,13 @@ impl LinearTask {
         }
     }
 
+    /// Makes both intervals due, so the next `step` polls and reads.
+    #[cfg(test)]
+    pub fn force_due(&mut self) {
+        self.last_intake = None;
+        self.last_read = None;
+    }
+
     pub fn level(&self) -> &LinearLevel {
         &self.level
     }

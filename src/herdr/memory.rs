@@ -54,6 +54,10 @@ struct Model {
     start_error: Option<String>,
     /// Snapshots a started agent stays hidden for.
     detection_lag: u32,
+    /// Snapshots a new pane stays hidden for.
+    pane_lag: u32,
+    /// Panes that are not in snapshots yet, with the snapshots left.
+    hidden_panes: BTreeMap<PaneId, u32>,
     /// The next placement does its work, then answers `OutcomeUnknown`.
     placement_unknown: bool,
     /// Every request fails as `NotSent`.
@@ -96,6 +100,9 @@ impl Model {
         };
         self.labels.insert(workspace, label.into());
         self.panes.insert(pane.id.clone(), pane.clone());
+        if self.pane_lag > 0 {
+            self.hidden_panes.insert(pane.id.clone(), self.pane_lag);
+        }
         pane
     }
 
@@ -209,6 +216,12 @@ impl FakeHerdr {
         self.model().detection_lag = snapshots;
     }
 
+    /// New panes stay out of the next `snapshots` snapshots, as when Herdr
+    /// answers a placement before its pane list shows the pane.
+    pub fn delay_panes(&self, snapshots: u32) {
+        self.model().pane_lag = snapshots;
+    }
+
     pub fn next_placement_unknown(&self) {
         self.model().placement_unknown = true;
     }
@@ -259,11 +272,31 @@ impl Herdr for FakeHerdr {
                 agents.push(fake.agent.clone());
             }
         }
+        let hidden: Vec<PaneId> = model.hidden_panes.keys().cloned().collect();
+        model.hidden_panes.retain(|_, left| {
+            *left -= 1;
+            *left > 0
+        });
+        let panes: BTreeMap<PaneId, Pane> = model
+            .panes
+            .iter()
+            .filter(|(id, _)| !hidden.contains(id))
+            .map(|(id, pane)| (id.clone(), pane.clone()))
+            .collect();
+        agents.retain(|a| !hidden.contains(&a.pane));
+        let workspaces = panes
+            .values()
+            .map(|p| {
+                let label = model.labels.get(&p.workspace).cloned().unwrap_or_default();
+                (p.workspace.clone(), label)
+            })
+            .collect();
         Ok(Snapshot {
             version: "0.9.1".into(),
             protocol: 22,
-            panes: model.panes.clone(),
+            panes,
             agents,
+            workspaces,
             skipped: 0,
         })
     }

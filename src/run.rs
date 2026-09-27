@@ -105,6 +105,12 @@ pub struct AgentRecord {
     pub resume: bool,
     pub last_state: String,
     pub last_state_change: String,
+    /// Herdr's `state_change_seq` when `last_state` was seen, so the same
+    /// status in a new episode is still a change.
+    pub last_state_seq: u64,
+    /// When the last unsuccessful placement or start was made; the next one
+    /// waits for the spacing.
+    pub last_attempt_at: String,
     pub last_group: String,
     /// A "needs someone in the pane" elicitation was sent for the current episode.
     pub blocked_reported: bool,

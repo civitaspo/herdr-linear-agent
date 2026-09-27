@@ -635,6 +635,9 @@ pub mod fake {
         pub lose_next_response: bool,
         /// Sessions fail as for an app without the agent session webhook category.
         pub sessions_disabled: bool,
+        /// The present the fake stamps activities after; the wall clock when
+        /// unset, a test clock otherwise.
+        pub present: Option<jiff::Timestamp>,
         clock: i64,
     }
 
@@ -647,7 +650,8 @@ pub mod fake {
         /// activities sort after a cursor the plugin took from the clock.
         fn tick_clock(&mut self) -> String {
             self.clock += 1;
-            (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(self.clock)).to_string()
+            let present = self.present.unwrap_or_else(jiff::Timestamp::now);
+            (present + jiff::SignedDuration::from_secs(self.clock)).to_string()
         }
 
         /// Adds an issue delegated to the app user in `team`.

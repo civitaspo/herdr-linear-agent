@@ -408,6 +408,7 @@ async fn place(
         w.agent.cwd = placed.cwd.clone();
         w.agent.prompt_pending = true;
         w.agent.launch_attempts = 0;
+        w.agent.last_attempt_at.clear();
     })
 }
 
@@ -512,6 +513,7 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.last_group.clear();
         w.agent.last_state.clear();
         w.agent.last_state_change.clear();
+        w.agent.last_state_seq = 0;
         w.agent.blocked_reported = false;
         w.agent.resume = false;
     })?;

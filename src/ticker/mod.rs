@@ -3,7 +3,10 @@
 //! run. `ticker start` (the startup hook, and every agent-facing command)
 //! keeps one of this version running; `ticker run` is the process itself.
 
+mod intake;
+mod launch;
 pub mod reconcile;
+mod watching;
 
 use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, Write};
@@ -308,6 +311,7 @@ async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>)
         queries: queries_tx,
         linear_wake,
         shutdown: shutdown_rx,
+        clock: Timestamp::now,
     });
     tokio::pin!(linear, reconciler);
     let reason = tokio::select! {

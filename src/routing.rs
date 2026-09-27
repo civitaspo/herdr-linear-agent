@@ -5,15 +5,16 @@
 //! The routing agent may only return a size from a fixed enum, so whatever the
 //! issue text says, the profile it leads to stays within the config's rules.
 
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::config::{Config, Profile, Size};
 use crate::linear::api::{IssueDetail, Label};
-use crate::run::RoutingJob;
+use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, Command};
 
 /// The fixed instruction the routing agent runs with. The issue arrives on
 /// standard input, never as an argument.
@@ -164,13 +165,15 @@ pub fn command(profile: &Profile, schema_path: &Path, output_path: &Path) -> (St
 }
 
 /// Starts the routing agent as a child process with the issue's title and
-/// description on standard input. Its answer lands in `<state>/routing.out`.
-pub fn spawn(
+/// description on standard input, and returns where its answer lands. The
+/// child is killed when it is dropped, so a caller that gives up on it (a
+/// timeout, a ticker exit) never leaves it running.
+pub async fn spawn(
     profile: &Profile,
     state_dir: &Path,
     issue: &IssueDetail,
     path_var: Option<&str>,
-) -> Result<(RoutingJob, Child)> {
+) -> Result<(PathBuf, Child)> {
     let output = state_dir.join("routing.out");
     let schema_path = state_dir.join("routing.schema.json");
     std::fs::write(&schema_path, schema().to_string())?;
@@ -185,7 +188,8 @@ pub fn spawn(
         .current_dir(state_dir)
         .stdin(Stdio::piped())
         .stdout(stdout)
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     if let Some(path) = path_var {
         cmd.env("PATH", path);
     }
@@ -193,16 +197,11 @@ pub fn spawn(
         .spawn()
         .with_context(|| format!("could not start the routing agent `{program}`"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
         // A child that exits early closes the pipe; the answer then reads as unknown.
-        let _ = write!(stdin, "Title: {}\n\n{}\n", issue.title, issue.description);
+        let text = format!("Title: {}\n\n{}\n", issue.title, issue.description);
+        let _ = stdin.write_all(text.as_bytes()).await;
     }
-    let job = RoutingJob {
-        pid: child.id(),
-        started: crate::files::now(),
-        output: output.to_string_lossy().into_owned(),
-    };
-    Ok((job, child))
+    Ok((output, child))
 }
 
 /// The size in the routing agent's output, checked against the same schema.
@@ -228,7 +227,8 @@ pub fn parse_output(text: &str) -> Size {
         .unwrap_or(Size::Unknown)
 }
 
-/// Whether a process that is not our child (after a ticker restart) still runs.
+/// Whether a process that is not our child (a routing agent an older build
+/// started) still runs.
 pub fn process_alive(pid: u32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
     pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
@@ -385,8 +385,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_agent_gets_the_issue_on_standard_input() {
+    #[tokio::test]
+    async fn the_agent_gets_the_issue_on_standard_input() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -409,10 +409,12 @@ mod tests {
         }))
         .unwrap();
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        let (job, mut child) = spawn(&profile, dir.path(), &issue, Some(&path)).unwrap();
-        child.wait().unwrap();
+        let (output, mut child) = spawn(&profile, dir.path(), &issue, Some(&path))
+            .await
+            .unwrap();
+        child.wait().await.unwrap();
         assert_eq!(
-            parse_output(&std::fs::read_to_string(&job.output).unwrap()),
+            parse_output(&std::fs::read_to_string(&output).unwrap()),
             Size::XS
         );
         assert!(!process_alive(0));
