@@ -325,7 +325,7 @@ pub async fn run(ctx: &Ctx<'_>) -> Result<()> {
 /// reconciler runs Linear-only passes; the link counts as down since the
 /// start, so the 5-minute unreachable exit still applies.
 async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>) -> Result<String> {
-    let herdr = herdr::Late::default();
+    let herdr = herdr::Client::default();
     let (link_tx, link) = watch::channel(Link {
         connected: false,
         since: Timestamp::now(),
@@ -388,23 +388,13 @@ async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>)
     Ok(reason)
 }
 
-fn unreachable_reason() -> &'static str {
-    "the configured Herdr session was unreachable for 5 minutes"
-}
-
-fn stop_reason(state_dir: &Path) -> Option<String> {
-    stop_path(state_dir)
-        .exists()
-        .then(|| "asked to stop".to_string())
-}
-
 /// Finds the configured session's socket (`herdr session list` fails while
 /// Herdr is down, so it is retried), then hands the client to the
 /// reconciler and follows the session's events.
 async fn connect(
     herdr_bin: String,
     session: Option<String>,
-    herdr: herdr::Late<herdr::Client>,
+    herdr: herdr::Client,
     link: watch::Sender<Link>,
     socket_path: watch::Sender<String>,
     log: Arc<Log>,
@@ -421,10 +411,9 @@ async fn connect(
         }
         tokio::time::sleep(SOCKET_RETRY).await;
     };
-    let client = herdr::Client::new(&socket);
-    herdr.set(client.clone());
+    herdr.set_socket(socket.clone());
     let _ = socket_path.send(socket.to_string_lossy().into_owned());
-    let mut events = herdr::wake(client);
+    let mut events = herdr::wake(herdr);
     loop {
         let current = events.borrow_and_update().clone();
         if link.send(current).is_err() || events.changed().await.is_err() {
@@ -438,11 +427,11 @@ async fn supervise(state_dir: &Path, link: watch::Receiver<Link>) -> String {
     let mut every = tokio::time::interval(SUPERVISE_EVERY);
     loop {
         every.tick().await;
-        if let Some(reason) = stop_reason(state_dir) {
-            return reason;
+        if stop_path(state_dir).exists() {
+            return "asked to stop".into();
         }
         if unreachable(&link.borrow(), Timestamp::now()) {
-            return unreachable_reason().into();
+            return "the configured Herdr session was unreachable for 5 minutes".into();
         }
     }
 }

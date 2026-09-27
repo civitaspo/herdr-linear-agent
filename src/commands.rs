@@ -152,18 +152,11 @@ pub fn parse_option(text: &str) -> Result<(String, String)> {
 pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, String)]) -> Result<()> {
     non_empty(text, "question")?;
     let (_, run, _) = load_active(ctx, key).await?;
-    let mut activity = Activity::new(Content::Elicitation {
-        body: text.trim().to_string(),
-    });
-    if !options.is_empty() {
-        activity.signal = Some("select".into());
-        let options: Vec<_> = options
-            .iter()
-            .map(|(label, value)| serde_json::json!({ "label": label, "value": value }))
-            .collect();
-        activity.signal_metadata = Some(serde_json::json!({ "options": options }));
-    }
-    outbox::push(&run, Op::Activity { activity })?;
+    let options: Vec<_> = options
+        .iter()
+        .map(|(label, value)| (label.as_str(), value.as_str()))
+        .collect();
+    outbox::push(&run, Op::elicitation(text.trim(), &options))?;
     ticker::poke(&ctx.state_dir());
     println!(
         "the question is queued for the Linear session; end your turn, the answer arrives in your inbox"
@@ -459,15 +452,7 @@ async fn place(
     worker::update(run, &worker.id, |w| {
         w.worktree_path = worker.worktree_path.clone();
         w.brief_dir = worker.brief_dir.clone();
-        w.agent.status = AgentStatus::Open;
-        w.agent.error.clear();
-        w.agent.workspace_id = placed.workspace.0.clone();
-        w.agent.tab_id = placed.tab.clone();
-        w.agent.pane_id = placed.pane.0.clone();
-        w.agent.cwd = placed.cwd.clone();
-        w.agent.prompt_pending = true;
-        w.agent.launch_attempts = 0;
-        w.agent.last_attempt_at.clear();
+        w.agent.placed(placed);
     })
 }
 

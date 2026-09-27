@@ -433,7 +433,7 @@ pub fn needs_person(record: &AgentRecord, live: &Live) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
     WaitingOnYou,
     Working,
@@ -617,7 +617,6 @@ mod tests {
             protocol: 22,
             panes: panes.iter().map(|p| listed_pane(p)).collect(),
             agents,
-            workspaces: BTreeMap::new(),
             skipped: 0,
         }
     }

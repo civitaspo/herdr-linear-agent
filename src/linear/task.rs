@@ -2,7 +2,7 @@
 //! only reads Linear and sends the outboxes; the reconciler owns every
 //! decision and every run record.
 //!
-//! Level state (the app user, the delegated list, the budget) is published on
+//! Level state (the app user and the delegated list) is published on
 //! a `watch`; everything that happened (a run was read, a session was found,
 //! an activity was sent, writes started or stopped failing) is a
 //! [`LinearEvent`], reported once.
@@ -20,11 +20,6 @@ use crate::config;
 use crate::outbox;
 use crate::run::Run;
 
-/// The request and complexity budget. PR 3 fills it from the rate-limit
-/// headers.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Budget {}
-
 /// The last successful poll of the delegated issues.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delegated {
@@ -36,7 +31,6 @@ pub struct Delegated {
 pub struct LinearLevel {
     pub app_user: Option<String>,
     pub delegated: Option<Delegated>,
-    pub budget: Budget,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,31 +77,6 @@ impl RunQuery {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
-    }
-}
-
-/// Where a step's events go: collected, or sent at once, so the reconciler
-/// sees a run's flush as soon as it finishes.
-pub enum Out<'a> {
-    #[cfg(test)]
-    Collect(Vec<LinearEvent>),
-    Send {
-        to: &'a mpsc::Sender<LinearEvent>,
-        closed: bool,
-    },
-}
-
-impl Out<'_> {
-    async fn push(&mut self, event: LinearEvent) {
-        match self {
-            #[cfg(test)]
-            Out::Collect(events) => events.push(event),
-            Out::Send { to, closed } => {
-                if !*closed && to.send(event).await.is_err() {
-                    *closed = true;
-                }
-            }
-        }
     }
 }
 
@@ -158,7 +127,7 @@ impl LinearTask {
         }
     }
 
-    /// Makes both intervals due, so the next `step` polls and reads.
+    /// Makes both intervals due, so the next `step_into` polls and reads.
     #[cfg(test)]
     pub fn force_due(&mut self) {
         self.last_intake = None;
@@ -183,30 +152,15 @@ impl LinearTask {
     }
 
     /// One round: the viewer while unknown, the delegated poll and the run
-    /// read when their intervals are due, then the flush. It neither sleeps
-    /// nor reads the clock.
-    #[cfg(test)]
-    pub async fn step(
-        &mut self,
-        client: &impl LinearApi,
-        queries: &[RunQuery],
-        now: Timestamp,
-    ) -> Vec<LinearEvent> {
-        let mut out = Out::Collect(Vec::new());
-        self.step_into(client, queries, now, &mut out).await;
-        match out {
-            Out::Collect(events) => events,
-            Out::Send { .. } => Vec::new(),
-        }
-    }
-
-    /// `step`, handing each event to `out` as soon as it happened.
+    /// read when their intervals are due, then the flush. Each event goes to
+    /// `events` as soon as it happened, so the reconciler sees a run's flush
+    /// as soon as it finishes. It neither sleeps nor reads the clock.
     pub async fn step_into(
         &mut self,
         client: &impl LinearApi,
         queries: &[RunQuery],
         now: Timestamp,
-        events: &mut Out<'_>,
+        events: &mpsc::Sender<LinearEvent>,
     ) {
         self.sessions.retain(|issue_id, _| {
             queries
@@ -219,7 +173,7 @@ impl LinearTask {
             .partition(|(issue_id, _)| queries.iter().any(|q| &q.issue_id == issue_id));
         self.failing = kept;
         for issue_id in gone.into_keys() {
-            events.push(LinearEvent::WritesRecovered { issue_id }).await;
+            let _ = events.send(LinearEvent::WritesRecovered { issue_id }).await;
         }
 
         // The viewer is retried on the run-read interval; run reads wait for it.
@@ -262,7 +216,7 @@ impl LinearTask {
         client: &impl LinearApi,
         queries: &[RunQuery],
         now: Timestamp,
-        events: &mut Out<'_>,
+        events: &mpsc::Sender<LinearEvent>,
     ) {
         let (with_session, without): (Vec<_>, Vec<_>) = queries
             .iter()
@@ -294,8 +248,8 @@ impl LinearTask {
             } else {
                 None
             };
-            events
-                .push(LinearEvent::RunRead {
+            let _ = events
+                .send(LinearEvent::RunRead {
                     issue_id: query.issue_id.clone(),
                     read_started_at: now,
                     update,
@@ -321,8 +275,8 @@ impl LinearTask {
                 },
                 prompts: Vec::new(),
             };
-            events
-                .push(LinearEvent::RunRead {
+            let _ = events
+                .send(LinearEvent::RunRead {
                     issue_id: query.issue_id.clone(),
                     read_started_at: now,
                     update,
@@ -353,7 +307,7 @@ impl LinearTask {
         client: &impl LinearApi,
         queries: &[RunQuery],
         now: Timestamp,
-        events: &mut Out<'_>,
+        events: &mpsc::Sender<LinearEvent>,
     ) {
         for query in queries {
             let key = query.key();
@@ -367,8 +321,8 @@ impl LinearTask {
                 let sent =
                     outbox::send(&run, &session, &query.issue_id, &self.review_state, client).await;
                 if sent.activity_sent {
-                    events
-                        .push(LinearEvent::ActivitySent {
+                    let _ = events
+                        .send(LinearEvent::ActivitySent {
                             issue_id: query.issue_id.clone(),
                             at: now,
                         })
@@ -394,8 +348,8 @@ impl LinearTask {
             match (blocked, self.failing.contains_key(&query.issue_id)) {
                 (true, false) => {
                     self.failing.insert(query.issue_id.clone(), now);
-                    events
-                        .push(LinearEvent::WritesFailing {
+                    let _ = events
+                        .send(LinearEvent::WritesFailing {
                             issue_id: query.issue_id.clone(),
                             since: now,
                         })
@@ -403,8 +357,8 @@ impl LinearTask {
                 }
                 (false, true) => {
                     self.failing.remove(&query.issue_id);
-                    events
-                        .push(LinearEvent::WritesRecovered {
+                    let _ = events
+                        .send(LinearEvent::WritesRecovered {
                             issue_id: query.issue_id.clone(),
                         })
                         .await;
@@ -418,7 +372,7 @@ impl LinearTask {
         &mut self,
         client: &impl LinearApi,
         query: &RunQuery,
-        events: &mut Out<'_>,
+        events: &mpsc::Sender<LinearEvent>,
     ) -> Option<String> {
         if let Some(session) = self.session_of(query) {
             return Some(session);
@@ -432,8 +386,8 @@ impl LinearTask {
             Ok(session) => {
                 self.sessions
                     .insert(query.issue_id.clone(), session.clone());
-                events
-                    .push(LinearEvent::SessionFound {
+                let _ = events
+                    .send(LinearEvent::SessionFound {
                         issue_id: query.issue_id.clone(),
                         session_id: session.clone(),
                     })
@@ -450,7 +404,7 @@ impl LinearTask {
         }
     }
 
-    /// Runs `step` whenever an interval is due or the reconciler calls
+    /// Runs `step_into` whenever an interval is due or the reconciler calls
     /// `notify_one`, until the event channel closes.
     pub async fn run(
         mut self,
@@ -463,15 +417,12 @@ impl LinearTask {
             let queries = links.queries.borrow().clone();
             // Events go out as they happen and before the level, so a pass
             // woken by the level has already seen what led to it.
-            let mut out = Out::Send {
-                to: &links.events,
-                closed: false,
-            };
-            self.step_into(client, &queries, clock(), &mut out).await;
+            self.step_into(client, &queries, clock(), &links.events)
+                .await;
             for line in self.take_log() {
                 log(&line);
             }
-            if matches!(out, Out::Send { closed: true, .. }) || links.events.is_closed() {
+            if links.events.is_closed() {
                 return;
             }
             // The latest level is always stored, but it wakes the
@@ -479,9 +430,8 @@ impl LinearTask {
             // changed: a new read time alone is no news.
             links.level.send_if_modified(|level| {
                 let issues = |l: &LinearLevel| l.delegated.as_ref().map(|d| d.issues.clone());
-                let news = level.app_user != self.level.app_user
-                    || issues(level) != issues(&self.level)
-                    || level.budget != self.level.budget;
+                let news =
+                    level.app_user != self.level.app_user || issues(level) != issues(&self.level);
                 *level = self.level.clone();
                 news
             });
@@ -510,6 +460,18 @@ mod tests {
 
     fn at(seconds: i64) -> Timestamp {
         T0.parse::<Timestamp>().unwrap() + SignedDuration::from_secs(seconds)
+    }
+
+    /// One `step_into`, and the events it sent.
+    async fn step(
+        task: &mut LinearTask,
+        linear: &impl LinearApi,
+        queries: &[RunQuery],
+        now: Timestamp,
+    ) -> Vec<LinearEvent> {
+        let (events, mut sent) = mpsc::channel(64);
+        task.step_into(linear, queries, now, &events).await;
+        std::iter::from_fn(|| sent.try_recv().ok()).collect()
     }
 
     fn task() -> LinearTask {
@@ -598,7 +560,7 @@ mod tests {
         let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
         let mut task = task();
 
-        let events = task.step(&s.linear, &queries, at(0)).await;
+        let events = step(&mut task, &s.linear, &queries, at(0)).await;
         assert_eq!(events.len(), 1);
         assert_eq!(task.level().app_user.as_deref(), Some("app-user-1"));
         let delegated = task.level().delegated.clone().unwrap();
@@ -608,10 +570,10 @@ mod tests {
         assert_eq!(task.next_due(at(0)), at(5));
 
         let calls = s.fake().calls.len();
-        assert_eq!(task.step(&s.linear, &queries, at(3)).await, []);
+        assert_eq!(step(&mut task, &s.linear, &queries, at(3)).await, []);
         assert_eq!(s.fake().calls.len(), calls, "nothing is read before 5 s");
 
-        let events = task.step(&s.linear, &queries, at(5)).await;
+        let events = step(&mut task, &s.linear, &queries, at(5)).await;
         assert!(matches!(
             &events[..],
             [LinearEvent::RunRead { read_started_at, detail: None, .. }] if *read_started_at == at(5)
@@ -635,7 +597,7 @@ mod tests {
             s.query(0, Some("session-1"), None),
             s.query(1, Some("session-2"), Some(UPDATED)),
         ];
-        let events = task.step(&s.linear, &queries, at(0)).await;
+        let events = step(&mut task, &s.linear, &queries, at(0)).await;
         assert_eq!(events.len(), 2);
         assert_eq!(detail_of(&events[0]), Some(UPDATED));
         assert_eq!(detail_of(&events[1]), None);
@@ -646,7 +608,7 @@ mod tests {
             s.query(0, Some("session-1"), Some(UPDATED)),
             s.query(1, Some("session-2"), Some(UPDATED)),
         ];
-        let events = task.step(&s.linear, &queries, at(5)).await;
+        let events = step(&mut task, &s.linear, &queries, at(5)).await;
         assert_eq!(detail_of(&events[0]), None);
         assert_eq!(detail_of(&events[1]), Some("2026-09-27T00:00:00.000Z"));
         assert_eq!(s.fake().count("HlaIssue"), 2);
@@ -657,11 +619,11 @@ mod tests {
         let s = setup(&["DATA-1"], true);
         let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
         let mut task = task();
-        task.step(&s.linear, &queries, at(0)).await;
+        step(&mut task, &s.linear, &queries, at(0)).await;
 
         let refused = outbox::push(&s.runs[0], thought("refused")).unwrap();
         s.fake().fail_next = Some(ApiError::Graphql("Entity not found".into()));
-        assert_eq!(task.step(&s.linear, &queries, at(1)).await, []);
+        assert_eq!(step(&mut task, &s.linear, &queries, at(1)).await, []);
         assert!(outbox::pending(&s.runs[0]).is_empty());
         assert_eq!(s.failed(0), 1);
         assert_eq!(
@@ -673,7 +635,7 @@ mod tests {
 
         outbox::push(&s.runs[0], thought("limited")).unwrap();
         s.fake().fail_next = Some(ApiError::RateLimited);
-        let events = task.step(&s.linear, &queries, at(2)).await;
+        let events = step(&mut task, &s.linear, &queries, at(2)).await;
         assert_eq!(
             events,
             [LinearEvent::WritesFailing {
@@ -697,14 +659,14 @@ mod tests {
         let s = setup(&["DATA-1"], true);
         let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
         let mut task = task();
-        task.step(&s.linear, &queries, at(0)).await;
+        step(&mut task, &s.linear, &queries, at(0)).await;
 
         outbox::push(&s.runs[0], thought("once")).unwrap();
         s.fake().lose_next_response = true;
-        task.step(&s.linear, &queries, at(1)).await;
+        step(&mut task, &s.linear, &queries, at(1)).await;
         assert!(outbox::pending(&s.runs[0])[0].1.attempted);
 
-        let events = task.step(&s.linear, &queries, at(2)).await;
+        let events = step(&mut task, &s.linear, &queries, at(2)).await;
         assert!(outbox::pending(&s.runs[0]).is_empty());
         assert_eq!(s.fake().sessions[0].sent("thought").len(), 1);
         assert_eq!(s.fake().count("HlaActivityCreate"), 1);
@@ -730,7 +692,7 @@ mod tests {
         let queries = [s.query(0, None, None)];
         let mut task = task();
 
-        let events = task.step(&s.linear, &queries, at(0)).await;
+        let events = step(&mut task, &s.linear, &queries, at(0)).await;
         assert_eq!(events.len(), 3);
         match &events[0] {
             LinearEvent::RunRead {
@@ -768,7 +730,7 @@ mod tests {
 
         // The reconciler has not persisted the session yet: no second one.
         outbox::push(&s.runs[0], thought("second")).unwrap();
-        let events = task.step(&s.linear, &queries, at(1)).await;
+        let events = step(&mut task, &s.linear, &queries, at(1)).await;
         assert_eq!(
             events,
             [LinearEvent::ActivitySent {
@@ -778,7 +740,7 @@ mod tests {
         );
         let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
         outbox::push(&s.runs[0], thought("third")).unwrap();
-        task.step(&s.linear, &queries, at(2)).await;
+        step(&mut task, &s.linear, &queries, at(2)).await;
         assert_eq!(s.fake().sessions.len(), 1);
         assert_eq!(s.fake().count("HlaSessions"), 1);
         assert_eq!(s.fake().count("HlaSessionCreate"), 0);
@@ -790,11 +752,11 @@ mod tests {
         let s = setup(&["DATA-1"], true);
         let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
         let mut task = task();
-        task.step(&s.linear, &queries, at(0)).await;
+        step(&mut task, &s.linear, &queries, at(0)).await;
         outbox::push(&s.runs[0], thought("late")).unwrap();
 
         s.fake().fail_next = Some(ApiError::HttpStatus(503));
-        let events = task.step(&s.linear, &queries, at(1)).await;
+        let events = step(&mut task, &s.linear, &queries, at(1)).await;
         assert_eq!(
             events,
             [LinearEvent::WritesFailing {
@@ -803,9 +765,9 @@ mod tests {
             }]
         );
         s.fake().fail_next = Some(ApiError::RequestFailed);
-        assert_eq!(task.step(&s.linear, &queries, at(2)).await, []);
+        assert_eq!(step(&mut task, &s.linear, &queries, at(2)).await, []);
 
-        let events = task.step(&s.linear, &queries, at(3)).await;
+        let events = step(&mut task, &s.linear, &queries, at(3)).await;
         assert_eq!(
             events,
             [
@@ -818,7 +780,7 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(task.step(&s.linear, &queries, at(4)).await, []);
+        assert_eq!(step(&mut task, &s.linear, &queries, at(4)).await, []);
         assert_eq!(s.fake().sessions[0].sent("thought").len(), 1);
     }
 
@@ -827,18 +789,18 @@ mod tests {
         let s = setup(&["DATA-1"], true);
         let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
         let mut task = task();
-        task.step(&s.linear, &queries, at(0)).await;
+        step(&mut task, &s.linear, &queries, at(0)).await;
         outbox::push(&s.runs[0], thought("late")).unwrap();
         s.fake().fail_next = Some(ApiError::HttpStatus(503));
-        task.step(&s.linear, &queries, at(1)).await;
-        let events = task.step(&s.linear, &[], at(2)).await;
+        step(&mut task, &s.linear, &queries, at(1)).await;
+        let events = step(&mut task, &s.linear, &[], at(2)).await;
         assert_eq!(
             events,
             [LinearEvent::WritesRecovered {
                 issue_id: s.issues[0].clone()
             }]
         );
-        assert_eq!(task.step(&s.linear, &[], at(3)).await, []);
+        assert_eq!(step(&mut task, &s.linear, &[], at(3)).await, []);
     }
 
     #[tokio::test]

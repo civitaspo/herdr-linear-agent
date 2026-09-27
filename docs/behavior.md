@@ -184,7 +184,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `issue_updated_at` | the issue's `updatedAt` when `issue.md` was last written |
 | `issue_hash` | hash of the parts a person edits |
 | `size`, `size_source` | size and where it came from: `estimate`, `label`, `agent`, `agent (timed out)`, `default` |
-| `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory and only clears this field |
+| `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory, ignores this field when reading, and drops it on the next write |
 | `coordinator` | the coordinator's agent record |
 | `prompt_cursor` | prompts created after this timestamp are unread |
 | `last_activity` | when an activity was last sent |
@@ -532,7 +532,7 @@ Rules pinned:
 ### Route and decide
 
 - `route`: a known size decides now. Without `[routing.agent]`, decide `(unknown, "default")`. Otherwise start the routing agent in its own task and keep the job in memory; a spawn failure is logged and decides `(unknown, "agent")`. A run whose coordinator is undecided and whose routing is not running asks the Linear task for the detail and is routed when it arrives.
-- `decide(size, source)`: pick the profile, set `size`, `size_source`, `routing = null` and a pending coordinator record (`status pending`, `profile`, `kind`, `agent_name`), then queue the thought ``The coordinator uses the `<profile>` profile (<why>).`` with `<why>`:
+- `decide(size, source)`: pick the profile, set `size`, `size_source` and a pending coordinator record (`status pending`, `profile`, `kind`, `agent_name`), then queue the thought ``The coordinator uses the `<profile>` profile (<why>).`` with `<why>`:
 
 | Size and source | `<why>` |
 | --- | --- |
@@ -548,7 +548,7 @@ Rules pinned:
 - Schema: object with one required property `size`, a string enum of the 8 size names, no additional properties. It is written to `.state/routing.schema.json`.
 - The child runs in `.state/`, with the ticker's `PATH`, stderr discarded, stdin `Title: <title>\n\n<description>\n`. For `claude`, stdout goes to `.state/routing.out`; for `codex`, stdout is discarded and `-o` writes that file. A child that exits before reading closes the pipe; that is not an error and the answer reads as unknown. `src/routing.rs:the_agent_gets_the_issue_on_standard_input`
 - `parse_output`: take `structured_output` when it is an object, else parse the string `result` as JSON, else the whole value. The answer must be an object with exactly one key, `size`, whose value is a size name; anything else is `unknown`. `src/routing.rs:outputs_are_checked_against_the_schema`
-- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. Routing jobs are in memory, so a ticker restart routes again. A record written by an older build with `routing` set: clear `routing` and route again. **Spec change:** the recorded pid is never signalled, since pids are reused and the record may predate a reboot; an old child ends by itself. `tests/scenarios:a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again`
+- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. Routing jobs are in memory, so a ticker restart routes again. A record written by an older build with `routing` set is read as if the field were absent; an undecided coordinator is routed again. **Spec change:** the recorded pid is never signalled, since pids are reused and the record may predate a reboot; an old child ends by itself. `tests/scenarios:a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again`
 - The issue goes to the child's standard input under the same timeout as the wait, so a child that never reads cannot hold the job past it. `tests/scenarios:a_routing_agent_that_never_reads_its_input_times_out`
 - With `tokio::process`, wait on the child with a timeout in its own task and hand the result to the run's pass. `tests/scenarios:the_routing_agent_decides_an_unsized_issue` (fake `claude` answers XS: size XS, source `agent`, profile `coordinator-light`).
 
@@ -755,7 +755,7 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 
 Skipped entirely while the run has no session or is `stopped`.
 
-- Heartbeat: when `last_activity` is at least 20 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 20 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought `Still on it: <summary>.` `<summary>` is `no workers`, or the counts of `open` workers by group in first-seen order, as `<n> <label in lower case>` joined by `, ` (for example `1 working, 1 waiting on you`). Linear marks a session `stale` after 30 minutes without an activity.
+- Heartbeat: when `last_activity` is at least 20 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 20 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought `Still on it: <summary>.` `<summary>` is `no workers`, or the counts of `open` workers by group in the order waiting on you, working, idle, reported, as `<n> <label in lower case>` joined by `, ` (for example `1 waiting on you, 1 working`). Linear marks a session `stale` after 30 minutes without an activity.
 - Run timeout: when not `timeout_asked` and `timeout_since` is at least `run_timeout_hours * 3600` s old, queue the elicitation `This run has been going for <h> hours. Reply to let it continue; until then the coordinator gets no prompts.` with option `Continue`=`continue`, set `timeout_asked`, and show the notification `<KEY> ran <h> hours` with body `Reply in the Linear session to let it continue.`
 - A reply clears `timeout_asked` and restarts the window. `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue`
 

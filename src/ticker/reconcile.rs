@@ -22,9 +22,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use jiff::{SignedDuration, Timestamp};
-use serde_json::json;
 use tokio::sync::{Notify, mpsc, watch};
 
 use super::Log;
@@ -189,7 +188,6 @@ pub struct Reconciler {
     pub(super) effects: mpsc::Sender<EffectDone>,
     pub(super) routing_done: mpsc::Sender<RoutingDone>,
     pub(super) bin: String,
-    pub(super) started_up: bool,
     /// At most one effect per agent; at most one start per run.
     pub(super) in_flight: BTreeMap<AgentKey, Effect>,
     /// Runs whose routing agent runs.
@@ -265,19 +263,6 @@ pub(super) fn thought(body: impl Into<String>) -> Op {
     }
 }
 
-pub(super) fn elicitation(body: impl Into<String>, options: &[(&str, &str)]) -> Op {
-    let mut activity = Activity::new(Content::Elicitation { body: body.into() });
-    if !options.is_empty() {
-        activity.signal = Some("select".into());
-        let options: Vec<_> = options
-            .iter()
-            .map(|(label, value)| json!({ "label": label, "value": value }))
-            .collect();
-        activity.signal_metadata = Some(json!({ "options": options }));
-    }
-    Op::Activity { activity }
-}
-
 pub(super) fn error_activity(body: impl Into<String>) -> Op {
     Op::Activity {
         activity: Activity::new(Content::Error { body: body.into() }),
@@ -349,7 +334,6 @@ impl Reconciler {
             effects,
             routing_done,
             bin: coordinator::binary_command()?,
-            started_up: false,
             in_flight: BTreeMap::new(),
             routing: BTreeSet::new(),
             launched: BTreeMap::new(),
@@ -465,10 +449,6 @@ impl Reconciler {
         wake: Wake,
         now: Timestamp,
     ) {
-        if !self.started_up {
-            self.started_up = true;
-            self.clear_old_routing(d).await;
-        }
         let snapshot = d.herdr.snapshot().await.ok();
         let snap = snapshot.as_ref();
         if let Some(snapshot) = snap {
@@ -570,20 +550,6 @@ impl Reconciler {
             self.seen_panes
                 .retain(|pane| live(pane) || recorded.contains(pane));
             self.missing_since.retain(|pane, _| recorded.contains(pane));
-        }
-    }
-
-    /// A routing job an older build recorded is not this ticker's child,
-    /// and its pid may belong to another process by now: it is only
-    /// forgotten, and the run is routed again.
-    async fn clear_old_routing<H>(&mut self, d: &Deps<'_, H>) {
-        for run in Run::list(&d.ctx.runs_dir()) {
-            if !run.record().is_ok_and(|r| r.routing.is_some()) {
-                continue;
-            }
-            if let Err(error) = update_run(&run, |r| r.routing = None).await {
-                d.fail(&run.key, &error);
-            }
         }
     }
 
@@ -765,29 +731,9 @@ fn agent_deadlines(agent: &AgentRecord, times: &mut Vec<Timestamp>) {
     }
 }
 
-fn fatal(log: &Log, what: &str) -> Result<()> {
-    log.line(&format!("ticker failed: {what}"));
-    Err(anyhow!("{what}"))
-}
-
 /// Runs passes until shutdown. Each wake drains every ready message, then
 /// runs one pass; between wakes it sleeps until the next deadline.
-pub async fn run<H: Herdr + Clone + 'static>(inputs: Inputs<'_, H>) -> Result<()> {
-    let Inputs {
-        ctx,
-        config,
-        herdr,
-        socket,
-        log,
-        mut link,
-        mut level,
-        mut events,
-        queries,
-        linear_wake,
-        mut shutdown,
-        poke,
-        clock,
-    } = inputs;
+pub async fn run<H: Herdr + Clone + 'static>(mut inputs: Inputs<'_, H>) -> Result<()> {
     let (effects_tx, mut effects) = mpsc::channel(EFFECT_QUEUE);
     let (routing_tx, mut routing) = mpsc::channel(EFFECT_QUEUE);
     let mut reconciler = Reconciler::new(effects_tx, routing_tx)
@@ -797,62 +743,54 @@ pub async fn run<H: Herdr + Clone + 'static>(inputs: Inputs<'_, H>) -> Result<()
         let mut wake = Wake::default();
         tokio::select! {
             biased;
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+            changed = inputs.shutdown.changed() => {
+                if changed.is_err() || *inputs.shutdown.borrow() {
                     return Ok(());
                 }
             }
-            changed = link.changed() => {
+            changed = inputs.link.changed() => {
                 if changed.is_err() {
-                    return fatal(&log, "the Herdr wake task ended");
+                    bail!("the Herdr wake task ended");
                 }
             }
-            changed = level.changed() => {
+            changed = inputs.level.changed() => {
                 if changed.is_err() {
-                    return fatal(&log, "the Linear task ended");
+                    bail!("the Linear task ended");
                 }
             }
-            event = events.recv() => match event {
+            event = inputs.events.recv() => match event {
                 Some(event) => wake.events.push(event),
-                None => return fatal(&log, "the Linear task ended"),
+                None => bail!("the Linear task ended"),
             },
             // The reconciler holds a sender of both, so they never close.
             Some(done) = effects.recv() => wake.effects.push(done),
             Some(done) = routing.recv() => wake.routing.push(done),
-            () = poke.notified() => {}
+            () = inputs.poke.notified() => {}
             () = tokio::time::sleep_until(deadline) => {}
         }
-        while let Ok(event) = events.try_recv() {
-            wake.events.push(event);
-        }
-        while let Ok(done) = effects.try_recv() {
-            wake.effects.push(done);
-        }
-        while let Ok(done) = routing.try_recv() {
-            wake.routing.push(done);
-        }
-        drop(link.borrow_and_update());
-        let current = level.borrow_and_update().clone();
-        let now = clock();
-        let socket_now = socket.borrow().clone();
+        wake.events
+            .extend(std::iter::from_fn(|| inputs.events.try_recv().ok()));
+        wake.effects
+            .extend(std::iter::from_fn(|| effects.try_recv().ok()));
+        wake.routing
+            .extend(std::iter::from_fn(|| routing.try_recv().ok()));
+        drop(inputs.link.borrow_and_update());
+        let current = inputs.level.borrow_and_update().clone();
+        let now = (inputs.clock)();
+        let socket = inputs.socket.borrow().clone();
         let deps = Deps {
-            ctx,
-            config,
-            herdr: &herdr,
-            socket: &socket_now,
-            log: &log,
+            ctx: inputs.ctx,
+            config: inputs.config,
+            herdr: &inputs.herdr,
+            socket: &socket,
+            log: &inputs.log,
         };
         reconciler.pass(&deps, &current, wake, now).await;
-        let next = reconciler.queries().to_vec();
-        queries.send_if_modified(|published| {
-            let changed = *published != next;
-            if changed {
-                *published = next;
-            }
-            changed
-        });
+        if *inputs.queries.borrow() != reconciler.queries() {
+            inputs.queries.send_replace(reconciler.queries().to_vec());
+        }
         if reconciler.take_queued() {
-            linear_wake.notify_one();
+            inputs.linear_wake.notify_one();
         }
         let wait = reconciler.next_deadline(&deps, now).duration_since(now);
         deadline =
@@ -890,7 +828,6 @@ mod tests {
                     team: "DATA".into(),
                 }],
             }),
-            ..LinearLevel::default()
         }
     }
 

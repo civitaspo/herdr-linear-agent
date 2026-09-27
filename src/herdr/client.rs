@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -14,13 +15,16 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{Instant, timeout_at};
 
-use super::{Agent, Event, HerdrError, Pane, PaneId, WorkspaceId, parse_event};
+use super::{Agent, Event, HerdrError, Pane, PaneId, parse_event};
 
 pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+/// A client of one session's socket. The ticker makes it before the
+/// session is found and fills the socket in later; until then every request
+/// is `NotSent`, so callers run as while Herdr is down.
+#[derive(Debug, Clone, Default)]
 pub struct Client {
-    pub socket: PathBuf,
+    socket: Arc<OnceLock<PathBuf>>,
 }
 
 /// `session.snapshot`: the complete view a decision reads. Entries that do
@@ -31,9 +35,6 @@ pub struct Snapshot {
     pub protocol: u32,
     pub panes: BTreeMap<PaneId, Pane>,
     pub agents: Vec<Agent>,
-    /// Each workspace's label, which the ticker gives a coordinator's
-    /// workspace so it can find one whose creation it did not hear back from.
-    pub workspaces: BTreeMap<WorkspaceId, String>,
     pub skipped: usize,
 }
 
@@ -93,9 +94,14 @@ fn lenient<T: DeserializeOwned>(values: Vec<Value>, skipped: &mut usize) -> Vec<
 
 impl Client {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
-        Self {
-            socket: socket.into(),
-        }
+        let client = Self::default();
+        client.set_socket(socket.into());
+        client
+    }
+
+    /// Fills in the socket of a client made without one; the first call wins.
+    pub fn set_socket(&self, socket: PathBuf) {
+        let _ = self.socket.set(socket);
     }
 
     /// Connects and writes one request, then reads its first line, all
@@ -106,7 +112,11 @@ impl Client {
         params: Value,
         deadline: Instant,
     ) -> Result<(String, Lines<BufReader<OwnedReadHalf>>, OwnedWriteHalf), HerdrError> {
-        let stream = timeout_at(deadline, UnixStream::connect(&self.socket))
+        let socket = self
+            .socket
+            .get()
+            .ok_or_else(|| HerdrError::NotSent("the Herdr session was not found yet".into()))?;
+        let stream = timeout_at(deadline, UnixStream::connect(socket))
             .await
             .map_err(|_| HerdrError::NotSent("connecting timed out".into()))?
             .map_err(|e| HerdrError::NotSent(e.to_string()))?;
@@ -175,14 +185,6 @@ impl Client {
             protocol: u32,
             panes: Vec<Value>,
             agents: Vec<Value>,
-            #[serde(default)]
-            workspaces: Vec<Value>,
-        }
-        #[derive(Deserialize)]
-        struct Workspace {
-            workspace_id: WorkspaceId,
-            #[serde(default)]
-            label: String,
         }
         let Answer { snapshot } = self.call("session.snapshot", json!({})).await?;
         let mut skipped = 0;
@@ -191,16 +193,11 @@ impl Client {
             .map(|pane| (pane.id.clone(), pane))
             .collect();
         let agents = lenient(snapshot.agents, &mut skipped);
-        let workspaces = lenient::<Workspace>(snapshot.workspaces, &mut skipped)
-            .into_iter()
-            .map(|w| (w.workspace_id, w.label))
-            .collect();
         Ok(Snapshot {
             version: snapshot.version,
             protocol: snapshot.protocol,
             panes,
             agents,
-            workspaces,
             skipped,
         })
     }
@@ -322,6 +319,24 @@ mod tests {
                 code: "server_busy".into(),
                 message: "try again later".into(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_is_not_sent_until_its_session_is_found() {
+        let fake = FakeHerdrServer::start().await;
+        let client = Client::default();
+        let error = client.snapshot().await.unwrap_err();
+        assert_eq!(
+            error,
+            HerdrError::NotSent("the Herdr session was not found yet".into())
+        );
+        client.clone().set_socket(fake.socket.clone());
+        assert_eq!(client.snapshot().await.unwrap().panes.len(), 0);
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "only the request after the socket was set"
         );
     }
 

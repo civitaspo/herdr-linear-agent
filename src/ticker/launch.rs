@@ -31,17 +31,9 @@ fn start_args(config: &Config, record: &AgentRecord) -> Result<Vec<String>> {
 }
 
 /// Sets a placed coordinator open in its root pane, ready to be started.
-fn place_coordinator(record: &mut RunRecord, workspace: &str, tab: &str, pane: &str, cwd: &str) {
+fn place_coordinator(record: &mut RunRecord, placed: &Placed) {
     let c = &mut record.coordinator;
-    c.status = AgentStatus::Open;
-    c.error.clear();
-    c.workspace_id = workspace.into();
-    c.tab_id = tab.into();
-    c.pane_id = pane.into();
-    c.cwd = cwd.into();
-    c.prompt_pending = true;
-    c.launch_attempts = 0;
-    c.last_attempt_at.clear();
+    c.placed(placed);
     c.last_state.clear();
     c.last_state_change.clear();
     c.last_state_seq = 0;
@@ -122,12 +114,7 @@ impl Reconciler {
     ) -> Result<()> {
         match result {
             Ok(placed) => {
-                let (workspace, tab, pane, cwd) = (
-                    placed.workspace.0.clone(),
-                    placed.tab.clone(),
-                    placed.pane.0.clone(),
-                    placed.cwd.clone(),
-                );
+                let found = placed.clone();
                 // Decided under the lock: the run may have moved on while
                 // the workspace was created.
                 let applied = self
@@ -138,9 +125,7 @@ impl Reconciler {
                         {
                             return Ok((false, Vec::new()));
                         }
-                        run.update_held(lock, |r| {
-                            place_coordinator(r, &workspace, &tab, &pane, &cwd)
-                        })?;
+                        run.update_held(lock, |r| place_coordinator(r, &found))?;
                         Ok((true, Vec::new()))
                     })
                     .await?;
@@ -368,7 +353,7 @@ impl Reconciler {
         if let Some(found) = placed_before(snapshot, &record.coordinator, &cwd) {
             update_run(run, move |r| {
                 if r.coordinator.status == AgentStatus::Pending {
-                    place_coordinator(r, &found.workspace.0, &found.tab, &found.pane.0, &found.cwd);
+                    place_coordinator(r, &found);
                 }
             })
             .await?;

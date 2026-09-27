@@ -202,7 +202,6 @@ async fn an_unsized_issue_is_sized_by_the_routing_agent() {
             "coordinator-light".to_string()
         )
     );
-    assert!(sized.routing.is_none(), "routing jobs live in memory");
 }
 
 #[tokio::test]
@@ -211,33 +210,18 @@ async fn a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again() 
     world.delegate(KEY, "Old", None);
     world.refuse_sessions(true);
     world.settle().await;
-    let mut leftover = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
+    let run = world.run(KEY);
+    run.update(|r| r.coordinator = crate::run::AgentRecord::default())
         .unwrap();
-    let job = crate::run::RoutingJob {
-        pid: leftover.id(),
-        started: "2026-01-01T00:00:00Z".into(),
-        output: String::new(),
-    };
-    world
-        .run(KEY)
-        .update(move |r| {
-            r.coordinator = crate::run::AgentRecord::default();
-            r.routing = Some(job);
-        })
-        .unwrap();
+    // The field an older build wrote; nothing reads it now.
+    let path = run.state_dir().join("run.json");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    stored["routing"] = json!({"pid": 4242, "started": "2026-01-01T00:00:00Z", "output": ""});
+    std::fs::write(&path, stored.to_string()).unwrap();
 
     world.restart_ticker();
     world.settle().await;
-    // Its pid may belong to another process by now.
-    assert_eq!(leftover.try_wait().unwrap(), None, "not killed");
-    leftover.kill().unwrap();
-    let routed = world.record(KEY);
-    assert_eq!(
-        (routed.routing, routed.coordinator.profile),
-        (None, "coordinator".into())
-    );
+    assert_eq!(world.record(KEY).coordinator.profile, "coordinator");
 }
 
 // ---------------------------------------------------------------- workers

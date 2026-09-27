@@ -268,7 +268,11 @@ impl World {
         let queries = self.queries_for_step();
         let mut events = std::mem::take(&mut self.injected);
         events.append(&mut self.held);
-        for event in self.task.step(&self.linear, &queries, self.now).await {
+        let (sender, mut sent) = mpsc::channel(1024);
+        self.task
+            .step_into(&self.linear, &queries, self.now, &sender)
+            .await;
+        for event in std::iter::from_fn(|| sent.try_recv().ok()) {
             if self.hold_activity_sent && matches!(event, LinearEvent::ActivitySent { .. }) {
                 self.held.push(event);
             } else {

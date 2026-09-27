@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Size;
 use crate::files::{self, write_atomic};
+use crate::herdr::Placed;
 use crate::linear::api::{ExternalUrl, IssueDetail};
 
 pub const SUBDIRS: [&str; 6] = [
@@ -116,6 +117,29 @@ pub struct AgentRecord {
     pub blocked_reported: bool,
 }
 
+impl AgentRecord {
+    /// Open in the pane Herdr placed it in, its launch prompt due.
+    pub fn placed(&mut self, placed: &Placed) {
+        self.status = AgentStatus::Open;
+        self.error.clear();
+        self.workspace_id = placed.workspace.0.clone();
+        self.tab_id = placed.tab.clone();
+        self.pane_id = placed.pane.0.clone();
+        self.cwd = placed.cwd.clone();
+        self.prompt_pending = true;
+        self.launch_attempts = 0;
+        self.last_attempt_at.clear();
+    }
+
+    /// Pending again, to be placed anew and resumed when it has a session.
+    pub fn repend(&mut self) {
+        self.status = AgentStatus::Pending;
+        self.resume = !self.agent_session.is_empty();
+        self.launch_attempts = 0;
+        self.last_attempt_at.clear();
+    }
+}
+
 /// Escape keys the run still owes its agents: a stop or a detach decided
 /// while no snapshot showed where they run.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,15 +148,6 @@ pub enum Interrupt {
     /// Posts `Stopped <n> agent(s) ...` once the keys went out.
     Stop,
     Detach,
-}
-
-/// A coordinator routing job running as a child process.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct RoutingJob {
-    pub pid: u32,
-    pub started: String,
-    pub output: String,
 }
 
 /// `.state/run.json`.
@@ -156,7 +171,6 @@ pub struct RunRecord {
     pub size: Size,
     /// Where the size came from: `estimate`, `label`, `agent` or `default`.
     pub size_source: String,
-    pub routing: Option<RoutingJob>,
     pub coordinator: AgentRecord,
     /// Prompts created after this timestamp have not been read yet.
     pub prompt_cursor: String,
@@ -426,6 +440,27 @@ mod tests {
         ] {
             assert!(validate_key(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_record_with_an_older_builds_routing_job_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = RunRecord {
+            identifier: "DATA-1".into(),
+            ..RunRecord::default()
+        };
+        let run = Run::create(dir.path(), record).unwrap();
+        std::fs::write(
+            run.record_path(),
+            r#"{"identifier":"DATA-1","size_source":"agent",
+                "routing":{"pid":4242,"started":"2026-01-01T00:00:00Z","output":""}}"#,
+        )
+        .unwrap();
+        let record = run.record().unwrap();
+        assert_eq!(
+            (record.identifier.as_str(), record.size_source.as_str()),
+            ("DATA-1", "agent")
+        );
     }
 
     #[test]

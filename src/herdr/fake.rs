@@ -55,7 +55,7 @@ struct Shared {
 
 pub struct FakeHerdrServer {
     _dir: tempfile::TempDir,
-    socket: PathBuf,
+    pub socket: PathBuf,
     shared: Arc<Shared>,
     server: Option<JoinHandle<()>>,
 }

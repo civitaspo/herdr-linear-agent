@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::files;
 use crate::linear::ApiError;
-use crate::linear::api::{Activity, ExternalUrl, IssueDetail};
+use crate::linear::api::{Activity, Content, ExternalUrl, IssueDetail};
 use crate::linear::client::LinearApi;
 use crate::run::{Run, RunLock};
 
@@ -36,6 +36,22 @@ pub enum Op {
     Plan { plan: Value },
     ExternalUrls { urls: Vec<ExternalUrl> },
     IssueState { target: StateTarget },
+}
+
+impl Op {
+    /// A question; with options, Linear shows them as a select.
+    pub fn elicitation(body: impl Into<String>, options: &[(&str, &str)]) -> Op {
+        let mut activity = Activity::new(Content::Elicitation { body: body.into() });
+        if !options.is_empty() {
+            activity.signal = Some("select".into());
+            let options: Vec<_> = options
+                .iter()
+                .map(|(label, value)| json!({ "label": label, "value": value }))
+                .collect();
+            activity.signal_metadata = Some(json!({ "options": options }));
+        }
+        Op::Activity { activity }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

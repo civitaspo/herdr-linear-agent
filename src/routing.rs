@@ -91,7 +91,7 @@ pub fn coordinator_profile<'a>(
     config: &'a Config,
     size: Size,
     team_key: &str,
-    labels: &[Label],
+    labels: &[String],
 ) -> &'a str {
     config
         .routing
@@ -104,7 +104,7 @@ pub fn coordinator_profile<'a>(
                     || labels.iter().any(|l| {
                         rule.labels_any
                             .iter()
-                            .any(|want| want.eq_ignore_ascii_case(&l.name))
+                            .any(|want| want.eq_ignore_ascii_case(l))
                     }))
         })
         .map_or(config.routing.default.as_str(), |rule| {
@@ -301,11 +301,11 @@ mod tests {
             },
         );
         assert_eq!(
-            coordinator_profile(&config, Size::S, "DATA", &[label("Urgent", None)]),
+            coordinator_profile(&config, Size::S, "DATA", &["Urgent".into()]),
             "coordinator"
         );
         assert_eq!(
-            coordinator_profile(&config, Size::S, "OTHER", &[label("urgent", None)]),
+            coordinator_profile(&config, Size::S, "OTHER", &["urgent".into()]),
             "coordinator-light"
         );
     }

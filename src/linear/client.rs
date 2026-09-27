@@ -8,218 +8,19 @@
 //! drives the HTTP call on the runtime with `Handle::block_on` while the lease
 //! is held.
 
-use std::collections::VecDeque;
-use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
-use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
-use super::api::{
-    self, Activity, Call, ExternalUrl, IssueDetail, IssueRef, RunQuery, RunUpdate, Viewer,
-};
+pub use super::api::LinearApi;
 use super::credentials::{CredentialError, CredentialManager};
 use super::transport::{
     CONNECT_TIMEOUT, GRAPHQL_ENDPOINT, MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, decode,
     json_content_type, verified,
 };
 use super::{ApiError, VerifiedReadOutcome};
-
-/// Header maps kept for a caller that has not taken them yet, newest last.
-const KEPT_HEADERS: usize = 32;
-
-/// The Linear operations the ticker needs. An implementation supplies
-/// `execute`; every operation's text and parsing is shared with the sync
-/// client in `api.rs`. Tests fake Linear by implementing `execute`.
-pub trait LinearApi: Sync {
-    /// Sends one GraphQL operation and returns its `data` object.
-    fn execute(
-        &self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        write: bool,
-    ) -> impl Future<Output = Result<Value, ApiError>> + Send;
-
-    /// The response headers of every call since the last take, oldest first
-    /// (the rate-limit headers are read from them).
-    // The budget that reads them (PR 3) is not written yet.
-    #[allow(dead_code)]
-    fn take_headers(&self) -> Vec<HeaderMap> {
-        Vec::new()
-    }
-
-    /// Sends a prepared call: a read's data, or a write's checked payload.
-    fn call(&self, call: Call) -> impl Future<Output = Result<Value, ApiError>> + Send {
-        async move {
-            let mut call = call;
-            let variables = std::mem::take(&mut call.variables);
-            let data = self
-                .execute(call.operation, &call.query, variables, call.is_write())
-                .await?;
-            call.finish(data)
-        }
-    }
-
-    fn viewer(&self) -> impl Future<Output = Result<Viewer, ApiError>> + Send {
-        async move { api::parse_viewer(&self.call(Call::viewer()).await?) }
-    }
-
-    /// Issues delegated to the app user in the teams whose state is neither
-    /// completed nor canceled.
-    fn delegated_issues(
-        &self,
-        team_keys: &[String],
-    ) -> impl Future<Output = Result<Vec<IssueRef>, ApiError>> + Send {
-        async move {
-            let mut issues = Vec::new();
-            let mut after: Option<String> = None;
-            for _ in 0..api::MAX_PAGES {
-                let data = self
-                    .call(Call::delegated_issues(team_keys, after.as_deref()))
-                    .await?;
-                let (page, next) = api::parse_delegated_page(&data)?;
-                issues.extend(page);
-                match next {
-                    Some(cursor) => after = Some(cursor),
-                    None => break,
-                }
-            }
-            Ok(issues)
-        }
-    }
-
-    fn issue(&self, id: &str) -> impl Future<Output = Result<IssueDetail, ApiError>> + Send {
-        async move { api::parse_issue_data(&self.call(Call::issue(id)).await?) }
-    }
-
-    /// The issue's newest open session of this app, usually the one Linear
-    /// created when the issue was delegated.
-    fn find_session(
-        &self,
-        issue_id: &str,
-    ) -> impl Future<Output = Result<Option<String>, ApiError>> + Send {
-        async move { api::newest_open_session(&self.call(Call::sessions()).await?, issue_id) }
-    }
-
-    /// Opens a new Agent Session on the issue and returns its ID.
-    fn create_session(
-        &self,
-        issue_id: &str,
-    ) -> impl Future<Output = Result<String, ApiError>> + Send {
-        async move { api::created_session(&self.call(Call::session_create(issue_id)).await?) }
-    }
-
-    /// Sends an activity with the caller's UUID as its ID.
-    fn create_activity(
-        &self,
-        session_id: &str,
-        id: &str,
-        activity: &Activity,
-    ) -> impl Future<Output = Result<(), ApiError>> + Send {
-        async move {
-            let call = Call::activity_create(session_id, id, activity)?;
-            self.call(call).await.map(|_| ())
-        }
-    }
-
-    fn activity_exists(
-        &self,
-        session_id: &str,
-        id: &str,
-    ) -> impl Future<Output = Result<bool, ApiError>> + Send {
-        async move { api::activity_found(&self.call(Call::activity_find(session_id, id)).await?, id) }
-    }
-
-    fn set_plan(
-        &self,
-        session_id: &str,
-        plan: &Value,
-    ) -> impl Future<Output = Result<(), ApiError>> + Send {
-        async move {
-            self.call(Call::set_plan(session_id, plan))
-                .await
-                .map(|_| ())
-        }
-    }
-
-    fn set_external_urls(
-        &self,
-        session_id: &str,
-        urls: &[ExternalUrl],
-    ) -> impl Future<Output = Result<(), ApiError>> + Send {
-        async move {
-            self.call(Call::set_external_urls(session_id, urls))
-                .await
-                .map(|_| ())
-        }
-    }
-
-    fn set_issue_state(
-        &self,
-        issue_id: &str,
-        state_id: &str,
-    ) -> impl Future<Output = Result<(), ApiError>> + Send {
-        async move {
-            self.call(Call::set_issue_state(issue_id, state_id))
-                .await
-                .map(|_| ())
-        }
-    }
-
-    /// Every given run's issue state and new prompts, in one request.
-    fn run_updates(
-        &self,
-        runs: &[RunQuery],
-    ) -> impl Future<Output = Result<Vec<RunUpdate>, ApiError>> + Send {
-        async move {
-            if runs.is_empty() {
-                return Ok(Vec::new());
-            }
-            let data = self.call(Call::run_updates(runs)).await?;
-            api::parse_run_updates(&data, runs.len())
-        }
-    }
-
-    /// The batched run read, one result per run in order. When the batch
-    /// fails, each run is read with its own request so one broken run does
-    /// not hide the others; a rate-limited batch is not split.
-    fn read_runs(
-        &self,
-        runs: &[RunQuery],
-    ) -> impl Future<Output = Vec<Result<RunUpdate, ApiError>>> + Send {
-        async move {
-            match self.run_updates(runs).await {
-                Ok(updates) => updates.into_iter().map(Ok).collect(),
-                Err(ApiError::RateLimited) => {
-                    runs.iter().map(|_| Err(ApiError::RateLimited)).collect()
-                }
-                Err(_) => {
-                    let mut updates = Vec::with_capacity(runs.len());
-                    for run in runs {
-                        updates.push(
-                            self.run_updates(std::slice::from_ref(run))
-                                .await
-                                .map(|mut one| one.remove(0)),
-                        );
-                    }
-                    updates
-                }
-            }
-        }
-    }
-}
-
-/// One answer from Linear: the response headers (empty when no response
-/// arrived) and the `data` object or the error.
-#[derive(Debug)]
-pub struct Response {
-    pub headers: HeaderMap,
-    pub result: Result<Value, ApiError>,
-}
 
 /// A token lease with the rules of the credential manager: a read's token
 /// is released only for a verified read, a write's only once the viewer is
@@ -259,7 +60,6 @@ pub struct Client {
     http: reqwest::Client,
     endpoint: &'static str,
     jobs: std::sync::mpsc::Sender<Job>,
-    headers: Mutex<VecDeque<HeaderMap>>,
 }
 
 impl Client {
@@ -322,66 +122,39 @@ impl Client {
             http,
             endpoint,
             jobs,
-            headers: Mutex::new(VecDeque::new()),
         })
     }
 
     /// Sends one operation under a credential lease and returns Linear's
-    /// answer with its headers.
+    /// `data` object.
     pub async fn request(
         &self,
         operation: &str,
         query: &str,
         variables: Value,
         write: bool,
-    ) -> Response {
-        let body = match serde_json::to_vec(
+    ) -> Result<Value, ApiError> {
+        let body = serde_json::to_vec(
             &json!({ "operationName": operation, "query": query, "variables": variables }),
-        ) {
-            Ok(body) => body,
-            Err(_) => {
-                return Response {
-                    headers: HeaderMap::new(),
-                    result: Err(ApiError::Configuration),
-                };
-            }
-        };
+        )
+        .map_err(|_| ApiError::Configuration)?;
         let http = self.http.clone();
         let endpoint = self.endpoint;
         let runtime = tokio::runtime::Handle::current();
         let (answer, answered) = oneshot::channel();
         let job: Job = Box::new(move |lease| {
-            let mut headers = HeaderMap::new();
-            let mut send = |token: &str| {
-                let response = runtime.block_on(post(&http, endpoint, token, &body));
-                headers = response.headers;
-                response.result
-            };
+            let send = |token: &str| runtime.block_on(post(&http, endpoint, token, &body));
             let result = if write {
                 lease.write(&mut |token| send(token))
             } else {
                 lease.read(&mut |token| verified(send(token)?))
             };
-            let _ = answer.send(Response { headers, result });
+            let _ = answer.send(result);
         });
-        if self.jobs.send(job).is_err() {
-            return Response {
-                headers: HeaderMap::new(),
-                result: Err(ApiError::ClientConfiguration),
-            };
-        }
-        answered.await.unwrap_or(Response {
-            headers: HeaderMap::new(),
-            result: Err(ApiError::ClientConfiguration),
-        })
-    }
-
-    fn keep(&self, headers: HeaderMap) {
-        let mut kept = self.headers.lock().unwrap_or_else(|e| e.into_inner());
-        if kept.len() == KEPT_HEADERS {
-            kept.pop_front();
-        }
-        kept.push_back(headers);
+        self.jobs
+            .send(job)
+            .map_err(|_| ApiError::ClientConfiguration)?;
+        answered.await.unwrap_or(Err(ApiError::ClientConfiguration))
     }
 }
 
@@ -393,108 +166,63 @@ impl LinearApi for Client {
         variables: Value,
         write: bool,
     ) -> Result<Value, ApiError> {
-        let response = self.request(operation, query, variables, write).await;
-        self.keep(response.headers);
-        response.result
-    }
-
-    fn take_headers(&self) -> Vec<HeaderMap> {
-        let mut kept = self.headers.lock().unwrap_or_else(|e| e.into_inner());
-        kept.drain(..).collect()
+        self.request(operation, query, variables, write).await
     }
 }
 
-async fn post(http: &reqwest::Client, endpoint: &str, token: &str, body: &[u8]) -> Response {
+async fn post(
+    http: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    body: &[u8],
+) -> Result<Value, ApiError> {
     use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 
     let mut authorization = Zeroizing::new(Vec::with_capacity(7 + token.len()));
     authorization.extend_from_slice(b"Bearer ");
     authorization.extend_from_slice(token.as_bytes());
-    let Ok(mut authorization) = HeaderValue::from_bytes(&authorization) else {
-        return Response {
-            headers: HeaderMap::new(),
-            result: Err(ApiError::Configuration),
-        };
-    };
+    let mut authorization =
+        HeaderValue::from_bytes(&authorization).map_err(|_| ApiError::Configuration)?;
     authorization.set_sensitive(true);
-    let sent = http
+    let mut response = http
         .post(endpoint)
         .header(CONTENT_TYPE, "application/json")
         .header(AUTHORIZATION, authorization)
         .body(body.to_vec())
         .send()
-        .await;
-    let mut response = match sent {
-        Ok(response) => response,
-        Err(_) => {
-            return Response {
-                headers: HeaderMap::new(),
-                result: Err(ApiError::RequestFailed),
-            };
-        }
-    };
+        .await
+        .map_err(|_| ApiError::RequestFailed)?;
     let status = response.status().as_u16();
-    let headers = response.headers().clone();
     let json_content = json_content_type(
-        headers
+        response
+            .headers()
             .get_all(CONTENT_TYPE)
             .iter()
             .filter_map(|v| v.to_str().ok()),
     );
     let mut bytes = Vec::with_capacity(4096);
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES => {
-                return Response {
-                    headers,
-                    result: Err(ApiError::ResponseTooLarge),
-                };
-            }
-            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
-            Ok(None) => break,
-            Err(_) => {
-                return Response {
-                    headers,
-                    result: Err(ApiError::RequestFailed),
-                };
-            }
-        }
-    }
-    Response {
-        headers,
-        result: decode_response(status, json_content, &bytes),
-    }
-}
-
-/// `transport::decode`, except that HTTP 429 and a GraphQL error whose
-/// `extensions.code` is `RATELIMITED` (Linear answers those with HTTP 400)
-/// are `RateLimited`, never a definitive refusal.
-pub fn decode_response(status: u16, json_content: bool, body: &[u8]) -> Result<Value, ApiError> {
-    if status == 429 {
-        return Err(ApiError::RateLimited);
-    }
-    if json_content
-        && let Ok(reply) = serde_json::from_slice::<Value>(body)
-        && reply["errors"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|error| error["extensions"]["code"] == "RATELIMITED")
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ApiError::RequestFailed)?
     {
-        return Err(ApiError::RateLimited);
+        if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(ApiError::ResponseTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    decode(status, json_content, body)
+    decode(status, json_content, &bytes)
 }
 
 #[cfg(test)]
-impl LinearApi for Mutex<api::fake::FakeLinear> {
+impl LinearApi for std::sync::Mutex<super::api::fake::FakeLinear> {
     fn execute(
         &self,
         operation: &str,
         query: &str,
         variables: Value,
         write: bool,
-    ) -> impl Future<Output = Result<Value, ApiError>> + Send {
+    ) -> impl std::future::Future<Output = Result<Value, ApiError>> + Send {
         let result = self
             .lock()
             .unwrap()
@@ -505,48 +233,11 @@ impl LinearApi for Mutex<api::fake::FakeLinear> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::linear::api::fake::FakeLinear;
-
-    #[test]
-    fn rate_limits_decode_apart_from_refusals() {
-        assert_eq!(
-            decode_response(
-                400,
-                true,
-                br#"{"errors":[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}]}"#
-            ),
-            Err(ApiError::RateLimited)
-        );
-        assert_eq!(
-            decode_response(429, false, b"Too Many Requests"),
-            Err(ApiError::RateLimited)
-        );
-        assert_eq!(
-            decode_response(429, true, b"{}"),
-            Err(ApiError::RateLimited)
-        );
-        assert_eq!(
-            decode_response(
-                400,
-                true,
-                br#"{"errors":[{"message":"Entity not found","extensions":{"code":"INVALID_INPUT"}}]}"#
-            ),
-            Err(ApiError::Graphql("Entity not found".into()))
-        );
-        assert_eq!(
-            decode_response(502, false, b"<html>"),
-            Err(ApiError::HttpStatus(502))
-        );
-        assert_eq!(
-            decode_response(200, true, br#"{"data":{"x":1}}"#).unwrap()["x"],
-            1
-        );
-        assert_eq!(
-            ApiError::RateLimited.to_string(),
-            "Linear rate-limited the request"
-        );
-    }
+    use crate::linear::api::{self, Activity, RunQuery};
 
     /// A lease that hands out a fixed token, bound or not.
     struct TestLease {
@@ -588,20 +279,13 @@ mod tests {
                 false,
             )
             .await;
-        assert_eq!(
-            read.result,
-            Err(ApiError::RequestFailed),
-            "plain HTTP is refused"
-        );
-        assert!(read.headers.is_empty());
+        assert_eq!(read, Err(ApiError::RequestFailed), "plain HTTP is refused");
         assert_eq!(
             unbound
                 .execute("HlaIssueState", "mutation", json!({}), true)
                 .await,
             Err(ApiError::Credential(CredentialError::NotReady))
         );
-        assert_eq!(unbound.take_headers().len(), 1);
-        assert!(unbound.take_headers().is_empty());
 
         let bound = Client::with_lease(
             || Ok(TestLease { bound: true }),
@@ -664,7 +348,6 @@ mod tests {
         let fake = linear.lock().unwrap();
         assert_eq!(fake.sessions[0].sent_types(), ["thought"]);
         assert_eq!(fake.issue("DATA-1")["state"]["name"], "In Progress");
-        assert!(linear.take_headers().is_empty());
     }
 
     #[tokio::test]

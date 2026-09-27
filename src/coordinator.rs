@@ -568,7 +568,6 @@ mod tests {
             protocol: 22,
             panes: BTreeMap::from([pane_row("p1:1")]),
             agents: vec![claude_in("p1:1", "data-1-w1", "/wt/repo1", Seen::Idle)],
-            workspaces: BTreeMap::new(),
             skipped: 0,
         };
         let state = tempfile::tempdir().unwrap();

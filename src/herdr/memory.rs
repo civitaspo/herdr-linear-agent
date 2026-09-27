@@ -176,19 +176,11 @@ impl Model {
             agents.retain(|a| a.pane != *pane);
             skipped += before - agents.len();
         }
-        let workspaces = panes
-            .values()
-            .map(|p| {
-                let label = self.labels.get(&p.workspace).cloned().unwrap_or_default();
-                (p.workspace.clone(), label)
-            })
-            .collect();
         Ok(Snapshot {
             version: "0.9.1".into(),
             protocol: 22,
             panes,
             agents,
-            workspaces,
             skipped,
         })
     }

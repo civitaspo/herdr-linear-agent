@@ -10,7 +10,7 @@ use super::reconcile::{
 };
 use crate::config::Size;
 use crate::herdr::{Herdr, Snapshot, WorkspaceId};
-use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Label, Prompt, RunUpdate};
+use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUpdate};
 use crate::linear::task::{LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
 use crate::run::{AgentRecord, AgentStatus, Interrupt, Run, RunRecord, Status};
@@ -260,10 +260,7 @@ impl Reconciler {
                     }
                     if r.coordinator_lost && resume {
                         r.coordinator_lost = false;
-                        r.coordinator.status = AgentStatus::Pending;
-                        r.coordinator.resume = !r.coordinator.agent_session.is_empty();
-                        r.coordinator.launch_attempts = 0;
-                        r.coordinator.last_attempt_at.clear();
+                        r.coordinator.repend();
                     }
                 })?;
                 Ok(((), Vec::new()))
@@ -475,10 +472,7 @@ impl Reconciler {
             }
             // A closed run's coordinator was stopped: bring it back.
             if r.coordinator.status == AgentStatus::Stopped {
-                r.coordinator.status = AgentStatus::Pending;
-                r.coordinator.resume = !r.coordinator.agent_session.is_empty();
-                r.coordinator.launch_attempts = 0;
-                r.coordinator.last_attempt_at.clear();
+                r.coordinator.repend();
             }
             vec![thought("The issue was delegated again; the run continues.")]
         })
@@ -646,16 +640,8 @@ impl Reconciler {
         if !record.coordinator.profile.is_empty() || record.status != Status::Active {
             return Ok(());
         }
-        let labels: Vec<Label> = record
-            .labels
-            .iter()
-            .map(|name| Label {
-                name: name.clone(),
-                group: None,
-            })
-            .collect();
-        let name =
-            routing::coordinator_profile(d.config, size, &record.team_key, &labels).to_string();
+        let name = routing::coordinator_profile(d.config, size, &record.team_key, &record.labels)
+            .to_string();
         let profile = d.config.profile(&name)?;
         let mut pending = coordinator::pending_record(&record, &name, &profile.kind);
         pending.agent_session = record.coordinator.agent_session.clone();
@@ -672,7 +658,6 @@ impl Reconciler {
             }
             r.size = size;
             r.size_source = stored_source;
-            r.routing = None;
             r.coordinator = pending;
             vec![thought(format!(
                 "The coordinator uses the `{name}` profile ({why})."

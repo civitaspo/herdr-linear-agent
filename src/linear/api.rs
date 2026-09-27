@@ -3,13 +3,15 @@
 //! GraphQL text. Every read also selects the viewer, so the transport can
 //! check that the credential still belongs to the app user.
 
+use std::future::Future;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ApiError;
 
 /// Pages read per poll at most: 50 issues each.
-pub(crate) const MAX_PAGES: usize = 4;
+const MAX_PAGES: usize = 4;
 
 const VIEWER_QUERY: &str = r#"query HlaViewer {
   viewer { id app isMe name }
@@ -260,248 +262,309 @@ pub struct RunUpdate {
     pub prompts: Vec<Prompt>,
 }
 
-/// One GraphQL operation: its fixed text and its variables. The sync
-/// [`Linear`] and the async [`super::client::LinearApi`] both send these, so
-/// the text and the parsing of every operation live only here.
-pub(crate) struct Call {
-    pub operation: &'static str,
-    pub query: std::borrow::Cow<'static, str>,
-    pub variables: Value,
-    /// For a mutation, the payload field whose `success` must be true.
-    pub payload: Option<&'static str>,
-}
+/// The Linear operations the ticker needs. An implementation supplies
+/// `execute`; every operation's text and parsing is here. Tests fake Linear
+/// by implementing `execute`.
+pub trait LinearApi: Sync {
+    /// Sends one GraphQL operation and returns its `data` object.
+    fn execute(
+        &self,
+        operation: &str,
+        query: &str,
+        variables: Value,
+        write: bool,
+    ) -> impl Future<Output = Result<Value, ApiError>> + Send;
 
-impl Call {
-    fn read(operation: &'static str, query: &'static str, variables: Value) -> Call {
-        Call {
-            operation,
-            query: query.into(),
-            variables,
-            payload: None,
-        }
-    }
-
-    fn write(
+    /// Sends a mutation and returns its `payload` field once its `success`
+    /// is true.
+    fn mutate(
+        &self,
         operation: &'static str,
         query: &'static str,
         variables: Value,
         payload: &'static str,
-    ) -> Call {
-        Call {
-            operation,
-            query: query.into(),
-            variables,
-            payload: Some(payload),
+    ) -> impl Future<Output = Result<Value, ApiError>> + Send {
+        async move {
+            let data = self.execute(operation, query, variables, true).await?;
+            let result = field(&data, payload)?;
+            if result["success"].as_bool() != Some(true) {
+                return Err(ApiError::Graphql(format!("{payload} did not succeed")));
+            }
+            Ok(result.clone())
         }
     }
 
-    pub fn is_write(&self) -> bool {
-        self.payload.is_some()
+    fn viewer(&self) -> impl Future<Output = Result<Viewer, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaViewer", VIEWER_QUERY, json!({}), false)
+                .await?;
+            serde_json::from_value(field(&data, "viewer")?.clone())
+                .map_err(|_| ApiError::ReadFieldsInvalid)
+        }
     }
 
-    pub fn viewer() -> Call {
-        Call::read("HlaViewer", VIEWER_QUERY, json!({}))
+    /// Issues delegated to the app user in the teams whose state is neither
+    /// completed nor canceled.
+    fn delegated_issues(
+        &self,
+        team_keys: &[String],
+    ) -> impl Future<Output = Result<Vec<IssueRef>, ApiError>> + Send {
+        async move {
+            let mut issues = Vec::new();
+            let mut after: Option<String> = None;
+            for _ in 0..MAX_PAGES {
+                let variables = json!({ "teamKeys": team_keys, "after": after });
+                let data = self
+                    .execute("HlaDelegatedIssues", DELEGATED_QUERY, variables, false)
+                    .await?;
+                let page = field(&data, "issues")?;
+                for node in nodes(page) {
+                    issues.push(
+                        serde_json::from_value(node.clone())
+                            .map_err(|_| ApiError::ReadFieldsInvalid)?,
+                    );
+                }
+                let info = &page["pageInfo"];
+                if info["hasNextPage"].as_bool() != Some(true) {
+                    break;
+                }
+                after = Some(text(info, "endCursor")?);
+            }
+            Ok(issues)
+        }
     }
 
-    pub fn delegated_issues(team_keys: &[String], after: Option<&str>) -> Call {
-        Call::read(
-            "HlaDelegatedIssues",
-            DELEGATED_QUERY,
-            json!({ "teamKeys": team_keys, "after": after }),
-        )
+    fn issue(&self, id: &str) -> impl Future<Output = Result<IssueDetail, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaIssue", ISSUE_QUERY, json!({ "id": id }), false)
+                .await?;
+            parse_issue(field(&data, "issue")?)
+        }
     }
 
-    pub fn issue(id: &str) -> Call {
-        Call::read("HlaIssue", ISSUE_QUERY, json!({ "id": id }))
+    /// The issue's newest open session of this app: the one Linear created
+    /// on delegation, or one the plugin created earlier.
+    fn find_session(
+        &self,
+        issue_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaSessions", SESSIONS_QUERY, json!({}), false)
+                .await?;
+            let viewer = text(field(&data, "viewer")?, "id")?;
+            nodes(field(&data, "agentSessions")?)
+                .filter(|s| s["issue"]["id"] == issue_id && s["appUser"]["id"] == viewer.as_str())
+                .filter(|s| s["status"] != "complete")
+                .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
+                .map(|session| text(session, "id"))
+                .transpose()
+        }
     }
 
-    pub fn sessions() -> Call {
-        Call::read("HlaSessions", SESSIONS_QUERY, json!({}))
+    /// Opens a new Agent Session on the issue and returns its ID.
+    fn create_session(
+        &self,
+        issue_id: &str,
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
+        async move {
+            let payload = self
+                .mutate(
+                    "HlaSessionCreate",
+                    SESSION_CREATE,
+                    json!({ "issueId": issue_id }),
+                    "agentSessionCreateOnIssue",
+                )
+                .await?;
+            text(field(&payload, "agentSession")?, "id")
+        }
     }
 
-    pub fn session_create(issue_id: &str) -> Call {
-        Call::write(
-            "HlaSessionCreate",
-            SESSION_CREATE,
-            json!({ "issueId": issue_id }),
-            "agentSessionCreateOnIssue",
-        )
-    }
-
-    pub fn activity_create(
+    /// Sends an activity with the caller's UUID as its ID.
+    fn create_activity(
+        &self,
         session_id: &str,
         id: &str,
         activity: &Activity,
-    ) -> Result<Call, ApiError> {
-        let mut input = json!({
-            "agentSessionId": session_id,
-            "id": id,
-            "content": serde_json::to_value(&activity.content).map_err(|_| ApiError::Configuration)?,
-            "ephemeral": activity.ephemeral,
-        });
-        if let Some(signal) = &activity.signal {
-            input["signal"] = json!(signal);
-        }
-        if let Some(metadata) = &activity.signal_metadata {
-            input["signalMetadata"] = metadata.clone();
-        }
-        Ok(Call::write(
-            "HlaActivityCreate",
-            ACTIVITY_CREATE,
-            json!({ "input": input }),
-            "agentActivityCreate",
-        ))
-    }
-
-    pub fn activity_find(session_id: &str, id: &str) -> Call {
-        Call::read(
-            "HlaActivityFind",
-            ACTIVITY_FIND,
-            json!({ "sessionId": session_id, "id": id }),
-        )
-    }
-
-    pub fn set_plan(session_id: &str, plan: &Value) -> Call {
-        Call::write(
-            "HlaSessionUpdate",
-            SESSION_UPDATE,
-            json!({ "id": session_id, "input": { "plan": plan } }),
-            "agentSessionUpdate",
-        )
-    }
-
-    pub fn set_external_urls(session_id: &str, urls: &[ExternalUrl]) -> Call {
-        Call::write(
-            "HlaSessionUpdate",
-            SESSION_UPDATE,
-            json!({ "id": session_id, "input": { "externalUrls": urls } }),
-            "agentSessionUpdate",
-        )
-    }
-
-    pub fn set_issue_state(issue_id: &str, state_id: &str) -> Call {
-        Call::write(
-            "HlaIssueState",
-            ISSUE_STATE_UPDATE,
-            json!({ "id": issue_id, "stateId": state_id }),
-            "issueUpdate",
-        )
-    }
-
-    /// `HlaRuns` for a non-empty list of runs.
-    pub fn run_updates(runs: &[RunQuery]) -> Call {
-        let mut declarations = Vec::new();
-        let mut body = String::from("  viewer { id app isMe }\n");
-        let mut variables = serde_json::Map::new();
-        for (n, run) in runs.iter().enumerate() {
-            declarations.push(format!(
-                "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!"
-            ));
-            body.push_str(&RUN_PART.replace('@', &n.to_string()));
-            variables.insert(format!("i{n}"), json!(run.issue_id));
-            variables.insert(format!("s{n}"), json!(run.session_id));
-            variables.insert(format!("c{n}"), json!(run.cursor));
-        }
-        let query = format!("query HlaRuns({}) {{\n{body}}}", declarations.join(", "));
-        Call {
-            operation: "HlaRuns",
-            query: query.into(),
-            variables: Value::Object(variables),
-            payload: None,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let mut input = json!({
+                "agentSessionId": session_id,
+                "id": id,
+                "content": serde_json::to_value(&activity.content).map_err(|_| ApiError::Configuration)?,
+                "ephemeral": activity.ephemeral,
+            });
+            if let Some(signal) = &activity.signal {
+                input["signal"] = json!(signal);
+            }
+            if let Some(metadata) = &activity.signal_metadata {
+                input["signalMetadata"] = metadata.clone();
+            }
+            let variables = json!({ "input": input });
+            self.mutate(
+                "HlaActivityCreate",
+                ACTIVITY_CREATE,
+                variables,
+                "agentActivityCreate",
+            )
+            .await
+            .map(|_| ())
         }
     }
 
-    /// A read's data, or a write's payload once its `success` is true.
-    pub fn finish(&self, data: Value) -> Result<Value, ApiError> {
-        let Some(payload) = self.payload else {
-            return Ok(data);
-        };
-        let result = field(&data, payload)?;
-        if result["success"].as_bool() != Some(true) {
-            return Err(ApiError::Graphql(format!("{payload} did not succeed")));
+    fn activity_exists(
+        &self,
+        session_id: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<bool, ApiError>> + Send {
+        async move {
+            let variables = json!({ "sessionId": session_id, "id": id });
+            let data = self
+                .execute("HlaActivityFind", ACTIVITY_FIND, variables, false)
+                .await?;
+            Ok(nodes(&field(&data, "agentSession")?["activities"]).any(|n| n["id"] == id))
         }
-        Ok(result.clone())
     }
-}
 
-pub(crate) fn parse_viewer(data: &Value) -> Result<Viewer, ApiError> {
-    serde_json::from_value(field(data, "viewer")?.clone()).map_err(|_| ApiError::ReadFieldsInvalid)
-}
-
-/// One page of the delegated poll, and the cursor of the next page when
-/// there is one.
-pub(crate) fn parse_delegated_page(
-    data: &Value,
-) -> Result<(Vec<IssueRef>, Option<String>), ApiError> {
-    let page = field(data, "issues")?;
-    let mut issues = Vec::new();
-    for node in nodes(page) {
-        issues.push(serde_json::from_value(node.clone()).map_err(|_| ApiError::ReadFieldsInvalid)?);
+    fn set_plan(
+        &self,
+        session_id: &str,
+        plan: &Value,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let variables = json!({ "id": session_id, "input": { "plan": plan } });
+            self.mutate(
+                "HlaSessionUpdate",
+                SESSION_UPDATE,
+                variables,
+                "agentSessionUpdate",
+            )
+            .await
+            .map(|_| ())
+        }
     }
-    let info = &page["pageInfo"];
-    if info["hasNextPage"].as_bool() != Some(true) {
-        return Ok((issues, None));
+
+    fn set_external_urls(
+        &self,
+        session_id: &str,
+        urls: &[ExternalUrl],
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let variables = json!({ "id": session_id, "input": { "externalUrls": urls } });
+            self.mutate(
+                "HlaSessionUpdate",
+                SESSION_UPDATE,
+                variables,
+                "agentSessionUpdate",
+            )
+            .await
+            .map(|_| ())
+        }
     }
-    Ok((issues, Some(text(info, "endCursor")?)))
-}
 
-pub(crate) fn parse_issue_data(data: &Value) -> Result<IssueDetail, ApiError> {
-    parse_issue(field(data, "issue")?)
-}
+    fn set_issue_state(
+        &self,
+        issue_id: &str,
+        state_id: &str,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let variables = json!({ "id": issue_id, "stateId": state_id });
+            self.mutate(
+                "HlaIssueState",
+                ISSUE_STATE_UPDATE,
+                variables,
+                "issueUpdate",
+            )
+            .await
+            .map(|_| ())
+        }
+    }
 
-/// The issue's newest open session of this app: the one Linear created on
-/// delegation, or one the plugin created earlier.
-pub(crate) fn newest_open_session(
-    data: &Value,
-    issue_id: &str,
-) -> Result<Option<String>, ApiError> {
-    let viewer = text(field(data, "viewer")?, "id")?;
-    nodes(field(data, "agentSessions")?)
-        .filter(|s| s["issue"]["id"] == issue_id && s["appUser"]["id"] == viewer.as_str())
-        .filter(|s| s["status"] != "complete")
-        .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
-        .map(|session| text(session, "id"))
-        .transpose()
-}
-
-/// The ID of the session a `session_create` payload names.
-pub(crate) fn created_session(payload: &Value) -> Result<String, ApiError> {
-    text(field(payload, "agentSession")?, "id")
-}
-
-pub(crate) fn activity_found(data: &Value, id: &str) -> Result<bool, ApiError> {
-    Ok(nodes(&field(data, "agentSession")?["activities"]).any(|n| n["id"] == id))
-}
-
-/// The updates of `count` runs from an `HlaRuns` answer, in query order.
-pub(crate) fn parse_run_updates(data: &Value, count: usize) -> Result<Vec<RunUpdate>, ApiError> {
-    (0..count)
-        .map(|n| {
-            let issue = field(data, &format!("i{n}"))?;
-            let session = field(data, &format!("s{n}"))?;
-            let mut prompts = nodes(&session["activities"])
-                .map(|a| {
-                    Ok(Prompt {
-                        id: text(a, "id")?,
-                        created_at: text(a, "createdAt")?,
-                        signal: a["signal"].as_str().map(str::to_string),
-                        user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
-                        body: a["content"]["body"].as_str().unwrap_or("").to_string(),
+    /// Every given run's issue state and new prompts, in one `HlaRuns`
+    /// request, in query order.
+    fn run_updates(
+        &self,
+        runs: &[RunQuery],
+    ) -> impl Future<Output = Result<Vec<RunUpdate>, ApiError>> + Send {
+        async move {
+            if runs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut declarations = Vec::new();
+            let mut body = String::from("  viewer { id app isMe }\n");
+            let mut variables = serde_json::Map::new();
+            for (n, run) in runs.iter().enumerate() {
+                declarations.push(format!(
+                    "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!"
+                ));
+                body.push_str(&RUN_PART.replace('@', &n.to_string()));
+                variables.insert(format!("i{n}"), json!(run.issue_id));
+                variables.insert(format!("s{n}"), json!(run.session_id));
+                variables.insert(format!("c{n}"), json!(run.cursor));
+            }
+            let query = format!("query HlaRuns({}) {{\n{body}}}", declarations.join(", "));
+            let data = self
+                .execute("HlaRuns", &query, Value::Object(variables), false)
+                .await?;
+            (0..runs.len())
+                .map(|n| {
+                    let issue = field(&data, &format!("i{n}"))?;
+                    let session = field(&data, &format!("s{n}"))?;
+                    let mut prompts = nodes(&session["activities"])
+                        .map(|a| {
+                            Ok(Prompt {
+                                id: text(a, "id")?,
+                                created_at: text(a, "createdAt")?,
+                                signal: a["signal"].as_str().map(str::to_string),
+                                user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
+                                body: a["content"]["body"].as_str().unwrap_or("").to_string(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, ApiError>>()?;
+                    prompts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                    Ok(RunUpdate {
+                        issue: IssueStatus {
+                            updated_at: text(issue, "updatedAt")?,
+                            state_type: text(field(issue, "state")?, "type")?,
+                            state_name: text(field(issue, "state")?, "name")?,
+                            delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
+                        },
+                        prompts,
                     })
                 })
-                .collect::<Result<Vec<_>, ApiError>>()?;
-            prompts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-            Ok(RunUpdate {
-                issue: IssueStatus {
-                    updated_at: text(issue, "updatedAt")?,
-                    state_type: text(field(issue, "state")?, "type")?,
-                    state_name: text(field(issue, "state")?, "name")?,
-                    delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
-                },
-                prompts,
-            })
-        })
-        .collect()
+                .collect()
+        }
+    }
+
+    /// The batched run read, one result per run in order. When the batch
+    /// fails, each run is read with its own request so one broken run does
+    /// not hide the others; a rate-limited batch is not split.
+    fn read_runs(
+        &self,
+        runs: &[RunQuery],
+    ) -> impl Future<Output = Vec<Result<RunUpdate, ApiError>>> + Send {
+        async move {
+            match self.run_updates(runs).await {
+                Ok(updates) => updates.into_iter().map(Ok).collect(),
+                Err(ApiError::RateLimited) => {
+                    runs.iter().map(|_| Err(ApiError::RateLimited)).collect()
+                }
+                Err(_) => {
+                    let mut updates = Vec::with_capacity(runs.len());
+                    for run in runs {
+                        updates.push(
+                            self.run_updates(std::slice::from_ref(run))
+                                .await
+                                .map(|mut one| one.remove(0)),
+                        );
+                    }
+                    updates
+                }
+            }
+        }
+    }
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a Value, ApiError> {
@@ -964,7 +1027,6 @@ mod tests {
 
     use super::fake::FakeLinear;
     use super::*;
-    use crate::linear::client::LinearApi;
 
     #[tokio::test]
     async fn reads_parse_into_typed_records() {

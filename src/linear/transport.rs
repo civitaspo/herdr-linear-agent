@@ -32,8 +32,13 @@ pub(crate) fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -
         .eq_ignore_ascii_case("application/json")
 }
 
-/// A GraphQL response's `data`, or the first error it reports.
+/// A GraphQL response's `data`, or the first error it reports. HTTP 429 and
+/// a GraphQL error whose `extensions.code` is `RATELIMITED` (Linear answers
+/// those with HTTP 400) are `RateLimited`, never a definitive refusal.
 pub fn decode(status: u16, json_content: bool, body: &[u8]) -> Result<Value, ApiError> {
+    if status == 429 {
+        return Err(ApiError::RateLimited);
+    }
     if !json_content {
         return Err(if status == 200 {
             ApiError::ContentType
@@ -48,7 +53,17 @@ pub fn decode(status: u16, json_content: bool, body: &[u8]) -> Result<Value, Api
             ApiError::HttpStatus(status)
         }
     })?;
-    if let Some(error) = reply["errors"].as_array().and_then(|errors| errors.first()) {
+    let errors = reply["errors"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if errors
+        .iter()
+        .any(|error| error["extensions"]["code"] == "RATELIMITED")
+    {
+        return Err(ApiError::RateLimited);
+    }
+    if let Some(error) = errors.first() {
         let message = error["extensions"]["userPresentableMessage"]
             .as_str()
             .or_else(|| error["message"].as_str())
@@ -109,7 +124,6 @@ mod tests {
         );
         assert_eq!(decode(200, false, b"{}"), Err(ApiError::ContentType));
         assert_eq!(decode(200, true, b"{}"), Err(ApiError::ReadFieldsInvalid));
-        assert_eq!(decode(429, true, b"{}"), Err(ApiError::HttpStatus(429)));
         assert!(json_content_type(
             ["application/json; charset=utf-8"].into_iter()
         ));
@@ -117,6 +131,40 @@ mod tests {
             ["application/json", "text/html"].into_iter()
         ));
         assert!(!json_content_type(std::iter::empty()));
+    }
+
+    #[test]
+    fn rate_limits_decode_apart_from_refusals() {
+        assert_eq!(
+            decode(
+                400,
+                true,
+                br#"{"errors":[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}]}"#
+            ),
+            Err(ApiError::RateLimited)
+        );
+        assert_eq!(
+            decode(429, false, b"Too Many Requests"),
+            Err(ApiError::RateLimited)
+        );
+        assert_eq!(decode(429, true, b"{}"), Err(ApiError::RateLimited));
+        assert_eq!(
+            decode(
+                400,
+                true,
+                br#"{"errors":[{"message":"Entity not found","extensions":{"code":"INVALID_INPUT"}}]}"#
+            ),
+            Err(ApiError::Graphql("Entity not found".into()))
+        );
+        assert_eq!(
+            decode(502, false, b"<html>"),
+            Err(ApiError::HttpStatus(502))
+        );
+        assert_eq!(decode(200, true, br#"{"data":{"x":1}}"#).unwrap()["x"], 1);
+        assert_eq!(
+            ApiError::RateLimited.to_string(),
+            "Linear rate-limited the request"
+        );
     }
 
     #[test]

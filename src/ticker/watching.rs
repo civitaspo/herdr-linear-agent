@@ -1,11 +1,13 @@
 //! Watching coordinators and workers from a snapshot, and the heartbeat.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use jiff::Timestamp;
 
 use super::reconcile::{
-    COORDINATOR_IDLE, Deps, HEARTBEAT, PANE_GRACE, Reconciler, apply_tracked, elicitation,
-    error_activity, inbox_item, since, update_worker,
+    COORDINATOR_IDLE, Deps, HEARTBEAT, PANE_GRACE, Reconciler, apply_tracked, error_activity,
+    inbox_item, since, update_worker,
 };
 use crate::agents;
 use crate::herdr::{Herdr, PaneId, Snapshot};
@@ -94,7 +96,7 @@ impl Reconciler {
             d.config.herdr.session.as_deref().unwrap_or("default")
         );
         let notice = (format!("{} needs you", run.key), body.clone());
-        (elicitation(body, &[]), notice)
+        (Op::elicitation(body, &[]), notice)
     }
 
     pub(super) async fn watch<H: Herdr>(
@@ -127,7 +129,7 @@ impl Reconciler {
                 } else {
                     "Reply `resume` to start a new coordinator."
                 };
-                ops.push(elicitation(
+                ops.push(Op::elicitation(
                     format!("The coordinator's pane for {} is gone. {how}", run.key),
                     &[("Resume", "resume")],
                 ));
@@ -392,7 +394,7 @@ impl Reconciler {
             .get(&run.key)
             .is_some_and(|at| now.duration_since(*at) < HEARTBEAT);
         if quiet && !recent && outbox::is_empty(run) {
-            let mut counts: Vec<(Group, usize)> = Vec::new();
+            let mut counts: BTreeMap<Group, usize> = BTreeMap::new();
             for w in worker::list(run)
                 .iter()
                 .filter(|w| w.agent.status == AgentStatus::Open)
@@ -404,10 +406,7 @@ impl Reconciler {
                     None => Group::from_token(&w.agent.last_group),
                 };
                 let Some(group) = group else { continue };
-                match counts.iter_mut().find(|(g, _)| *g == group) {
-                    Some((_, n)) => *n += 1,
-                    None => counts.push((group, 1)),
-                }
+                *counts.entry(group).or_default() += 1;
             }
             let summary = if counts.is_empty() {
                 "no workers".to_string()
@@ -432,7 +431,7 @@ impl Reconciler {
                     if std::mem::replace(&mut r.timeout_asked, true) {
                         return Vec::new();
                     }
-                    vec![elicitation(
+                    vec![Op::elicitation(
                         format!(
                             "This run has been going for {hours} hours. Reply to let it continue; until then the coordinator gets no prompts."
                         ),
