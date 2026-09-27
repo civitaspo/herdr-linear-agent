@@ -7,7 +7,7 @@ use jiff::Timestamp;
 
 use super::reconcile::{
     AgentKey, DETECTION_GRACE, Deps, Effect, EffectDone, MAX_LAUNCH_ATTEMPTS, Reconciler,
-    attempt_due, error_activity, update_run, update_worker,
+    error_activity, update_run, update_worker,
 };
 use crate::config::Config;
 use crate::herdr::{Herdr, HerdrError, PaneId, Placed, Snapshot};
@@ -48,14 +48,22 @@ fn place_coordinator(record: &mut RunRecord, workspace: &str, tab: &str, pane: &
     c.blocked_reported = false;
 }
 
-/// A pane of a workspace with the coordinator's label in the run folder: a
-/// placement whose answer did not arrive.
-fn placed_before(snapshot: &Snapshot, label: &str, cwd: &str) -> Option<Placed> {
+/// A pane in the run folder that is empty or holds our agent: a placement
+/// whose answer did not arrive. The label is not compared, since a title
+/// edit changes it.
+fn placed_before(snapshot: &Snapshot, record: &AgentRecord, cwd: &str) -> Option<Placed> {
+    let ours = |agent: &crate::herdr::Agent| {
+        agent.kind.as_deref() == Some(record.kind.as_str())
+            && agent
+                .name
+                .as_deref()
+                .is_none_or(|n| n.is_empty() || n == record.agent_name)
+    };
     snapshot
         .panes
         .values()
-        .filter(|p| snapshot.workspaces.get(&p.workspace).map(String::as_str) == Some(label))
-        .find(|p| p.cwd.as_deref() == Some(cwd) || p.foreground_cwd.as_deref() == Some(cwd))
+        .filter(|p| p.cwd.as_deref() == Some(cwd) || p.foreground_cwd.as_deref() == Some(cwd))
+        .find(|p| snapshot.agents.iter().filter(|a| a.pane == p.id).all(ours))
         .map(|p| Placed {
             workspace: p.workspace.clone(),
             tab: p.tab.clone(),
@@ -63,6 +71,15 @@ fn placed_before(snapshot: &Snapshot, label: &str, cwd: &str) -> Option<Placed> 
             cwd: cwd.to_string(),
             worktree_path: None,
         })
+}
+
+/// A prompt whose answer was lost counts as delivered: a missed one is
+/// recovered by the nudge, a doubled one is not.
+pub(super) fn delivered(result: Result<(), HerdrError>) -> Result<(), HerdrError> {
+    match result {
+        Err(HerdrError::OutcomeUnknown(_)) => Ok(()),
+        other => other,
+    }
 }
 
 fn pane_is_empty(snapshot: &Snapshot, pane: &str) -> bool {
@@ -125,11 +142,15 @@ impl Reconciler {
                 .await?;
                 Ok(())
             }
-            // The next snapshot shows whether it was placed; Herdr down does
-            // not count as an attempt.
-            Err(HerdrError::OutcomeUnknown(_) | HerdrError::NotSent(_)) => {
+            // The next snapshot shows whether it was placed.
+            Err(HerdrError::OutcomeUnknown(_)) => {
                 let at = now.to_string();
                 update_run(run, move |r| r.coordinator.last_attempt_at = at).await?;
+                Ok(())
+            }
+            // Herdr down is not an attempt; the next one waits 15 s.
+            Err(HerdrError::NotSent(_)) => {
+                self.not_sent.insert(key.clone(), now);
                 Ok(())
             }
             Err(error) => self.attempt_failed(run, key, &error.to_string(), now).await,
@@ -152,12 +173,38 @@ impl Reconciler {
                 Ok(())
             }
             Err(HerdrError::NotSent(_)) => {
-                let at = now.to_string();
-                self.set_agent(run, key, move |a| a.last_attempt_at = at)
-                    .await
+                self.not_sent.insert(key.clone(), now);
+                Ok(())
             }
             Err(error) => self.attempt_failed(run, key, &error.to_string(), now).await,
         }
+    }
+
+    /// A start Herdr has not detected once the grace ended counts as an
+    /// unsuccessful attempt, so a start that never shows ends after three.
+    async fn expire_undetected(
+        &mut self,
+        snapshot: &Snapshot,
+        run: &Run,
+        now: Timestamp,
+    ) -> Result<()> {
+        let expired: Vec<(AgentKey, String)> = self
+            .launched
+            .iter()
+            .filter(|(key, (_, at))| {
+                key.run == run.key && now.duration_since(*at) >= DETECTION_GRACE
+            })
+            .map(|(key, (pane, _))| (key.clone(), pane.clone()))
+            .collect();
+        for (key, pane) in expired {
+            self.launched.remove(&key);
+            if pane_is_empty(snapshot, &pane) {
+                let grace = DETECTION_GRACE.as_secs();
+                let error = format!("Herdr did not detect the agent within {grace} s");
+                self.attempt_failed(run, &key, &error, now).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Counts a failed placement or start; the third fails the agent.
@@ -233,6 +280,8 @@ impl Reconciler {
         if record.status != Status::Active {
             return Ok(());
         }
+        self.expire_undetected(snapshot, run, now).await?;
+        let record = run.record()?;
         let coordinator_key = AgentKey::coordinator(&run.key);
         let c = &record.coordinator;
         if c.status == AgentStatus::Pending
@@ -284,7 +333,7 @@ impl Reconciler {
         coordinator::write_priming(run, record, &self.bin)?;
         let cwd = run.canonical_dir().to_string_lossy().into_owned();
         let label = coordinator::workspace_label(record);
-        if let Some(found) = placed_before(snapshot, &label, &cwd) {
+        if let Some(found) = placed_before(snapshot, &record.coordinator, &cwd) {
             update_run(run, move |r| {
                 if r.coordinator.status == AgentStatus::Pending {
                     place_coordinator(r, &found.workspace.0, &found.tab, &found.pane.0, &found.cwd);
@@ -293,10 +342,11 @@ impl Reconciler {
             .await?;
             return Ok(());
         }
-        if attempt_due(&record.coordinator).is_some_and(|at| at > now) {
+        let key = AgentKey::coordinator(&run.key);
+        if self.waits(&key, &record.coordinator, now) {
             return Ok(());
         }
-        let key = AgentKey::coordinator(&run.key);
+        self.not_sent.remove(&key);
         self.in_flight.insert(key.clone(), Effect::Place);
         let (herdr, done) = (d.herdr.clone(), self.effects.clone());
         tokio::spawn(async move {
@@ -321,7 +371,7 @@ impl Reconciler {
             || !agent.prompt_pending
             || self.in_flight.contains_key(key)
             || !pane_is_empty(snapshot, &agent.pane_id)
-            || attempt_due(agent).is_some_and(|at| at > now)
+            || self.waits(key, agent, now)
         {
             return Ok(false);
         }
@@ -339,6 +389,7 @@ impl Reconciler {
             }
         }
         self.launched.remove(key);
+        self.not_sent.remove(key);
         self.in_flight.insert(key.clone(), Effect::Start);
         let (herdr, done) = (d.herdr.clone(), self.effects.clone());
         let (key, name, kind, pane) = (
@@ -377,7 +428,8 @@ impl Reconciler {
         };
         self.launched.remove(&AgentKey::coordinator(&run.key));
         let text = coordinator::launch_prompt(&run.key, c.resume);
-        d.herdr.agent_prompt(&agent.pane, &text).await?;
+        delivered(d.herdr.agent_prompt(&agent.pane, &text).await)?;
+        self.prompted.insert(run.key.clone());
         update_run(run, |r| r.coordinator.prompt_pending = false).await?;
         Ok(())
     }
@@ -401,9 +453,8 @@ impl Reconciler {
             return Ok(());
         };
         self.launched.remove(&AgentKey::worker(&run.key, &w.id));
-        d.herdr
-            .agent_prompt(&agent.pane, &worker::launch_prompt(&run.key, &w.id))
-            .await?;
+        let prompt = worker::launch_prompt(&run.key, &w.id);
+        delivered(d.herdr.agent_prompt(&agent.pane, &prompt).await)?;
         let id = w.id.clone();
         self.guarded(run, move |run, lock| {
             let w = worker::update_held(run, lock, &id, |w| w.agent.prompt_pending = false)?;

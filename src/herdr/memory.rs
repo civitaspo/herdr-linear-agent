@@ -58,8 +58,13 @@ struct Model {
     pane_lag: u32,
     /// Panes that are not in snapshots yet, with the snapshots left.
     hidden_panes: BTreeMap<PaneId, u32>,
-    /// The next placement does its work, then answers `OutcomeUnknown`.
+    /// The next placement (`workspace.create`, `worktree.create`,
+    /// `worktree.open`) does its work, then answers `OutcomeUnknown`.
     placement_unknown: bool,
+    /// The next `agent.prompt` is delivered, then answers `OutcomeUnknown`.
+    prompt_unknown: bool,
+    /// The next `agent.start` fails as `NotSent` without doing anything.
+    start_not_sent: bool,
     /// Every request fails as `NotSent`.
     down: bool,
 }
@@ -226,6 +231,14 @@ impl FakeHerdr {
         self.model().placement_unknown = true;
     }
 
+    pub fn next_prompt_unknown(&self) {
+        self.model().prompt_unknown = true;
+    }
+
+    pub fn next_start_not_sent(&self) {
+        self.model().start_not_sent = true;
+    }
+
     pub fn set_down(&self, down: bool) {
         self.model().down = down;
     }
@@ -354,6 +367,11 @@ impl Herdr for FakeHerdr {
         args: &[String],
     ) -> Result<(), HerdrError> {
         let mut model = self.model();
+        if std::mem::take(&mut model.start_not_sent) {
+            return Err(HerdrError::NotSent(
+                "the fake Herdr dropped the start".into(),
+            ));
+        }
         model.request("agent.start")?;
         model.starts.push(Start {
             name: name.into(),
@@ -407,6 +425,9 @@ impl Herdr for FakeHerdr {
         model.request("agent.prompt")?;
         model.agent_in(pane)?;
         model.prompts.push((pane.clone(), text.into()));
+        if std::mem::take(&mut model.prompt_unknown) {
+            return Err(HerdrError::OutcomeUnknown("no answer in time".into()));
+        }
         Ok(())
     }
 

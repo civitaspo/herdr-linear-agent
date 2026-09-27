@@ -209,6 +209,10 @@ pub struct Reconciler {
     /// Per run, when a heartbeat was queued and no activity was reported
     /// sent since; the flush and its `ActivitySent` may be a pass apart.
     pub(super) heartbeats: BTreeMap<String, Timestamp>,
+    /// Runs whose coordinator got its launch prompt in this pass.
+    pub(super) prompted: BTreeSet<String>,
+    /// Agents whose last placement or start never reached Herdr, and when.
+    pub(super) not_sent: BTreeMap<AgentKey, Timestamp>,
     pub(super) queued: bool,
     pub(super) queries: Vec<RunQuery>,
 }
@@ -295,6 +299,18 @@ pub(super) fn attempt_due(record: &AgentRecord) -> Option<Timestamp> {
     after(&record.last_attempt_at, spacing(record.launch_attempts))
 }
 
+impl Reconciler {
+    /// Whether a placement or start of `key` must wait: for the spacing of
+    /// its counted attempts, or 15 s after one that never reached Herdr.
+    pub(super) fn waits(&self, key: &AgentKey, record: &AgentRecord, now: Timestamp) -> bool {
+        attempt_due(record).is_some_and(|at| at > now)
+            || self
+                .not_sent
+                .get(key)
+                .is_some_and(|at| *at + LAUNCH_SPACING > now)
+    }
+}
+
 /// The fields `track` owns, copied only where they changed, so a field
 /// another process wrote meanwhile is kept.
 pub(super) fn apply_tracked(target: &mut AgentRecord, before: &AgentRecord, after: &AgentRecord) {
@@ -339,6 +355,8 @@ impl Reconciler {
             failing: BTreeMap::new(),
             failure_notified: false,
             heartbeats: BTreeMap::new(),
+            prompted: BTreeSet::new(),
+            not_sent: BTreeMap::new(),
             queued: false,
             queries: Vec::new(),
         })
@@ -438,6 +456,10 @@ impl Reconciler {
             self.apply_event(d, level, snap, event, now).await;
         }
         self.intake(d, level, now).await;
+        if let Some(snapshot) = snap {
+            self.deliver_interrupts(d, snapshot).await;
+        }
+        self.prompted.clear();
         for effect in wake.effects {
             self.apply_effect(d, effect, now).await;
         }
@@ -574,6 +596,7 @@ impl Reconciler {
             }
         }
         times.extend(self.launched.values().map(|(_, at)| *at + DETECTION_GRACE));
+        times.extend(self.not_sent.values().map(|at| *at + LAUNCH_SPACING));
         times.extend(self.missing_since.values().map(|at| *at + PANE_GRACE));
         times.extend(self.reported.values().map(|(_, at)| *at + METADATA_REFRESH));
         if !self.failure_notified {

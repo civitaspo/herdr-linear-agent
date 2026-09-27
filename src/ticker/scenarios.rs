@@ -1023,3 +1023,156 @@ async fn a_failing_outbox_of_a_run_that_ended_raises_no_notice() {
         .collect();
     assert_eq!(notices, Vec::<String>::new());
 }
+
+// ---------------------------------------------------------------- Herdr effects
+
+#[tokio::test]
+async fn a_prompt_whose_answer_is_lost_counts_as_delivered() {
+    let mut world = World::sample();
+    world.herdr.next_prompt_unknown();
+    let pane = world.running_issue().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(to(&world, &pane), [LAUNCH]);
+
+    world.herdr.next_prompt_unknown();
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+    assert_eq!(world.actions(KEY), ["Start worker"]);
+
+    inbox::write(&world.run(KEY), "worker", "w1", "item").unwrap();
+    world.herdr.next_prompt_unknown();
+    world.later(120);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(count(&to(&world, &pane), NUDGE_INBOX), 1);
+}
+
+#[tokio::test]
+async fn a_coordinator_prompted_in_a_pass_is_not_nudged_in_it() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.later(120);
+    world.settle().await;
+    // A coordinator idle for two minutes whose launch prompt is due again,
+    // with an unseen item.
+    world
+        .run(KEY)
+        .update(|r| r.coordinator.prompt_pending = true)
+        .unwrap();
+    inbox::write(&world.run(KEY), "worker", "w1", "item").unwrap();
+    world.once().await;
+    assert_eq!(to(&world, &pane), [LAUNCH, LAUNCH]);
+}
+
+#[tokio::test]
+async fn a_stop_while_herdr_is_down_interrupts_once_herdr_is_back() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.herdr.set_down(true);
+    world.message(KEY, "user-1", "", Some("stop"));
+    world.settle().await;
+    assert!(world.record(KEY).stopped);
+    assert!(world.bodies(KEY, "response").is_empty(), "no count yet");
+
+    world.herdr.set_down(false);
+    world.later(5);
+    world.settle().await;
+    let keys: Vec<String> = world.herdr.keys().into_iter().map(|(_, k)| k).collect();
+    assert_eq!(keys, ["esc", "esc"]);
+    let answer = world.bodies(KEY, "response");
+    assert_eq!(answer.len(), 1);
+    assert!(answer[0].starts_with("Stopped 2 agent(s)"), "{answer:?}");
+}
+
+#[tokio::test]
+async fn a_detach_while_herdr_is_down_interrupts_once_herdr_is_back() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.herdr.set_down(true);
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    world.herdr.set_down(false);
+    world.later(5);
+    world.settle().await;
+    let keys: Vec<String> = world.herdr.keys().into_iter().map(|(_, k)| k).collect();
+    assert_eq!(keys, ["esc"]);
+    assert!(world.bodies(KEY, "response").is_empty());
+}
+
+#[tokio::test]
+async fn a_start_herdr_never_detects_counts_as_an_attempt() {
+    let mut world = World::sample();
+    world.herdr.delay_detection(1_000_000);
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+    for _ in 0..8 {
+        world.later(61);
+        world.settle().await;
+    }
+    assert_eq!(world.asked("agent.start"), 3);
+    let c = world.record(KEY).coordinator;
+    assert_eq!((c.status, c.launch_attempts), (AgentStatus::Failed, 3));
+    let errors = world.bodies(KEY, "error");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].starts_with("Could not start the coordinator agent: "),
+        "{errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_start_herdr_never_received_waits_fifteen_seconds_whatever_the_attempts() {
+    let mut world = World::sample();
+    world.herdr.fail_next_start("startup_failed");
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+    world.later(15);
+    world.herdr.fail_next_start("startup_failed");
+    world.settle().await;
+    assert_eq!(world.record(KEY).coordinator.launch_attempts, 2);
+    world.later(30);
+    world.herdr.next_start_not_sent();
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "the dropped start is not seen"
+    );
+    world.later(15);
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 3);
+    assert_eq!(world.record(KEY).coordinator.launch_attempts, 2);
+}
+
+#[tokio::test]
+async fn a_placement_without_an_answer_is_adopted_after_a_title_edit() {
+    let mut world = World::sample();
+    world.herdr.next_placement_unknown();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    while world.asked("workspace.create") == 0 {
+        world.once().await;
+    }
+    // The title changes while the answer is lost, and with it the label.
+    world
+        .run(KEY)
+        .update(|r| r.title = "Fix the login page".into())
+        .unwrap();
+    world.settle().await;
+    let panes = world.herdr.panes();
+    assert_eq!((world.asked("workspace.create"), panes.len()), (1, 1));
+    let c = world.record(KEY).coordinator;
+    assert_eq!(
+        (c.status, c.pane_id),
+        (AgentStatus::Open, panes[0].id.0.clone())
+    );
+    assert_eq!(to(&world, &panes[0].id.0), [LAUNCH]);
+}

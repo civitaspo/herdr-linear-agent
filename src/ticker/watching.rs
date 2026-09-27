@@ -410,6 +410,7 @@ impl Reconciler {
         let record = run.record()?;
         let c = &record.coordinator;
         if c.status != AgentStatus::Open
+            || self.prompted.contains(&run.key)
             || record.coordinator_lost
             || c.prompt_pending
             || record.stopped
@@ -445,7 +446,7 @@ impl Reconciler {
         } else {
             coordinator::NUDGE_INBOX
         };
-        if d.herdr.agent_prompt(&agent.pane, text).await.is_ok() {
+        if super::launch::delivered(d.herdr.agent_prompt(&agent.pane, text).await).is_ok() {
             self.nudged.insert(run.key.clone(), hash);
         }
         Ok(())

@@ -262,6 +262,54 @@ async fn fetch(runner: &dyn Runner, repo: &Repository) -> Result<()> {
     Ok(())
 }
 
+/// The path of the worktree that has `branch` checked out, from
+/// `git worktree list --porcelain` (blocks of `worktree <path>` and
+/// `branch refs/heads/<name>` lines).
+fn worktree_of(listing: &str, branch: &str) -> Option<String> {
+    let wanted = format!("branch refs/heads/{branch}");
+    listing.split("\n\n").find_map(|block| {
+        let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
+        block
+            .lines()
+            .any(|l| l.trim() == wanted)
+            .then(|| path.to_string())
+    })
+}
+
+async fn find_worktree(runner: &dyn Runner, repo_path: &str, branch: &str) -> Option<String> {
+    let out = runner
+        .run(&Cmd::new("git", GIT_TIMEOUT).args([
+            "-C",
+            repo_path,
+            "worktree",
+            "list",
+            "--porcelain",
+        ]))
+        .await
+        .ok()?;
+    out.success().then(|| worktree_of(&out.stdout, branch))?
+}
+
+/// `worktree.create`, except that a creation whose answer was lost is
+/// found by its branch and opened instead of failing or creating a second.
+async fn create_worktree<H: Herdr>(
+    runner: &dyn Runner,
+    herdr: &H,
+    repo_path: &str,
+    branch: &str,
+    base: &str,
+) -> Result<Placed, herdr::HerdrError> {
+    match herdr.worktree_create(repo_path, branch, base).await {
+        Err(herdr::HerdrError::OutcomeUnknown(detail)) => {
+            match find_worktree(runner, repo_path, branch).await {
+                Some(path) => herdr.worktree_open(&path).await,
+                None => Err(herdr::HerdrError::OutcomeUnknown(detail)),
+            }
+        }
+        other => other,
+    }
+}
+
 pub struct WorkerStart {
     pub repo: String,
     pub profile: String,
@@ -335,10 +383,14 @@ pub async fn worker_start<H: Herdr>(
         },
     )?;
     let base = format!("origin/{}", repo.base);
-    let placed = match session
-        .herdr
-        .worktree_create(&repo_path, &worker.branch, &base)
-        .await
+    let placed = match create_worktree(
+        ctx.runner,
+        &session.herdr,
+        &repo_path,
+        &worker.branch,
+        &base,
+    )
+    .await
     {
         Ok(placed) => placed,
         Err(error) => {
@@ -481,15 +533,24 @@ pub async fn worker_restart<H: Herdr>(
         check_agents(ctx, config.limits)?;
     }
     let placed = if w.worktree_path.is_empty() {
-        // The worktree was never created: place it again from its base.
         let repo = config.repository(&w.repo)?.clone();
-        fetch(ctx.runner, &repo).await?;
-        let base = format!("origin/{}", repo.base);
-        session
-            .herdr
-            .worktree_create(&repo.path.to_string_lossy(), &w.branch, &base)
-            .await
-            .with_context(|| format!("could not create the worktree for {id}"))?
+        let repo_path = repo.path.to_string_lossy().into_owned();
+        match find_worktree(ctx.runner, &repo_path, &w.branch).await {
+            // A creation whose answer was lost left the checkout behind.
+            Some(path) => session
+                .herdr
+                .worktree_open(&path)
+                .await
+                .with_context(|| format!("could not open the worktree of {id}"))?,
+            // The worktree was never created: place it again from its base.
+            None => {
+                fetch(ctx.runner, &repo).await?;
+                let base = format!("origin/{}", repo.base);
+                create_worktree(ctx.runner, &session.herdr, &repo_path, &w.branch, &base)
+                    .await
+                    .with_context(|| format!("could not create the worktree for {id}"))?
+            }
+        }
     } else {
         if !w.agent.workspace_id.is_empty() {
             // The checkout stays; a workspace that is already gone is fine.
@@ -783,6 +844,71 @@ mod tests {
             .unwrap();
         assert_eq!((w.agent.status, w.restarts), (AgentStatus::Open, 1));
         assert_eq!(setup.session.herdr.worktrees().len(), 1);
+    }
+
+    /// `git worktree list --porcelain` naming the fake's worktree of `branch`.
+    fn listing(setup: &Setup, branch: &str) -> String {
+        let path = setup
+            .home
+            .path()
+            .join("worktrees")
+            .join(branch.replace('/', "-"));
+        format!(
+            "worktree {}/src/api\nHEAD 1111\nbranch refs/heads/main\n\nworktree {}\nHEAD 2222\nbranch refs/heads/{branch}\n\n",
+            setup.home.path().display(),
+            path.display()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_worktree_created_without_an_answer_is_opened_not_failed() {
+        let setup = Setup::new(|c| c);
+        let branch = "herdr-linear-agent/data-1/w1-change-api";
+        setup
+            .runner
+            .on("worktree list --porcelain", ok(&listing(&setup, branch)));
+        setup.session.herdr.next_placement_unknown();
+        let w = setup.start("api", "standard").await.unwrap();
+        assert_eq!(w.agent.status, AgentStatus::Open);
+        assert_eq!(setup.session.herdr.worktrees().len(), 1);
+        let opened: Vec<String> = setup
+            .session
+            .herdr
+            .requests()
+            .into_iter()
+            .filter(|m| m.starts_with("worktree."))
+            .collect();
+        assert_eq!(opened, ["worktree.create", "worktree.open"]);
+        assert_eq!(w.agent.pane_id, "w2:p1");
+        assert!(
+            w.worktree_path
+                .ends_with("herdr-linear-agent-data-1-w1-change-api")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_opens_the_worktree_a_lost_answer_left_behind() {
+        let setup = Setup::new(|c| c);
+        setup.session.herdr.next_placement_unknown();
+        assert!(setup.start("api", "standard").await.is_err());
+        let failed = worker::load(&setup.run(), "w1").unwrap();
+        assert_eq!(failed.agent.status, AgentStatus::Failed);
+        setup.runner.on(
+            "worktree list --porcelain",
+            ok(&listing(&setup, &failed.branch)),
+        );
+        let w = worker_restart(&setup.ctx(), &setup.session, "DATA-1", "w1", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.session.herdr.worktrees().len(),
+            1,
+            "not created again"
+        );
+        assert_eq!(
+            (w.agent.status, w.agent.pane_id.as_str()),
+            (AgentStatus::Open, "w2:p1")
+        );
     }
 
     #[tokio::test]

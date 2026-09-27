@@ -116,6 +116,16 @@ pub struct AgentRecord {
     pub blocked_reported: bool,
 }
 
+/// Escape keys the run still owes its agents: a stop or a detach decided
+/// while no snapshot showed where they run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Interrupt {
+    /// Posts `Stopped <n> agent(s) ...` once the keys went out.
+    Stop,
+    Detach,
+}
+
 /// A coordinator routing job running as a child process.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
@@ -167,6 +177,8 @@ pub struct RunRecord {
     /// The claim's `Picked up <KEY>.` thought is not queued yet. A record
     /// of an older build lacks the field and reads as announced.
     pub announce_pending: bool,
+    /// Sent by the next pass that has a snapshot.
+    pub interrupt: Option<Interrupt>,
 }
 
 #[derive(Debug, Clone)]

@@ -193,6 +193,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `timeout_asked` | the timeout question is open |
 | `coordinator_lost` | the coordinator's pane is gone and the resume question was asked |
 | `stopped` | a person pressed stop; no prompt or heartbeat goes out until they reply |
+| `interrupt` | `stop` or `detach`: Escape keys still owed to the run's agents, sent by the first pass with a snapshot |
 | `announce_pending` | the claim's `Picked up <KEY>.` thought is not queued yet; missing in an older record, which reads as announced |
 
 Agent record (coordinator and every worker's `agent`):
@@ -563,7 +564,7 @@ For every active run with a session, per update, in this order. A read that star
 5. Set the run `closed` and the coordinator `stopped`. Log the close line.
 6. A closed run is left alone: nothing is started for it. Reopened and still delegated, it becomes active with the coordinator resumed from its session (`--resume sess-...`). `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it` (two workspaces closed, worker `stopped`).
 
-`detach_run`: interrupt the agents, set the run `detached`, log. Workspaces stay. Delegated again, the run is active again. `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it`
+`detach_run`: set the run `detached` with a pending interrupt (`interrupt = detach`, cleared when the run becomes active again), log; the first pass with a snapshot interrupts the agents and posts nothing. Workspaces stay. `tests/scenarios:a_detach_while_herdr_is_down_interrupts_once_herdr_is_back` Delegated again, the run is active again. `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it`
 
 Checkouts and branches are never removed.
 
@@ -572,14 +573,14 @@ Checkouts and branches are never removed.
 `relay(run, prompts)`, prompts oldest first. Nothing happens for an empty list. For each prompt:
 
 - A user not in `linear.allowed_user_ids`: append to `.state/ignored-prompts.md`; nothing else. Stop signals from such users are ignored too.
-- Signal `stop` from an allowed user: interrupt the agents, set `stopped = true`, queue the response `Stopped <n> agent(s) as asked. Their worktrees are kept; reply here to continue.`
+- Signal `stop` from an allowed user: set `stopped = true` and a pending interrupt (`interrupt = stop`). The first pass with a snapshot, which may be this one, interrupts the agents, clears it and queues the response `Stopped <n> agent(s) as asked. Their worktrees are kept; reply here to continue.` with the true count. `tests/scenarios:a_stop_while_herdr_is_down_interrupts_once_herdr_is_back`
 - Any other allowed prompt:
   1. Append it to `conversation.md`.
   2. Write an inbox item (kind `reply`, subject `reply`): `A new reply from user <user id> is in conversation.md.`
   3. Set `stopped = false`. When `timeout_asked`, clear it and set `timeout_since = now`.
   4. When `coordinator_lost` and the trimmed body equals `resume` case-insensitively: clear `coordinator_lost`, set the coordinator `pending`, `resume = agent_session non-empty`, `launch_attempts = 0`.
 
-The Linear task may read with the query of an earlier pass, so a prompt created at or before the record's current `prompt_cursor` is dropped. Each prompt, ignored ones included, moves `prompt_cursor` to its `createdAt` in the critical section that records it (the conversation entry and the record fields, the ignored-prompts entry, or the stop and its response); a reply's inbox item is written just before. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`, `tests/scenarios:a_prompt_read_again_with_an_old_cursor_is_relayed_once`
+The Linear task may read with the query of an earlier pass, so a prompt created at or before the record's current `prompt_cursor` is dropped. Each prompt, ignored ones included, moves `prompt_cursor` to its `createdAt` in the critical section that records it (the conversation entry and the record fields, the ignored-prompts entry, or the stop and its pending interrupt); a reply's inbox item is written just before. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`, `tests/scenarios:a_prompt_read_again_with_an_old_cursor_is_relayed_once`
 
 Interrupting sends `esc` to the coordinator's pane and to every `open` worker's pane, for each agent found by identity; the count is the number of successful sends. With a coordinator and one worker the count is 2. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
 
@@ -697,7 +698,7 @@ For an active run whose coordinator is `pending`:
    - `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
 2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused.
 3. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` from the root pane; set `status open`, `prompt_pending true`, `launch_attempts 0`.
-4. `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane of a workspace with the run's label whose cwd is `canonical_dir` is adopted instead of creating a second workspace. Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
+4. `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane whose cwd is `canonical_dir` and that is empty or holds our agent (kind and name) is adopted instead of creating a second workspace; the label is not compared, since a title edit changes it. With our agent in it, the adopted coordinator is prompted, not started. `tests/scenarios:a_placement_without_an_answer_is_adopted_after_a_title_edit` Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 
 A placement failure counts as a launch attempt (see below); `NotSent` and `OutcomeUnknown` do not.
 
@@ -706,7 +707,7 @@ A placement failure counts as a launch attempt (see below); `NotSent` and `Outco
 For each `open` agent of the run with `prompt_pending` (coordinator first, then workers by id):
 
 - Start only when the pane exists and no agent is in it (the pane is at its shell prompt). An agent already in the pane (for example one left `blocked` by `agent_not_ready`) is never started again.
-- At most one start per run per pass. **Timing change:** in the rewrite a run has at most one start in flight, and the next start waits until the previous one's outcome is known. `agent.start` runs as an effect task; after it answers (or its answer is lost) the agent is not started again in that pane for 60 s while Herdr has not detected it.
+- At most one start per run per pass. **Timing change:** in the rewrite a run has at most one start in flight, and the next start waits until the previous one's outcome is known. `agent.start` runs as an effect task; after it answers (or its answer is lost) the agent is not started again in that pane for 60 s while Herdr has not detected it. When the 60 s end and the pane is still empty, that counts as an unsuccessful attempt with the error `Herdr did not detect the agent within 60 s`, so a start that never shows ends after three. `tests/scenarios:a_start_herdr_never_detects_counts_as_an_attempt`
 - Arguments: `profile_args(profile)`, then `resume_args(kind, agent_session)` when `resume` is set and the arguments exist. Examples: a `coordinator-light` start ends `-- --model sonnet`; a resumed coordinator ends `--resume sess-data-1-coordinator`; a `standard` worker ends `--model sonnet --effort high --permission-mode auto`; a `deep` worker includes `model_reasoning_effort=xhigh`. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:restarts_switch_profiles_and_are_limited`
 - Trust dialog: when `claude.auto_accept_trust_dialog` is true and the kind is `claude`, right before the start, trust the coordinator's `canonical_dir`, or the worker's worktree (its `cwd`) and its repository's main checkout (`repo_path`). Nothing is trusted when the option is off. `tests/scenarios:the_trust_dialog_is_accepted_only_when_enabled`
 - `claude_trust.trust(env, dirs)`: the config is `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`. A missing file is left missing; a file whose top level is not an object is left alone. For each non-empty folder, set `projects.<folder>.hasTrustDialogAccepted = true` when it is not already true, keeping every other key, the key order and the file mode (0600 when unknown). Write through `.claude.json.hla.<pid>.tmp` and a rename. Returns whether the file changed. `src/claude_trust.rs:trust_is_added_once_and_everything_else_is_kept`, `src/claude_trust.rs:a_missing_or_unexpected_config_is_left_alone`
@@ -714,11 +715,11 @@ For each `open` agent of the run with `prompt_pending` (coordinator first, then 
   - Success: the agent is running; the prompt is still pending.
   - Error `agent_not_ready`: the agent exists in the pane but is not ready (a trust or permission dialog); keep `open` and `prompt_pending`; the needs-a-person rules take over. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
   - Any other error: increase `launch_attempts`. After 3 attempts, set `failed` with `error` = the message and queue an error activity (see decision 6).
-  - Attempts are spaced: after an unsuccessful attempt the next one waits 15 s, doubling with every counted attempt (`last_attempt_at`). `NotSent` (Herdr down) waits 15 s and does not count.
+  - Attempts are spaced: after an unsuccessful attempt the next one waits 15 s, doubling with every counted attempt (`last_attempt_at`). `NotSent` (Herdr down), for a placement or a start, waits a fixed 15 s whatever the count, does not count, and is kept in memory only. `tests/scenarios:a_start_herdr_never_received_waits_fifteen_seconds_whatever_the_attempts`
 
 ### Launch prompt
 
-When `prompt_pending` and our agent is in the pane and ready for input (idle or done), send the prompt and clear `prompt_pending`. It goes out once. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
+When `prompt_pending` and our agent is in the pane and ready for input (idle or done), send the prompt and clear `prompt_pending`. It goes out once: a prompt whose answer was lost (`OutcomeUnknown`) counts as delivered, and for a worker the `Start worker` action is queued, since a missed prompt is recovered by the nudge and a doubled one is not. `tests/scenarios:a_prompt_whose_answer_is_lost_counts_as_delivered` `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 
 | Agent | Prompt |
 | --- | --- |
@@ -735,6 +736,8 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 - Constants: `NUDGE_REPLY` = `[herdr-linear-agent ticker] There is a new reply in Linear. Run context.`; `NUDGE_INBOX` = `[herdr-linear-agent ticker] There are new inbox items. Run context.`
 - Condition: the coordinator is `open`, not lost, its launch prompt is delivered, its status is `idle` for at least 60 s (`COORDINATOR_IDLE_SECS`), the run is neither `stopped` nor `timeout_asked`, and unseen inbox items exist (unhandled and not marked seen).
 - The prompt is `NUDGE_REPLY` when any unseen item has kind `reply`, else `NUDGE_INBOX`.
+- No nudge in the pass that delivered the coordinator's launch prompt. `tests/scenarios:a_coordinator_prompted_in_a_pass_is_not_nudged_in_it`
+- A nudge whose answer was lost counts as sent.
 - One nudge per set of items: the ticker keeps, per run, a hash of the unseen item ids it last nudged about, and nudges again only when that set changes. The memory is in-process; a new ticker may nudge once more.
 - Pinned: `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (inbox nudge once), `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts` (reply nudge), `tests/scenarios:a_stop_holds_prompts_until_the_next_reply` (no nudge while stopped; after the next reply, `NUDGE_REPLY` although a worker item is also unseen), `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue` (no nudge while the timeout question is open).
 
@@ -864,7 +867,7 @@ A worker counts against `max_agents` when its status is `pending` or `open`.
 2. Checks, in this order: the repository is in the catalog; the profile is a worker profile (`not a worker profile`); no other worker of the run uses the repository (message contains `one worker per repository`); the run has fewer than `max_workers_per_run` workers (message contains `max_workers_per_run`); the agent count leaves room under `max_agents`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold`
 3. Allocate the id. Branch: `branch_name(KEY, id, title)`.
 4. `git -C <repo path> fetch origin <base>` (60 s).
-5. `worktree.create` with `cwd` = repo path, `branch`, `base` = `origin/<base>`, not focused. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` and `worktree_path` from the result.
+5. `worktree.create` with `cwd` = repo path, `branch`, `base` = `origin/<base>`, not focused. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` and `worktree_path` from the result. When its answer is lost (`OutcomeUnknown`), look for the branch's worktree in `git -C <repo path> worktree list --porcelain` (10 s); when it exists, open it with `worktree.open` and go on, else mark the worker failed. `src/commands.rs:a_worktree_created_without_an_answer_is_opened_not_failed`
 6. Add `.herdr-linear-agent/` to the repository's shared `info/exclude` (the common git dir, so every worktree is covered), once. A failure here does not fail the command. `tests/commands:exclude_is_added_once_to_the_shared_file` (git status stays clean with files under `.herdr-linear-agent/`); the scenario World fails every `git -C` except the fetch and the command still succeeds.
 7. Write `workers/<id>.task.md` and `<brief_dir>/brief.md`.
 8. Set the agent `open`, `prompt_pending`, `profile`, `kind`, `agent_name = <key>-<id>`.
@@ -895,6 +898,7 @@ Input: issue key, title, URL, worker, task, restart flag, binary. Order in the t
 
 - At most 2 restarts per worker; the third fails with a message containing `limit is 2`.
 - A new profile must be a worker profile; without one the profile stays.
+- A worker without a `worktree_path` first looks for its branch's worktree (`git worktree list --porcelain`) and opens it when it exists; otherwise it is placed again from its base. `src/commands.rs:a_restart_opens_the_worktree_a_lost_answer_left_behind`
 - Close the old workspace (the checkout stays), open the kept worktree again with `worktree.open` and `path` = `worktree_path`, record the new pane, rewrite the brief with the restart note, set `restarts += 1`, `kind` of the profile, `open`, `prompt_pending`, `launch_attempts = 0`. The ticker starts it in a later pass with the new profile's arguments.
 - `tests/scenarios:restarts_switch_profiles_and_are_limited` (kind `codex`, restarts 1, one workspace closed, `previous attempt` in the brief, `model_reasoning_effort=xhigh` in the next start).
 

@@ -13,7 +13,7 @@ use crate::herdr::{Herdr, Snapshot, WorkspaceId};
 use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Label, Prompt, RunUpdate};
 use crate::linear::task::{LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
-use crate::run::{AgentRecord, AgentStatus, Run, RunRecord, Status};
+use crate::run::{AgentRecord, AgentStatus, Interrupt, Run, RunRecord, Status};
 use crate::{coordinator, files, routing, worker};
 
 /// Whether a prompt created at `created` is newer than the cursor. Both are
@@ -140,7 +140,7 @@ impl Reconciler {
         }
         if level.app_user.is_some() && issue.delegate_id != level.app_user {
             self.changed_at.insert(record.issue_id.clone(), read_at);
-            return self.detach_run(d, snap, run).await;
+            return self.detach_run(d, run).await;
         }
         if let Some(detail) = detail {
             self.refresh_issue(run, record, &detail).await?;
@@ -148,7 +148,7 @@ impl Reconciler {
                 self.finish_claim(d, run, &detail).await?;
             }
         }
-        self.relay(d, snap, run, &update.prompts, now).await
+        self.relay(d, run, &update.prompts, now).await
     }
 
     /// Rewrites `issue.md` and tells the coordinator when a person edited
@@ -195,7 +195,6 @@ impl Reconciler {
     async fn relay<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
-        snap: Option<&Snapshot>,
         run: &Run,
         prompts: &[Prompt],
         now: Timestamp,
@@ -221,19 +220,14 @@ impl Reconciler {
                 continue;
             }
             if prompt.signal.as_deref() == Some("stop") {
-                let stopped = self.interrupt_agents(d, snap, run).await;
-                self.update_and_push(run, move |r| {
-                    if !after_cursor(&created, &r.prompt_cursor) {
-                        return Vec::new();
+                // The keys and the response follow in the first pass with a
+                // snapshot, which may be this one.
+                update_run(run, move |r| {
+                    if after_cursor(&created, &r.prompt_cursor) {
+                        r.prompt_cursor = created;
+                        r.stopped = true;
+                        r.interrupt = Some(Interrupt::Stop);
                     }
-                    r.prompt_cursor = created;
-                    r.stopped = true;
-                    let body = format!(
-                        "Stopped {stopped} agent(s) as asked. Their worktrees are kept; reply here to continue."
-                    );
-                    vec![Op::Activity {
-                        activity: Activity::new(Content::Response { body }),
-                    }]
                 })
                 .await?;
                 continue;
@@ -277,6 +271,36 @@ impl Reconciler {
             .await?;
         }
         Ok(())
+    }
+
+    /// Sends the Escape keys a stop or a detach left pending, and after a
+    /// stop posts how many agents it reached.
+    pub(super) async fn deliver_interrupts<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        snapshot: &Snapshot,
+    ) {
+        for run in Run::list(&d.ctx.runs_dir()) {
+            if !run.record().is_ok_and(|r| r.interrupt.is_some()) {
+                continue;
+            }
+            let stopped = self.interrupt_agents(d, Some(snapshot), &run).await;
+            let result = self
+                .update_and_push(&run, move |r| match r.interrupt.take() {
+                    Some(Interrupt::Stop) => vec![Op::Activity {
+                        activity: Activity::new(Content::Response {
+                            body: format!(
+                                "Stopped {stopped} agent(s) as asked. Their worktrees are kept; reply here to continue."
+                            ),
+                        }),
+                    }],
+                    _ => Vec::new(),
+                })
+                .await;
+            if let Err(error) = result {
+                d.fail(&run.key, &error);
+            }
+        }
     }
 
     /// Escape in the coordinator's and every open worker's pane, for each
@@ -370,14 +394,13 @@ impl Reconciler {
     }
 
     /// The delegation was removed: stop the agents, keep the workspaces.
-    async fn detach_run<H: Herdr>(
-        &mut self,
-        d: &Deps<'_, H>,
-        snap: Option<&Snapshot>,
-        run: &Run,
-    ) -> Result<()> {
-        self.interrupt_agents(d, snap, run).await;
-        update_run(run, |r| r.status = Status::Detached).await?;
+    /// The keys go out in the first pass with a snapshot.
+    async fn detach_run<H: Herdr>(&mut self, d: &Deps<'_, H>, run: &Run) -> Result<()> {
+        update_run(run, |r| {
+            r.status = Status::Detached;
+            r.interrupt.get_or_insert(Interrupt::Detach);
+        })
+        .await?;
         d.log
             .line(&format!("{}: detached (no longer delegated)", run.key));
         Ok(())
@@ -447,6 +470,9 @@ impl Reconciler {
                 return Vec::new();
             }
             r.status = Status::Active;
+            if r.interrupt == Some(Interrupt::Detach) {
+                r.interrupt = None;
+            }
             // A closed run's coordinator was stopped: bring it back.
             if r.coordinator.status == AgentStatus::Stopped {
                 r.coordinator.status = AgentStatus::Pending;
