@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - lock file maintenance (#34)
 
+
+### Refactor
+
+- rewrite the remaining helpers and drop the herdr-projects attribution (#39)
+
 ## [0.1.0] - 2026-09-27
 
 
