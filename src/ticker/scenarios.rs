@@ -1427,7 +1427,10 @@ async fn a_run_under_every_lag_knob_writes_each_fact_once() {
 async fn a_coordinator_seen_again_in_its_pane_is_no_longer_lost_and_gets_its_reply() {
     let mut world = World::sample();
     let pane = world.running_issue().await;
-    world.run(KEY).update(|r| r.coordinator_lost = true).unwrap();
+    world
+        .run(KEY)
+        .update(|r| r.coordinator_lost = true)
+        .unwrap();
 
     world.message(KEY, "user-1", "Try again, please.", None);
     world.later(120);
