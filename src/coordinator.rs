@@ -44,26 +44,21 @@ pub fn sheet(bin: &str, key: &str) -> String {
 }
 
 pub fn agents_md(bin: &str, record: &RunRecord, instructions: Option<&str>) -> String {
-    let mut text = format!(
+    format!(
         "# herdr-linear-agent run {key}\n\n\
          If your working directory is this folder, you are the coordinator of the herdr-linear-agent run for the Linear issue {key} ({title}).\n\n\
          Run `{bin} skill {key}` now and follow the sheet it prints. Then run `{bin} context {key}` at the start of every turn.\n",
         key = record.identifier,
         title = record.title.replace('\n', " "),
-    );
-    if let Some(extra) = instructions.filter(|t| !t.trim().is_empty()) {
-        text.push_str(&profile_section(
-            &record.coordinator.profile,
-            "the sheet",
-            extra,
-        ));
-    }
-    text
+    ) + &profile_section(&record.coordinator.profile, "the sheet", instructions)
 }
 
 /// A profile's own `instructions`, after the built-in rules they may not
-/// override.
-pub fn profile_section(profile: &str, rules: &str, instructions: &str) -> String {
+/// override; nothing when the profile has none.
+pub fn profile_section(profile: &str, rules: &str, instructions: Option<&str>) -> String {
+    let Some(instructions) = instructions.filter(|t| !t.trim().is_empty()) else {
+        return String::new();
+    };
     format!(
         "\n## Profile instructions\n\n\
          These come from the `{profile}` profile in the plugin's config and add to {rules}. \

@@ -309,13 +309,11 @@ pub fn compose_brief(input: &BriefInput) -> String {
         );
     }
     text.push_str(include_str!("../assets/WORKER.md").trim_end());
-    if let Some(extra) = input.instructions.filter(|t| !t.trim().is_empty()) {
-        text.push_str(&crate::coordinator::profile_section(
-            &w.agent.profile,
-            "the rules above",
-            extra,
-        ));
-    }
+    text.push_str(&crate::coordinator::profile_section(
+        &w.agent.profile,
+        "the rules above",
+        input.instructions,
+    ));
     text.push_str(&format!(
         "\n\n## Progress\n\n\
          Tell the plugin how far you are whenever your activity changes:\n\n\

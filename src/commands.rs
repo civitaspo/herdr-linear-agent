@@ -415,12 +415,18 @@ pub async fn worker_start<H: Herdr>(
             bail!("could not create the worktree for {}: {error}", worker.id);
         }
     };
-    let handover = Handover {
-        task: args.task.trim(),
-        restart: false,
-        instructions: profile.instructions.as_deref(),
-    };
-    let worker = place(ctx, &run, &record, worker, &placed, &handover).await?;
+    let instructions = profile.instructions.as_deref();
+    let worker = place(
+        ctx,
+        &run,
+        &record,
+        worker,
+        &placed,
+        args.task.trim(),
+        false,
+        instructions,
+    )
+    .await?;
     ticker::poke(&ctx.state_dir());
     println!(
         "{} is placed in {} on branch {}; herdr-linear-agent starts its agent shortly",
@@ -429,29 +435,19 @@ pub async fn worker_start<H: Herdr>(
     Ok(worker)
 }
 
-/// What a placement hands the worker: its task, whether it is a restart,
-/// and its profile's own instructions.
-struct Handover<'a> {
-    task: &'a str,
-    restart: bool,
-    instructions: Option<&'a str>,
-}
-
 /// Writes the task and the brief into the new pane's worktree and records
 /// the placement. The agent's own fields are reset for a fresh launch.
+#[allow(clippy::too_many_arguments)]
 async fn place(
     ctx: &Ctx<'_>,
     run: &Run,
     record: &RunRecord,
     mut worker: Worker,
     placed: &Placed,
-    handover: &Handover<'_>,
+    task: &str,
+    restart: bool,
+    instructions: Option<&str>,
 ) -> Result<Worker> {
-    let Handover {
-        task,
-        restart,
-        instructions,
-    } = *handover;
     let worktree = placed
         .worktree_path
         .clone()
@@ -641,12 +637,18 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.resume = false;
     })?;
     let task = std::fs::read_to_string(worker::task_path(&run, id)).unwrap_or_default();
-    let handover = Handover {
-        task: task.trim(),
-        restart: true,
-        instructions: profile.instructions.as_deref(),
-    };
-    let worker = place(ctx, &run, &record, reset, &placed, &handover).await?;
+    let instructions = profile.instructions.as_deref();
+    let worker = place(
+        ctx,
+        &run,
+        &record,
+        reset,
+        &placed,
+        task.trim(),
+        true,
+        instructions,
+    )
+    .await?;
     ticker::poke(&ctx.state_dir());
     println!(
         "{id} restarts in {} with the `{profile_name}` profile",

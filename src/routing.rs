@@ -12,8 +12,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::config::{Config, Profile};
@@ -149,52 +150,29 @@ pub fn input(issue: &IssueDetail) -> String {
 /// The candidate an answer names, checked against the same schema whatever
 /// the kind already enforced.
 pub fn pick(answer: &Value, candidates: &[Candidate]) -> Result<String, String> {
-    let object = answer
-        .as_object()
-        .ok_or_else(|| "not a JSON object".to_string())?;
-    if object.len() != 1 {
-        return Err("expected exactly the `coordinator` key".into());
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Answer {
+        coordinator: String,
     }
-    let name = object
-        .get("coordinator")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "no `coordinator` string".to_string())?;
-    candidates
-        .iter()
-        .find(|c| c.name == name)
-        .map(|c| c.name.clone())
-        .ok_or_else(|| format!("`{name}` is not a candidate"))
-}
-
-/// The call's working directory: a fresh empty folder, gone when the call
-/// ends. The only files in it are the ones a recipe needs (a schema).
-pub struct Sandbox {
-    root: PathBuf,
-}
-
-impl Sandbox {
-    pub fn new(parent: &Path) -> Result<Sandbox> {
-        let root = parent.join(format!("hla-routing-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("could not create {}", root.display()))?;
-        Ok(Sandbox { root })
+    // Serde would also accept `["name"]` for a struct.
+    if !answer.is_object() {
+        return Err("not a JSON object".into());
     }
-
-    pub fn dir(&self) -> &Path {
-        &self.root
-    }
-}
-
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+    let Answer { coordinator } = Answer::deserialize(answer).map_err(|e| e.to_string())?;
+    if candidates.iter().any(|c| c.name == coordinator) {
+        Ok(coordinator)
+    } else {
+        Err(format!("`{coordinator}` is not a candidate"))
     }
 }
 
 /// What a recipe builds the call from.
 struct Call<'a> {
     profile: &'a Profile,
-    sandbox: &'a Sandbox,
+    /// The call's working directory: a fresh folder, removed when the call
+    /// ends, holding only the files the recipe needs.
+    dir: &'a Path,
     schema: &'a Value,
     schema_path: &'a Path,
     instructions: &'a str,
@@ -345,7 +323,7 @@ const CODEX_DISABLED_FEATURES: &[&str] = &[
 /// overrides (docs/verification.md). `~/.codex/AGENTS.md` still loads, and
 /// the model keeps two code-mode tool definitions that cannot run.
 fn codex_invocation(call: &Call) -> Invocation {
-    let dir = call.sandbox.dir();
+    let dir = call.dir;
     let answer = dir.join("answer.json");
     let instructions_file = dir.join("instructions.md");
     let mut args: Vec<String> = [
@@ -437,14 +415,17 @@ async fn run(
 ) -> Result<Result<String, Fallback>> {
     let recipe = recipe(&profile.kind)
         .with_context(|| format!("the `{}` kind cannot be a routing agent", profile.kind))?;
-    let sandbox = Sandbox::new(parent)?;
+    let sandbox = tempfile::Builder::new()
+        .prefix("hla-routing-")
+        .tempdir_in(parent)
+        .with_context(|| format!("could not create a folder in {}", parent.display()))?;
     let schema = schema(candidates);
-    let schema_path = sandbox.dir().join("schema.json");
+    let schema_path = sandbox.path().join("schema.json");
     std::fs::write(&schema_path, schema.to_string())?;
     let instructions = instructions(candidates);
     let invocation = (recipe.invocation)(&Call {
         profile,
-        sandbox: &sandbox,
+        dir: sandbox.path(),
         schema: &schema,
         schema_path: &schema_path,
         instructions: &instructions,
@@ -454,7 +435,7 @@ async fn run(
     }
     let mut cmd = Command::new(&invocation.program);
     cmd.args(&invocation.args)
-        .current_dir(sandbox.dir())
+        .current_dir(sandbox.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -469,31 +450,28 @@ async fn run(
         .spawn()
         .with_context(|| format!("could not start the routing agent `{}`", invocation.program))?;
     let stdin_text = input(issue);
+    // A child past the timeout is dropped with the future and so killed.
     let finished = tokio::time::timeout(timeout, async {
         if let Some(mut stdin) = child.stdin.take() {
             // A child that exits early closes the pipe; its answer then decides.
             let _ = stdin.write_all(stdin_text.as_bytes()).await;
         }
-        let mut stdout = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            let _ = out.read_to_string(&mut stdout).await;
-        }
-        child.wait().await.map(|status| (status, stdout))
+        child.wait_with_output().await
     })
     .await;
-    let (status, stdout) = match finished {
-        Err(_) => {
-            let _ = child.kill().await;
-            return Ok(Err(Fallback::TimedOut));
-        }
-        Ok(result) => result.context("could not wait for the routing agent")?,
+    let Ok(output) = finished else {
+        return Ok(Err(Fallback::TimedOut));
     };
-    if !status.success() {
-        return Ok(Err(Fallback::Failed(format!("it exited with {status}"))));
+    let output = output.context("could not wait for the routing agent")?;
+    if !output.status.success() {
+        return Ok(Err(Fallback::Failed(format!(
+            "it exited with {}",
+            output.status
+        ))));
     }
     let text = match &invocation.answer_file {
         Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
-        None => stdout,
+        None => String::from_utf8_lossy(&output.stdout).into_owned(),
     };
     let Some(answer) = (recipe.answer)(&text) else {
         return Ok(Err(Fallback::Invalid("no JSON answer".into())));
@@ -675,7 +653,7 @@ mod tests {
             ),
             (
                 r#"{"structured_output":{"coordinator":"docs","why":"short"}}"#,
-                Fallback::Invalid("expected exactly the `coordinator` key".into()),
+                Fallback::Invalid("unknown field `why`, expected `coordinator`".into()),
             ),
             (
                 r#"{"result":"I think docs"}"#,
