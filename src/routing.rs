@@ -166,8 +166,8 @@ pub fn pick(answer: &Value, candidates: &[Candidate]) -> Result<String, String> 
         .ok_or_else(|| format!("`{name}` is not a candidate"))
 }
 
-/// An empty folder the call runs in, with its own HOME and config dir, gone
-/// when the call ends.
+/// The call's working directory: a fresh empty folder, gone when the call
+/// ends. The only files in it are the ones a recipe needs (a schema).
 pub struct Sandbox {
     root: PathBuf,
 }
@@ -175,32 +175,12 @@ pub struct Sandbox {
 impl Sandbox {
     pub fn new(parent: &Path) -> Result<Sandbox> {
         let root = parent.join(format!("hla-routing-{}", uuid::Uuid::new_v4().simple()));
-        for dir in ["cwd", "home", "config", "tmp"] {
-            std::fs::create_dir_all(root.join(dir))
-                .with_context(|| format!("could not create {}", root.display()))?;
-        }
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("could not create {}", root.display()))?;
         Ok(Sandbox { root })
     }
 
-    /// The working directory, which stays empty.
-    pub fn cwd(&self) -> PathBuf {
-        self.root.join("cwd")
-    }
-
-    pub fn home(&self) -> PathBuf {
-        self.root.join("home")
-    }
-
-    pub fn config(&self) -> PathBuf {
-        self.root.join("config")
-    }
-
-    pub fn tmp(&self) -> PathBuf {
-        self.root.join("tmp")
-    }
-
-    /// For files the call needs outside the working directory (a schema).
-    pub fn root(&self) -> &Path {
+    pub fn dir(&self) -> &Path {
         &self.root
     }
 }
@@ -211,22 +191,36 @@ impl Drop for Sandbox {
     }
 }
 
+/// What a recipe builds the call from.
+struct Call<'a> {
+    profile: &'a Profile,
+    sandbox: &'a Sandbox,
+    schema: &'a Value,
+    schema_path: &'a Path,
+    instructions: &'a str,
+}
+
 /// How one kind is run: its command line and environment, and where its
 /// answer lands.
 pub struct Invocation {
     pub program: String,
     pub args: Vec<String>,
+    /// Set on top of the ticker's own environment, which the call keeps
+    /// (the login of most kinds lives under the real HOME and config dir).
     pub env: Vec<(String, String)>,
     /// The answer file, when the kind writes one; otherwise standard output.
     pub answer_file: Option<PathBuf>,
 }
 
-/// A kind that can run with no context: every item of the specification is
-/// cut by the flags, settings and environment its function sets. The
-/// profile's `args` are never used, since they could bring context back.
+/// A kind that can be a routing agent: it runs headless, answers JSON, and
+/// its recipe cuts what the kind lets it cut of its default context (system
+/// prompt, tools, MCP, skills, plugins, hooks, settings, instruction files,
+/// memory, session persistence). The profile's `args` are never used.
+/// README.md ("Routing agent kinds") lists what each recipe cuts and what
+/// remains.
 struct Recipe {
     kind: &'static str,
-    invocation: fn(&Profile, &Sandbox, &Path, &str) -> Invocation,
+    invocation: fn(&Call) -> Invocation,
     /// The answer object inside what the kind printed or wrote.
     answer: fn(&str) -> Option<Value>,
 }
@@ -253,36 +247,52 @@ pub fn registered(kind: &str) -> bool {
     recipe(kind).is_some()
 }
 
-fn claude_invocation(
-    profile: &Profile,
-    sandbox: &Sandbox,
-    schema_path: &Path,
-    instructions: &str,
-) -> Invocation {
-    let _ = (sandbox, schema_path);
+/// Claude Code keeps its login under the real HOME and config dir (on macOS
+/// a Keychain entry tied to the config dir), so both stay; the flags and
+/// variables below cut the customizations they hold (docs/verification.md).
+fn claude_invocation(call: &Call) -> Invocation {
     let mut args = vec!["-p".to_string()];
-    if let Some(model) = &profile.model {
+    if let Some(model) = &call.profile.model {
         args.extend(["--model".into(), model.clone()]);
     }
-    if let Some(effort) = &profile.effort {
+    if let Some(effort) = &call.profile.effort {
         args.extend(["--effort".into(), effort.clone()]);
     }
     args.extend(
         [
+            "--safe-mode",
+            "--restricted",
+            "--setting-sources",
+            "",
             "--tools",
             "",
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+            "--disable-slash-commands",
             "--no-session-persistence",
             "--output-format",
             "json",
+            "--json-schema",
         ]
         .map(String::from),
     );
+    args.push(call.schema.to_string());
     args.push("--system-prompt".into());
-    args.push(instructions.to_string());
+    args.push(call.instructions.to_string());
+    let env = [
+        ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1".into()),
+        ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1".into()),
+        ("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1".into()),
+        ("ENABLE_CLAUDEAI_MCP_SERVERS", "false".into()),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()),
+    ]
+    .map(|(k, v)| (k.to_string(), v))
+    .to_vec();
     Invocation {
         program: "claude".into(),
         args,
-        env: Vec::new(),
+        env,
         answer_file: None,
     }
 }
@@ -296,18 +306,13 @@ fn claude_answer(text: &str) -> Option<Value> {
     serde_json::from_str(value.get("result")?.as_str()?.trim()).ok()
 }
 
-fn codex_invocation(
-    profile: &Profile,
-    sandbox: &Sandbox,
-    schema_path: &Path,
-    instructions: &str,
-) -> Invocation {
-    let answer = sandbox.root().join("answer.json");
+fn codex_invocation(call: &Call) -> Invocation {
+    let answer = call.sandbox.dir().join("answer.json");
     let mut args = vec!["exec".to_string()];
-    if let Some(model) = &profile.model {
+    if let Some(model) = &call.profile.model {
         args.extend(["-m".into(), model.clone()]);
     }
-    if let Some(effort) = &profile.effort {
+    if let Some(effort) = &call.profile.effort {
         args.extend(["-c".into(), format!("model_reasoning_effort={effort}")]);
     }
     args.extend(
@@ -320,10 +325,10 @@ fn codex_invocation(
         ]
         .map(String::from),
     );
-    args.push(schema_path.to_string_lossy().into_owned());
+    args.push(call.schema_path.to_string_lossy().into_owned());
     args.push("-o".into());
     args.push(answer.to_string_lossy().into_owned());
-    args.push(instructions.to_string());
+    args.push(call.instructions.to_string());
     Invocation {
         program: "codex".into(),
         args,
@@ -364,16 +369,20 @@ async fn run(
     let recipe = recipe(&profile.kind)
         .with_context(|| format!("the `{}` kind cannot be a routing agent", profile.kind))?;
     let sandbox = Sandbox::new(parent)?;
-    let schema_path = sandbox.root().join("schema.json");
-    std::fs::write(&schema_path, schema(candidates).to_string())?;
-    let invocation =
-        (recipe.invocation)(profile, &sandbox, &schema_path, &instructions(candidates));
+    let schema = schema(candidates);
+    let schema_path = sandbox.dir().join("schema.json");
+    std::fs::write(&schema_path, schema.to_string())?;
+    let instructions = instructions(candidates);
+    let invocation = (recipe.invocation)(&Call {
+        profile,
+        sandbox: &sandbox,
+        schema: &schema,
+        schema_path: &schema_path,
+        instructions: &instructions,
+    });
     let mut cmd = Command::new(&invocation.program);
     cmd.args(&invocation.args)
-        .current_dir(sandbox.cwd())
-        .env_clear()
-        .env("HOME", sandbox.home())
-        .env("TMPDIR", sandbox.tmp())
+        .current_dir(sandbox.dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -422,5 +431,287 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+    use crate::linear::api::{Label, Team, WorkflowState};
+
+    fn issue() -> IssueDetail {
+        IssueDetail {
+            id: "issue-1".into(),
+            identifier: "DATA-1".into(),
+            title: "Fix the login".into(),
+            url: "https://linear.app/acme/issue/DATA-1".into(),
+            description: "The session expires too early.".into(),
+            updated_at: "2026-09-28T00:00:00Z".into(),
+            estimate: Some(3.0),
+            state: WorkflowState {
+                id: "todo".into(),
+                name: "Todo".into(),
+                r#type: "unstarted".into(),
+                position: 1.0,
+            },
+            delegate_id: None,
+            team: Team {
+                id: "team-1".into(),
+                key: "DATA".into(),
+                name: "Data".into(),
+                estimation_type: "fibonacci".into(),
+                states: Vec::new(),
+            },
+            labels: vec![
+                Label {
+                    name: "bug".into(),
+                    group: None,
+                },
+                Label {
+                    name: "S".into(),
+                    group: Some("Size".into()),
+                },
+            ],
+            comments: Vec::new(),
+        }
+    }
+
+    fn two() -> Vec<Candidate> {
+        vec![
+            Candidate {
+                name: "coordinator".into(),
+                description: "default coordinator".into(),
+            },
+            Candidate {
+                name: "docs".into(),
+                description: "documentation changes".into(),
+            },
+        ]
+    }
+
+    fn profile(kind: &str) -> Profile {
+        Profile {
+            kind: kind.into(),
+            model: Some("small".into()),
+            effort: Some("low".into()),
+            args: vec!["--dangerously-skip-permissions".into()],
+            description: String::new(),
+            instructions: None,
+        }
+    }
+
+    /// A folder with a fake CLI that records what it was given into `seen/`
+    /// and prints `answer` (for `claude`) or writes it to its `-o` file.
+    struct Fake {
+        dir: tempfile::TempDir,
+    }
+
+    impl Fake {
+        fn new(kind: &str, answer: &str) -> Fake {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("bin");
+            let seen = dir.path().join("seen");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&seen).unwrap();
+            let deliver = if kind == "codex" {
+                format!(
+                    "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=\"$2\"; shift; done\necho '{answer}' > \"$out\"\n"
+                )
+            } else {
+                format!("echo '{answer}'\n")
+            };
+            let script = format!(
+                "#!/bin/sh\n\
+                 seen={seen}\n\
+                 printf '%s\\n' \"$@\" > $seen/args\n\
+                 pwd > $seen/cwd\n\
+                 ls -A > $seen/cwd-contents\n\
+                 env | sort > $seen/env\n\
+                 cat > $seen/stdin\n\
+                 {deliver}",
+                seen = seen.display()
+            );
+            let path = bin.join(kind);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Fake { dir }
+        }
+
+        fn path(&self) -> String {
+            format!("{}:/usr/bin:/bin", self.dir.path().join("bin").display())
+        }
+
+        fn parent(&self) -> PathBuf {
+            let parent = self.dir.path().join("tmp");
+            std::fs::create_dir_all(&parent).unwrap();
+            parent
+        }
+
+        fn seen(&self, what: &str) -> String {
+            std::fs::read_to_string(self.dir.path().join("seen").join(what)).unwrap_or_default()
+        }
+
+        async fn choose(&self, kind: &str, timeout: Duration) -> Choice {
+            let path = self.path();
+            choose(
+                &profile(kind),
+                &two(),
+                &issue(),
+                timeout,
+                Some(&path),
+                &self.parent(),
+            )
+            .await
+        }
+    }
+
+    const PICKS_DOCS: &str = r#"{"structured_output":{"coordinator":"docs"}}"#;
+
+    #[tokio::test]
+    async fn the_agent_picks_a_candidate() {
+        let fake = Fake::new("claude", PICKS_DOCS);
+        let choice = fake.choose("claude", Duration::from_secs(10)).await;
+        assert_eq!(choice, Choice::Agent("docs".into()));
+        assert_eq!(choice.source(), "chosen by the routing agent");
+
+        let codex = Fake::new("codex", r#"{"coordinator":"coordinator"}"#);
+        assert_eq!(
+            codex.choose("codex", Duration::from_secs(10)).await,
+            Choice::Agent("coordinator".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_issue_with_its_estimate_labels_and_team_goes_to_standard_input() {
+        let fake = Fake::new("claude", PICKS_DOCS);
+        fake.choose("claude", Duration::from_secs(10)).await;
+        assert_eq!(
+            fake.seen("stdin"),
+            "Title: Fix the login\nTeam: DATA (Data)\nEstimate: 3 (scale: fibonacci)\nLabels: bug, Size/S\n\nThe session expires too early.\n"
+        );
+        let args = fake.seen("args");
+        assert!(
+            !args.contains("Fix the login"),
+            "the issue is not an argument"
+        );
+        assert!(args.contains("- docs: documentation changes"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn invalid_answers_and_timeouts_fall_back_to_the_default() {
+        let table = [
+            (
+                r#"{"structured_output":{"coordinator":"deep"}}"#,
+                Fallback::Invalid("`deep` is not a candidate".into()),
+            ),
+            (
+                r#"{"structured_output":{"coordinator":"docs","why":"short"}}"#,
+                Fallback::Invalid("expected exactly the `coordinator` key".into()),
+            ),
+            (
+                r#"{"result":"I think docs"}"#,
+                Fallback::Invalid("no JSON answer".into()),
+            ),
+        ];
+        for (answer, expected) in table {
+            let fake = Fake::new("claude", answer);
+            assert_eq!(
+                fake.choose("claude", Duration::from_secs(10)).await,
+                Choice::Default(expected),
+                "{answer}"
+            );
+        }
+        let slow = Fake::new("claude", PICKS_DOCS);
+        std::fs::write(slow.dir.path().join("bin/claude"), "#!/bin/sh\nsleep 30\n").unwrap();
+        assert_eq!(
+            slow.choose("claude", Duration::from_millis(300)).await,
+            Choice::Default(Fallback::TimedOut)
+        );
+        let missing = Fake::new("claude", PICKS_DOCS);
+        std::fs::remove_file(missing.dir.path().join("bin/claude")).unwrap();
+        assert!(matches!(
+            missing.choose("claude", Duration::from_secs(10)).await,
+            Choice::Default(Fallback::Failed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_call_runs_in_a_fresh_folder_that_is_gone_afterwards() {
+        for (kind, answer, contents) in [
+            ("claude", PICKS_DOCS, "schema.json\n"),
+            ("codex", r#"{"coordinator":"docs"}"#, "schema.json\n"),
+        ] {
+            let fake = Fake::new(kind, answer);
+            fake.choose(kind, Duration::from_secs(10)).await;
+            let cwd = fake.seen("cwd");
+            assert!(
+                cwd.trim_end()
+                    .starts_with(&fake.parent().canonicalize().unwrap().display().to_string()),
+                "{kind}: {cwd}"
+            );
+            assert_eq!(
+                fake.seen("cwd-contents"),
+                contents,
+                "{kind}: only the recipe's files"
+            );
+            assert!(
+                !Path::new(cwd.trim_end()).exists(),
+                "{kind}: the folder is removed"
+            );
+            assert_eq!(
+                std::fs::read_dir(fake.parent()).unwrap().count(),
+                0,
+                "{kind}: nothing is left in the parent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_recipe_reaches_the_agent_but_not_the_profile_args() {
+        let fake = Fake::new("claude", PICKS_DOCS);
+        fake.choose("claude", Duration::from_secs(10)).await;
+        let args = fake.seen("args");
+        assert!(!args.contains("--dangerously-skip-permissions"), "{args}");
+        for flag in [
+            "--safe-mode",
+            "--restricted",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--json-schema",
+        ] {
+            assert!(args.lines().any(|l| l == flag), "{flag}: {args}");
+        }
+        assert!(args.contains("--model\nsmall\n--effort\nlow\n"), "{args}");
+        let env = fake.seen("env");
+        for set in [
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS=1",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
+            "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1",
+        ] {
+            assert!(env.lines().any(|l| l == set), "{set}");
+        }
+        // The login lives under the real HOME: the call keeps the ticker's.
+        let home = std::env::var("HOME").unwrap();
+        assert!(env.lines().any(|l| l == format!("HOME={home}")), "{env}");
+    }
+
+    #[test]
+    fn the_schema_and_the_answer_check_agree() {
+        assert_eq!(
+            schema(&two()),
+            json!({
+                "type": "object",
+                "properties": { "coordinator": { "type": "string", "enum": ["coordinator", "docs"] } },
+                "required": ["coordinator"],
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(
+            pick(&json!({"coordinator": "docs"}), &two()),
+            Ok("docs".into())
+        );
+        assert_eq!(
+            pick(&json!(["docs"]), &two()),
+            Err("not a JSON object".into())
+        );
+        assert!(registered("claude") && registered("codex") && !registered("cursor"));
+    }
 }

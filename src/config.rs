@@ -263,7 +263,7 @@ impl Config {
         let agent = self.profile(&routing.agent).context("routing.agent")?;
         ensure!(
             routing::registered(&agent.kind),
-            "routing.agent: the `{}` kind cannot be a routing agent, because herdr-linear-agent cannot run it with no context",
+            "routing.agent: the `{}` kind cannot be a routing agent",
             agent.kind
         );
         ensure!(
@@ -501,14 +501,14 @@ workers = ["standard", "deep"]
     }
 
     #[test]
-    fn a_routing_agent_must_be_a_kind_that_runs_with_no_context() {
+    fn a_routing_agent_must_be_a_registered_kind() {
         let text = SAMPLE.replace(
             "[profiles.router]\nkind = \"claude\"\nmodel = \"haiku\"",
             "[profiles.router]\nkind = \"cursor\"",
         );
         assert_eq!(
             Config::parse(&text).unwrap_err().to_string(),
-            "routing.agent: the `cursor` kind cannot be a routing agent, because herdr-linear-agent cannot run it with no context"
+            "routing.agent: the `cursor` kind cannot be a routing agent"
         );
     }
 }
