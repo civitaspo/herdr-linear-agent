@@ -472,6 +472,7 @@ mod tests {
         }
         assert_eq!(shown, [item]);
 
+        inbox::mark_seen(&f.run, &shown).unwrap();
         inbox::done(&f.run, &[], true).unwrap();
         let (_, shown) = digest(&f.run, &sample_config(), "/bin/hla", &[]).unwrap();
         assert!(shown.is_empty());
