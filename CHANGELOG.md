@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- record the integration test of the async rewrite (#41)
 - record the behavior the async rewrite keeps (#31)
 
 
