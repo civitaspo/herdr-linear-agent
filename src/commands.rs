@@ -392,7 +392,7 @@ pub async fn worker_start<H: Herdr>(
             w.agent.status = AgentStatus::Pending;
             w.agent.profile = args.profile.clone();
             w.agent.kind = profile.kind.clone();
-            w.agent.agent_name = names::worker(key, &record.issue_id, &w.id);
+            w.agent.agent_name = names::agent_name(key, &record.issue_id, &w.id);
         },
     )?;
     let base = format!("origin/{}", repo.base);

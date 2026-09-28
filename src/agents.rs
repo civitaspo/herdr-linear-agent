@@ -157,25 +157,18 @@ mod tests {
 
     #[test]
     fn resume_words_depend_on_the_kind_and_need_a_usable_session() {
-        let words = |kind, session| resume_args(kind, session);
-        assert_eq!(
-            words("claude", "abc-1"),
-            Some(vec!["--resume".to_string(), "abc-1".into()])
-        );
-        assert_eq!(
-            words("codex", "abc-1"),
-            Some(vec!["resume".to_string(), "abc-1".into()])
-        );
-        assert_eq!(
-            words("opencode", "ses_9"),
-            Some(vec!["--session".to_string(), "ses_9".into()])
-        );
-        assert_eq!(
-            words("copilot", "c7"),
-            Some(vec!["--resume=c7".to_string()])
-        );
-        assert_eq!(words("gemini", "abc-1"), None);
-        assert_eq!(words("claude", ""), None);
-        assert_eq!(words("claude", "--dangerous"), None);
+        let cases: [(&str, &str, Option<&[&str]>); 7] = [
+            ("claude", "abc-1", Some(&["--resume", "abc-1"])),
+            ("codex", "abc-1", Some(&["resume", "abc-1"])),
+            ("opencode", "ses_9", Some(&["--session", "ses_9"])),
+            ("copilot", "c7", Some(&["--resume=c7"])),
+            ("gemini", "abc-1", None),
+            ("claude", "", None),
+            ("claude", "--dangerous", None),
+        ];
+        for (kind, session, expected) in cases {
+            let expected = expected.map(|words| words.iter().map(|w| w.to_string()).collect());
+            assert_eq!(resume_args(kind, session), expected, "{kind} {session:?}");
+        }
     }
 }

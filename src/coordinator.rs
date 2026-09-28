@@ -85,7 +85,7 @@ pub fn pending_record(record: &RunRecord, profile: &str, kind: &str) -> AgentRec
         status: AgentStatus::Pending,
         profile: profile.to_string(),
         kind: kind.to_string(),
-        agent_name: names::coordinator(&record.identifier, &record.issue_id),
+        agent_name: names::agent_name(&record.identifier, &record.issue_id, "coordinator"),
         ..AgentRecord::default()
     }
 }

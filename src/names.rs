@@ -2,16 +2,6 @@
 
 use crate::files::sha256_hex;
 
-/// `<key>-coordinator`, for example `data-123-coordinator`.
-pub fn coordinator(key: &str, issue_id: &str) -> String {
-    named(key, issue_id, "coordinator")
-}
-
-/// `<key>-<id>`, for example `data-123-w2`.
-pub fn worker(key: &str, issue_id: &str, id: &str) -> String {
-    named(key, issue_id, id)
-}
-
 /// Herdr's rule for agent names: `[a-z][a-z0-9_-]{0,31}`.
 fn is_valid(name: &str) -> bool {
     let mut chars = name.chars();
@@ -20,9 +10,10 @@ fn is_valid(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// The lower-case key and the suffix, or, when that is not a valid name, a
-/// stand-in for the key made from the issue UUID.
-fn named(key: &str, issue_id: &str, suffix: &str) -> String {
+/// `<key>-<suffix>` with the key in lower case, for example
+/// `data-123-coordinator` or `data-123-w2`. When that is not a valid Herdr
+/// name, the key is replaced by a stand-in made from the issue UUID.
+pub fn agent_name(key: &str, issue_id: &str, suffix: &str) -> String {
     let plain = format!("{}-{suffix}", key.to_ascii_lowercase());
     if is_valid(&plain) {
         return plain;
@@ -37,21 +28,25 @@ mod tests {
 
     #[test]
     fn names_use_the_lower_case_key() {
-        assert_eq!(coordinator("DATA-123", "u-1"), "data-123-coordinator");
-        assert_eq!(worker("DATA-123", "u-1", "w2"), "data-123-w2");
+        assert_eq!(
+            agent_name("DATA-123", "u-1", "coordinator"),
+            "data-123-coordinator"
+        );
+        assert_eq!(agent_name("DATA-123", "u-1", "w2"), "data-123-w2");
     }
 
     #[test]
     fn a_key_that_cannot_be_a_name_becomes_a_hash_of_the_issue() {
         // sha256("issue-uuid") = 6d0c47b2...
         assert_eq!(
-            coordinator("VERYLONGTEAMKEY-123456", "issue-uuid"),
+            agent_name("VERYLONGTEAMKEY-123456", "issue-uuid", "coordinator"),
             "i6d0c47b2-coordinator"
         );
-        assert_eq!(worker("9LIVES-1", "issue-uuid", "w1"), "i6d0c47b2-w1");
-        assert!(is_valid(&coordinator(
+        assert_eq!(agent_name("9LIVES-1", "issue-uuid", "w1"), "i6d0c47b2-w1");
+        assert!(is_valid(&agent_name(
             "VERYLONGTEAMKEY-123456",
-            "issue-uuid"
+            "issue-uuid",
+            "coordinator"
         )));
     }
 

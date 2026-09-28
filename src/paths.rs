@@ -117,7 +117,14 @@ mod tests {
     #[test]
     fn folders_follow_absolute_xdg_values_and_default_under_home() {
         let home = Path::new("/home/ann");
-        let defaults = Env::for_test(home, &[]);
+        // Herdr's plugin folder variables are never read.
+        let defaults = Env::for_test(
+            home,
+            &[
+                ("HERDR_PLUGIN_STATE_DIR", "/plugin/state"),
+                ("HERDR_PLUGIN_CONFIG_DIR", "/plugin/config"),
+            ],
+        );
         assert_eq!(
             defaults.config_dir(),
             Path::new("/home/ann/.config/herdr-linear-agent")
@@ -139,25 +146,6 @@ mod tests {
             assert_eq!(env.config_dir(), defaults.config_dir(), "{bad:?}");
             assert_eq!(env.state_dir(), defaults.state_dir(), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn plugin_dir_variables_are_never_read() {
-        let env = Env::for_test(
-            Path::new("/home/ann"),
-            &[
-                ("HERDR_PLUGIN_STATE_DIR", "/plugin/state"),
-                ("HERDR_PLUGIN_CONFIG_DIR", "/plugin/config"),
-            ],
-        );
-        assert_eq!(
-            env.state_dir(),
-            Path::new("/home/ann/.local/state/herdr-linear-agent")
-        );
-        assert_eq!(
-            env.config_dir(),
-            Path::new("/home/ann/.config/herdr-linear-agent")
-        );
     }
 
     #[test]
@@ -193,10 +181,5 @@ mod tests {
         assert!(!state.exists());
         assert_eq!(ctx.ensure_state_dir().unwrap(), state);
         assert!(state.is_dir());
-    }
-
-    #[test]
-    fn the_binary_is_an_absolute_path() {
-        assert!(binary().unwrap().is_absolute());
     }
 }

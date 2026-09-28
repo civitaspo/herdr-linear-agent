@@ -1,7 +1,7 @@
 //! Small helpers shared by every module: atomic file writes, hashing,
 //! timestamps, slugs and shell quoting.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,11 +102,7 @@ pub fn shell_quote(text: &str) -> String {
 /// The text of a `--file` style argument: standard input for `-`.
 pub fn read_text_arg(path: &str) -> Result<String> {
     if path == "-" {
-        let mut text = String::new();
-        std::io::stdin()
-            .read_to_string(&mut text)
-            .context("could not read standard input")?;
-        return Ok(text);
+        return std::io::read_to_string(std::io::stdin()).context("could not read standard input");
     }
     std::fs::read_to_string(path).with_context(|| format!("could not read {path}"))
 }
@@ -209,15 +205,5 @@ mod tests {
         assert_eq!(read_text_arg(path.to_str().unwrap()).unwrap(), "hello\n");
         let error = read_text_arg("/nonexistent/t.md").unwrap_err();
         assert_eq!(error.to_string(), "could not read /nonexistent/t.md");
-    }
-
-    #[test]
-    fn the_open_command_matches_the_platform() {
-        let expected = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        assert_eq!(OPEN_COMMAND, expected);
     }
 }

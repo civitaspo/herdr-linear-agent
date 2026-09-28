@@ -27,41 +27,30 @@ use std::path::{Path, PathBuf};
 /// started from.
 pub const VERSION: &str = concat!(env!("HLA_RELEASE_VERSION"), "+", env!("HLA_BUILD_ID"));
 
-/// Folders where `git` and the agent CLIs are usually installed. Herdr may
-/// start plugins with a bare `PATH` when it was not launched from a login
-/// shell, so these are added at the end: the user's own order still wins.
-fn usual_folders(home: Option<&Path>) -> Vec<PathBuf> {
-    let mut folders = Vec::new();
-    if let Some(home) = home {
-        for sub in [".local/bin", ".cargo/bin", ".local/share/mise/shims"] {
-            folders.push(home.join(sub));
-        }
-    }
-    for dir in [
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/home/linuxbrew/.linuxbrew/bin",
-    ] {
-        folders.push(PathBuf::from(dir));
-    }
-    folders
-}
-
 /// `current` with each existing folder it lacks appended, or `None` when
-/// nothing is missing.
+/// nothing is missing. Herdr may start plugins with a bare `PATH` when it was
+/// not launched from a login shell, so the folders where `git` and the agent
+/// CLIs are usually installed are added at the end: the user's own order
+/// still wins.
 fn extended_path(
     current: &OsStr,
     home: Option<&Path>,
     exists: impl Fn(&Path) -> bool,
 ) -> Option<OsString> {
+    let home_folders = [".local/bin", ".cargo/bin", ".local/share/mise/shims"]
+        .into_iter()
+        .filter_map(|sub| home.map(|h| h.join(sub)));
+    let system_folders = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+    ]
+    .map(PathBuf::from);
     let present: Vec<PathBuf> = std::env::split_paths(current).collect();
-    let mut added: Vec<PathBuf> = Vec::new();
-    for dir in usual_folders(home) {
-        if exists(&dir) && !present.contains(&dir) && !added.contains(&dir) {
-            added.push(dir);
-        }
-    }
-    let tail = std::env::join_paths(&added).ok()?;
+    let added: Vec<PathBuf> = home_folders
+        .chain(system_folders)
+        .filter(|dir| exists(dir) && !present.contains(dir))
+        .collect();
     if added.is_empty() {
         return None;
     }
@@ -69,7 +58,7 @@ fn extended_path(
     if !path.is_empty() {
         path.push(":");
     }
-    path.push(tail);
+    path.push(std::env::join_paths(&added).ok()?);
     Some(path)
 }
 
