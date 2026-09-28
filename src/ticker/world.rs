@@ -425,28 +425,9 @@ impl World {
         self.reconciler.next_deadline(&deps, self.now)
     }
 
-    /// Puts `dir` in front of the `PATH` the ticker hands its children.
-    pub fn put_on_path(&mut self, dir: &Path) {
-        self.env = env_in(
-            self.home.path(),
-            &format!("{}:/usr/bin:/bin", dir.display()),
-        );
-    }
-
     /// Replaces the fake routing agent with a script body (after its shebang).
     pub fn router(&self, body: &str) {
         write_router(&self.home.path().join("bin"), body);
-    }
-
-    /// An executable script under the World's `bin` folder.
-    pub fn script(&self, name: &str, text: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = self.home.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = bin.join(name);
-        std::fs::write(&path, text).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin
     }
 
     pub fn pause_intake(&self) {
