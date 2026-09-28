@@ -1,4 +1,5 @@
-//! One GraphQL request to Linear, bounded and without redirects or retries.
+//! The rules of one GraphQL request to Linear: the endpoint, the bounds, the
+//! decoding of an answer, and the viewer check.
 //!
 //! Reads go through the credential manager's verified-read lease: every read
 //! selects `viewer { id app isMe }`, and the response is accepted only when
@@ -7,127 +8,101 @@
 
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use jiff::Timestamp;
+use reqwest::header::HeaderMap;
+use serde_json::Value;
 use zeroize::Zeroizing;
 
-use super::credentials::CredentialManager;
 use super::{ApiError, VerifiedReadOutcome};
 
 pub const GRAPHQL_ENDPOINT: &str = "https://api.linear.app/graphql";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 
-/// Sends one GraphQL operation and returns its `data` object.
-pub trait Transport {
-    fn execute(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        write: bool,
-    ) -> Result<Value, ApiError>;
+/// One of Linear's two hourly allowances as a response reported it. A value
+/// whose header is missing or does not parse is `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Allowance {
+    pub limit: Option<u64>,
+    pub remaining: Option<u64>,
+    pub reset: Option<Timestamp>,
 }
 
-impl<T: Transport + ?Sized> Transport for Box<T> {
-    fn execute(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        write: bool,
-    ) -> Result<Value, ApiError> {
-        (**self).execute(operation, query, variables, write)
-    }
+/// The rate-limit headers of one response, or Linear's budget as the latest
+/// responses reported it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateHeaders {
+    pub requests: Allowance,
+    pub complexity: Allowance,
+    /// `X-Complexity`: the points this query cost.
+    pub cost: Option<u64>,
 }
 
-/// The production transport: HTTPS to Linear with the Keychain-held token.
-pub struct HttpsTransport {
-    manager: CredentialManager,
-    client: oauth2::reqwest::blocking::Client,
-}
-
-impl HttpsTransport {
-    pub fn new(manager: CredentialManager) -> Result<Self, ApiError> {
-        let client = oauth2::reqwest::blocking::ClientBuilder::new()
-            .https_only(true)
-            .redirect(oauth2::reqwest::redirect::Policy::none())
-            .no_proxy()
-            .retry(oauth2::reqwest::retry::never())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|_| ApiError::ClientConfiguration)?;
-        Ok(Self { manager, client })
-    }
-
-    fn post(
-        client: &oauth2::reqwest::blocking::Client,
-        token: &str,
-        body: &[u8],
-    ) -> Result<Value, ApiError> {
-        use oauth2::reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
-        use std::io::Read;
-
-        let mut authorization = Zeroizing::new(Vec::with_capacity(7 + token.len()));
-        authorization.extend_from_slice(b"Bearer ");
-        authorization.extend_from_slice(token.as_bytes());
-        let mut authorization =
-            HeaderValue::from_bytes(&authorization).map_err(|_| ApiError::Configuration)?;
-        authorization.set_sensitive(true);
-        let response = client
-            .post(GRAPHQL_ENDPOINT)
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, authorization)
-            .body(body.to_vec())
-            .send()
-            .map_err(|_| ApiError::RequestFailed)?;
-        let status = response.status().as_u16();
-        let json_content = json_content_type(
-            response
-                .headers()
-                .get_all(CONTENT_TYPE)
-                .iter()
-                .filter_map(|v| v.to_str().ok()),
-        );
-        let mut bytes = Vec::with_capacity(4096);
-        response
-            .take((MAX_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ApiError::RequestFailed)?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(ApiError::ResponseTooLarge);
+impl RateHeaders {
+    pub fn parse(headers: &HeaderMap) -> Self {
+        let text = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+        };
+        let count = |name: &str| text(name).and_then(|v| v.parse::<u64>().ok());
+        let allowance = |kind: &str| Allowance {
+            limit: count(&format!("x-ratelimit-{kind}-limit")),
+            remaining: count(&format!("x-ratelimit-{kind}-remaining")),
+            reset: text(&format!("x-ratelimit-{kind}-reset"))
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+        };
+        RateHeaders {
+            requests: allowance("requests"),
+            complexity: allowance("complexity"),
+            cost: count("x-complexity"),
         }
-        decode(status, json_content, &bytes)
     }
-}
 
-impl Transport for HttpsTransport {
-    fn execute(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        write: bool,
-    ) -> Result<Value, ApiError> {
-        let body = serde_json::to_vec(
-            &json!({ "operationName": operation, "query": query, "variables": variables }),
-        )
-        .map_err(|_| ApiError::Configuration)?;
-        let client = &self.client;
-        if write {
-            self.manager
-                .with_bound_access_token(|token| Self::post(client, token, &body))
-        } else {
-            self.manager
-                .with_verified_read(|token| verified(Self::post(client, token, &body)?))
-        }
+    /// Takes every value `newer` knows and keeps the others.
+    pub fn observe(&mut self, newer: &RateHeaders) {
+        let take = |old: &mut Allowance, new: &Allowance| {
+            old.limit = new.limit.or(old.limit);
+            old.remaining = new.remaining.or(old.remaining);
+            old.reset = new.reset.or(old.reset);
+        };
+        take(&mut self.requests, &newer.requests);
+        take(&mut self.complexity, &newer.complexity);
+        self.cost = newer.cost.or(self.cost);
+    }
+
+    /// The latest reset known.
+    pub fn reset(&self) -> Option<Timestamp> {
+        self.requests.reset.max(self.complexity.reset)
+    }
+
+    /// `<n>/<limit> requests, <n>/<limit> points, resets <time>`, or `None`
+    /// while a value is unknown.
+    pub fn describe(&self) -> Option<String> {
+        let (r, c) = (&self.requests, &self.complexity);
+        Some(format!(
+            "{}/{} requests, {}/{} points, resets {:.0}",
+            r.remaining?,
+            r.limit?,
+            c.remaining?,
+            c.limit?,
+            self.reset()?
+        ))
+    }
+
+    /// `describe`, or `the budget is unknown`.
+    pub fn summary(&self) -> String {
+        self.describe()
+            .unwrap_or_else(|| "the budget is unknown".into())
     }
 }
 
 /// Exactly one `application/json` content type, parameters allowed.
-fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
+pub(crate) fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
     let (Some(value), None) = (values.next(), values.next()) else {
         return false;
     };
@@ -139,8 +114,13 @@ fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
         .eq_ignore_ascii_case("application/json")
 }
 
-/// A GraphQL response's `data`, or the first error it reports.
+/// A GraphQL response's `data`, or the first error it reports. HTTP 429 and
+/// a GraphQL error whose `extensions.code` is `RATELIMITED` (Linear answers
+/// those with HTTP 400) are `RateLimited`, never a definitive refusal.
 pub fn decode(status: u16, json_content: bool, body: &[u8]) -> Result<Value, ApiError> {
+    if status == 429 {
+        return Err(ApiError::RateLimited);
+    }
     if !json_content {
         return Err(if status == 200 {
             ApiError::ContentType
@@ -155,7 +135,17 @@ pub fn decode(status: u16, json_content: bool, body: &[u8]) -> Result<Value, Api
             ApiError::HttpStatus(status)
         }
     })?;
-    if let Some(error) = reply["errors"].as_array().and_then(|errors| errors.first()) {
+    let errors = reply["errors"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if errors
+        .iter()
+        .any(|error| error["extensions"]["code"] == "RATELIMITED")
+    {
+        return Err(ApiError::RateLimited);
+    }
+    if let Some(error) = errors.first() {
         let message = error["extensions"]["userPresentableMessage"]
             .as_str()
             .or_else(|| error["message"].as_str())
@@ -195,6 +185,8 @@ pub(crate) fn verified(data: Value) -> Result<VerifiedReadOutcome<Value>, ApiErr
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -214,7 +206,6 @@ mod tests {
         );
         assert_eq!(decode(200, false, b"{}"), Err(ApiError::ContentType));
         assert_eq!(decode(200, true, b"{}"), Err(ApiError::ReadFieldsInvalid));
-        assert_eq!(decode(429, true, b"{}"), Err(ApiError::HttpStatus(429)));
         assert!(json_content_type(
             ["application/json; charset=utf-8"].into_iter()
         ));
@@ -222,6 +213,125 @@ mod tests {
             ["application/json", "text/html"].into_iter()
         ));
         assert!(!json_content_type(std::iter::empty()));
+    }
+
+    #[test]
+    fn rate_limits_decode_apart_from_refusals() {
+        assert_eq!(
+            decode(
+                400,
+                true,
+                br#"{"errors":[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}]}"#
+            ),
+            Err(ApiError::RateLimited)
+        );
+        assert_eq!(
+            decode(429, false, b"Too Many Requests"),
+            Err(ApiError::RateLimited)
+        );
+        assert_eq!(decode(429, true, b"{}"), Err(ApiError::RateLimited));
+        assert_eq!(
+            decode(
+                400,
+                true,
+                br#"{"errors":[{"message":"Entity not found","extensions":{"code":"INVALID_INPUT"}}]}"#
+            ),
+            Err(ApiError::Graphql("Entity not found".into()))
+        );
+        assert_eq!(
+            decode(502, false, b"<html>"),
+            Err(ApiError::HttpStatus(502))
+        );
+        assert_eq!(decode(200, true, br#"{"data":{"x":1}}"#).unwrap()["x"], 1);
+        assert_eq!(
+            ApiError::RateLimited.to_string(),
+            "Linear rate-limited the request"
+        );
+    }
+
+    #[test]
+    fn rate_limit_headers_parse_into_counts_and_reset_times() {
+        use reqwest::header::{HeaderName, HeaderValue};
+        let headers: HeaderMap = [
+            ("x-ratelimit-requests-limit", "5000"),
+            ("x-ratelimit-requests-remaining", " 4999 "),
+            ("x-ratelimit-requests-reset", "1790550000000"),
+            ("x-ratelimit-complexity-limit", "2000000"),
+            ("x-ratelimit-complexity-remaining", "many"),
+            ("x-ratelimit-complexity-reset", "1790550000500"),
+            ("x-complexity", "251"),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+        })
+        .collect();
+        let parsed = RateHeaders::parse(&headers);
+        assert_eq!(
+            parsed.requests,
+            Allowance {
+                limit: Some(5000),
+                remaining: Some(4999),
+                reset: Some("2026-09-27T23:00:00Z".parse().unwrap()),
+            }
+        );
+        assert_eq!(parsed.complexity.limit, Some(2_000_000));
+        assert_eq!(parsed.complexity.remaining, None, "unparsable");
+        assert_eq!(
+            parsed.complexity.reset,
+            Some("2026-09-27T23:00:00.5Z".parse().unwrap())
+        );
+        assert_eq!(parsed.cost, Some(251));
+        assert_eq!(
+            RateHeaders::parse(&HeaderMap::new()),
+            RateHeaders::default()
+        );
+
+        let mut known = parsed;
+        known.observe(&RateHeaders {
+            requests: Allowance {
+                remaining: Some(4998),
+                ..Allowance::default()
+            },
+            ..RateHeaders::default()
+        });
+        assert_eq!(
+            (known.requests.limit, known.requests.remaining),
+            (Some(5000), Some(4998)),
+            "a missing value keeps the previous one"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_described_when_every_value_is_known() {
+        let mut budget = RateHeaders::default();
+        assert_eq!(budget.describe(), None);
+        assert_eq!(budget.summary(), "the budget is unknown");
+        let reset = "2026-09-28T01:00:00.250Z".parse().unwrap();
+        budget.observe(&RateHeaders {
+            requests: Allowance {
+                limit: Some(5_000),
+                remaining: Some(4_321),
+                reset: Some(reset),
+            },
+            complexity: Allowance {
+                limit: Some(2_000_000),
+                remaining: Some(1_999_000),
+                reset: None,
+            },
+            cost: Some(12),
+        });
+        assert_eq!(
+            budget.describe().as_deref(),
+            Some("4321/5000 requests, 1999000/2000000 points, resets 2026-09-28T01:00:00Z")
+        );
+        budget.observe(&RateHeaders::default());
+        assert_eq!(budget.requests.remaining, Some(4_321), "headers missing");
+        budget.complexity = Allowance::default();
+        assert_eq!(budget.describe(), None);
     }
 
     #[test]
