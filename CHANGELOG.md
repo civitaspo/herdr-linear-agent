@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- keep a just-prompted worker working and open worktrees with their checkout (#40)
 - recognize a coordinator Herdr is still launching (#37)
 
 
