@@ -1,4 +1,5 @@
-//! The coordinator's inbox: one JSON file per item under `runs/<KEY>/inbox/`.
+//! The coordinator's inbox: one file per item, `runs/<KEY>/inbox/<id>.md`,
+//! holding the item's fields as TOML between two `+++` lines.
 //!
 //! The ticker writes items (an issue edit, a reply, a worker's new group);
 //! `context` shows the unhandled ones and records which ids it showed;
@@ -18,17 +19,28 @@ use crate::run::Run;
 /// Handled items are kept this long.
 const DONE_KEPT: Duration = Duration::from_secs(30 * 24 * 3600);
 
+/// The line that opens and closes an item's front matter.
+const FENCE: &str = "+++";
+
+/// The field order is the key order in the file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
     pub kind: String,
     pub subject: String,
-    pub summary: String,
-    #[serde(default)]
     pub created: String,
-    /// The run's inbox counter when the item was written; orders the items.
-    #[serde(default)]
-    pub seq: u64,
+    pub summary: String,
+}
+
+impl Item {
+    /// The counter that ends the id: `3` for `...-reply-reply-3`.
+    fn counter(&self) -> u64 {
+        self.id
+            .rsplit('-')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    }
 }
 
 fn inbox_dir(run: &Run) -> PathBuf {
@@ -45,6 +57,10 @@ fn counter_path(run: &Run) -> PathBuf {
 
 fn seen_path(run: &Run) -> PathBuf {
     run.state_dir().join("inbox-seen.json")
+}
+
+fn item_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.md"))
 }
 
 /// Ids name files, so one that could leave the folder or hide is refused.
@@ -68,34 +84,47 @@ fn id_part(text: &str) -> String {
         .collect()
 }
 
+/// The file's text: `+++`, one `key = value` line per field, `+++`.
+fn render(item: &Item) -> Result<String> {
+    let fields = toml::to_string(item).context("an inbox item does not serialize")?;
+    Ok(format!("{FENCE}\n{fields}{FENCE}\n"))
+}
+
+/// The item a file's text holds, or `None` when it is not in that format.
+fn parse(text: &str) -> Option<Item> {
+    let inner = text.strip_prefix(FENCE)?.strip_prefix('\n')?;
+    let fields = inner.trim_end().strip_suffix(FENCE)?;
+    if !fields.ends_with('\n') {
+        return None;
+    }
+    toml::from_str(fields).ok()
+}
+
 /// Writes an item and returns its id, `<time>-<kind>-<subject>-<n>`.
 pub fn write(run: &Run, kind: &str, subject: &str, summary: &str) -> Result<String> {
     let _lock = run.lock()?;
-    let seq = files::read_json::<u64>(&counter_path(run)).unwrap_or(0) + 1;
-    files::write_json(&counter_path(run), &seq)?;
+    let n = files::read_json::<u64>(&counter_path(run)).unwrap_or(0) + 1;
+    files::write_json(&counter_path(run), &n)?;
     let created = files::now();
     let stamp: String = created
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect();
     let item = Item {
-        id: format!("{stamp}-{}-{}-{seq}", id_part(kind), id_part(subject)),
+        id: format!("{stamp}-{}-{}-{n}", id_part(kind), id_part(subject)),
         kind: kind.to_string(),
         subject: subject.to_string(),
-        summary: summary.to_string(),
         created,
-        seq,
+        summary: summary.to_string(),
     };
     std::fs::create_dir_all(inbox_dir(run))?;
-    files::write_json(&item_path(&inbox_dir(run), &item.id), &item)?;
+    let text = render(&item)?;
+    files::write_atomic(&item_path(&inbox_dir(run), &item.id), text.as_bytes())?;
     Ok(item.id)
 }
 
-fn item_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json"))
-}
-
-/// The items in `dir` that parse, and the names of the files that do not.
+/// The items in `dir` that parse, oldest first, and the names of the files
+/// that do not.
 fn read_items(dir: &Path) -> (Vec<Item>, Vec<String>) {
     let (mut items, mut unreadable) = (Vec::new(), Vec::new());
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -106,12 +135,15 @@ fn read_items(dir: &Path) -> (Vec<Item>, Vec<String>) {
         if name.starts_with('.') || !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
-        match files::read_json::<Item>(&entry.path()) {
-            Some(item) if name == format!("{}.json", item.id) => items.push(item),
+        let item = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|text| parse(&text));
+        match item {
+            Some(item) if name == format!("{}.md", item.id) => items.push(item),
             _ => unreadable.push(name),
         }
     }
-    items.sort_by(|a, b| (a.seq, &a.id).cmp(&(b.seq, &b.id)));
+    items.sort_by(|a, b| (&a.created, a.counter(), &a.id).cmp(&(&b.created, b.counter(), &b.id)));
     (items, unreadable)
 }
 
@@ -126,9 +158,11 @@ pub fn unhandled(run: &Run) -> Vec<Item> {
 
 /// Records the ids `context` showed the coordinator, replacing the last set:
 /// a digest shows every unhandled item, so nothing shown earlier is lost.
+/// The file is a pretty JSON array with no final newline.
 pub fn mark_seen(run: &Run, ids: &[String]) -> Result<()> {
     let _lock = run.lock()?;
-    files::write_json(&seen_path(run), ids)
+    let text = serde_json::to_string_pretty(ids)?;
+    files::write_atomic(&seen_path(run), text.as_bytes())
 }
 
 /// The ids the last `context` showed.
@@ -162,8 +196,8 @@ pub fn done(run: &Run, ids: &[String], all: bool) -> Result<usize> {
     Ok(moved)
 }
 
-/// Removes handled items older than 30 days, and moves files in `inbox/`
-/// that are not items of this build (another build's format) to
+/// Removes handled items older than 30 days, and moves the files in `inbox/`
+/// that do not parse as items (`<id>.md` with the front matter) to
 /// `inbox/done/`, so the caller logs each of them once. Returns their names.
 pub fn prune_done(run: &Run) -> Vec<String> {
     let Ok(_lock) = run.lock() else {
@@ -196,6 +230,26 @@ mod tests {
     use super::*;
     use crate::run::RunRecord;
 
+    /// Two items as the released build wrote them, byte for byte.
+    const REPLY_ID: &str = "20260928T014109Z-reply-reply-3";
+    const REPLY: &str = "+++
+id = \"20260928T014109Z-reply-reply-3\"
+kind = \"reply\"
+subject = \"reply\"
+created = \"2026-09-28T01:41:10Z\"
+summary = \"A new reply from user 6b7b1cde-f3cc-4886-8339-660f4851e476 is in conversation.md.\"
++++
+";
+    const WORKER_ID: &str = "20260928T020313Z-worker-w1-1";
+    const WORKER: &str = "+++
+id = \"20260928T020313Z-worker-w1-1\"
+kind = \"worker\"
+subject = \"w1\"
+created = \"2026-09-28T02:03:14Z\"
+summary = \"w1 (testing) is idle without a report; check its pane wH:p1.\"
++++
+";
+
     fn run() -> (tempfile::TempDir, Run) {
         let home = tempfile::tempdir().unwrap();
         let run = Run::create(
@@ -212,6 +266,96 @@ mod tests {
 
     fn ids(items: &[Item]) -> Vec<&str> {
         items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    fn read(run: &Run, rel: &str) -> String {
+        std::fs::read_to_string(run.dir.join(rel)).unwrap()
+    }
+
+    #[test]
+    fn items_written_by_the_released_build_are_read_and_handled() {
+        let (_home, run) = run();
+        std::fs::write(run.dir.join(format!("inbox/{REPLY_ID}.md")), REPLY).unwrap();
+        std::fs::write(run.dir.join(format!("inbox/{WORKER_ID}.md")), WORKER).unwrap();
+        std::fs::write(run.state_dir().join("inbox-counter.json"), "3\n").unwrap();
+
+        assert!(prune_done(&run).is_empty(), "both parse as items");
+        let items = unhandled(&run);
+        assert_eq!(
+            items,
+            [
+                Item {
+                    id: REPLY_ID.into(),
+                    kind: "reply".into(),
+                    subject: "reply".into(),
+                    created: "2026-09-28T01:41:10Z".into(),
+                    summary: "A new reply from user 6b7b1cde-f3cc-4886-8339-660f4851e476 \
+                              is in conversation.md."
+                        .into(),
+                },
+                Item {
+                    id: WORKER_ID.into(),
+                    kind: "worker".into(),
+                    subject: "w1".into(),
+                    created: "2026-09-28T02:03:14Z".into(),
+                    summary: "w1 (testing) is idle without a report; check its pane wH:p1.".into(),
+                },
+            ],
+            "ordered by created before the counter"
+        );
+
+        mark_seen(&run, &[REPLY_ID.to_string()]).unwrap();
+        assert_eq!(
+            read(&run, ".state/inbox-seen.json"),
+            "[\n  \"20260928T014109Z-reply-reply-3\"\n]"
+        );
+        assert_eq!(done(&run, &[], true).unwrap(), 1);
+        assert_eq!(ids(&unhandled(&run)), [WORKER_ID]);
+        assert_eq!(read(&run, &format!("inbox/done/{REPLY_ID}.md")), REPLY);
+
+        let next = write(&run, "worker", "w1", "next").unwrap();
+        assert!(next.ends_with("-worker-w1-4"), "{next}");
+        assert_eq!(read(&run, ".state/inbox-counter.json"), "4\n");
+    }
+
+    #[test]
+    fn an_item_is_written_in_the_released_format() {
+        let (_home, run) = run();
+        let id = write(&run, "worker", "w1", "w1 (api) has a new report").unwrap();
+        let item = &unhandled(&run)[0];
+        assert_eq!(
+            read(&run, &format!("inbox/{id}.md")),
+            format!(
+                "+++\nid = \"{id}\"\nkind = \"worker\"\nsubject = \"w1\"\n\
+                 created = \"{}\"\nsummary = \"w1 (api) has a new report\"\n+++\n",
+                item.created
+            )
+        );
+        assert_eq!(item.id, id);
+    }
+
+    #[test]
+    fn items_of_one_second_order_by_their_counter_as_a_number() {
+        let (_home, run) = run();
+        for (id, n) in [
+            ("T-worker-w1-10", 10),
+            ("T-worker-w1-9", 9),
+            ("T-reply-reply-9", 9),
+        ] {
+            let item = Item {
+                id: id.into(),
+                kind: "worker".into(),
+                subject: format!("{n}"),
+                created: "2026-09-28T01:00:00Z".into(),
+                summary: "same second".into(),
+            };
+            let path = item_path(&inbox_dir(&run), id);
+            std::fs::write(path, render(&item).unwrap()).unwrap();
+        }
+        assert_eq!(
+            ids(&unhandled(&run)),
+            ["T-reply-reply-9", "T-worker-w1-9", "T-worker-w1-10"]
+        );
     }
 
     #[test]
@@ -231,7 +375,7 @@ mod tests {
         assert_eq!(items[0].kind, "worker");
         assert_eq!(items[0].subject, "w1");
         assert_eq!(items[1].summary, "A new reply.");
-        assert!(run.dir.join(format!("inbox/{first}.json")).is_file());
+        assert!(run.dir.join(format!("inbox/{first}.md")).is_file());
     }
 
     #[test]
@@ -245,7 +389,7 @@ mod tests {
         let later = write(&run, "worker", "w2", "written after context").unwrap();
         assert_eq!(done(&run, &[], true).unwrap(), 1);
         assert_eq!(ids(&unhandled(&run)), [&later]);
-        assert!(run.dir.join(format!("inbox/done/{shown}.json")).is_file());
+        assert!(run.dir.join(format!("inbox/done/{shown}.md")).is_file());
 
         assert_eq!(done(&run, &[], true).unwrap(), 0, "already moved");
         mark_seen(&run, std::slice::from_ref(&later)).unwrap();
@@ -287,12 +431,12 @@ mod tests {
     }
 
     #[test]
-    fn pruning_drops_old_done_items_and_sets_aside_foreign_files() {
+    fn pruning_drops_old_done_items_and_sets_aside_files_that_do_not_parse() {
         let (_home, run) = run();
         let old = write(&run, "worker", "w1", "old").unwrap();
         let recent = write(&run, "worker", "w1", "recent").unwrap();
         done(&run, &[old.clone(), recent.clone()], false).unwrap();
-        let old_path = run.dir.join(format!("inbox/done/{old}.json"));
+        let old_path = run.dir.join(format!("inbox/done/{old}.md"));
         let month_ago = SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
         std::fs::File::options()
             .write(true)
@@ -301,19 +445,25 @@ mod tests {
             .set_modified(month_ago)
             .unwrap();
         let open = write(&run, "reply", "reply", "open").unwrap();
-        std::fs::write(run.dir.join("inbox/legacy.md"), "an older format").unwrap();
-        std::fs::write(run.dir.join("inbox/other.json"), r#"{"body":"x"}"#).unwrap();
+        let inbox = run.dir.join("inbox");
+        std::fs::write(inbox.join("plain.md"), "no front matter").unwrap();
+        std::fs::write(inbox.join("renamed.md"), REPLY).unwrap();
+        std::fs::write(inbox.join("unclosed.md"), &REPLY[..REPLY.len() - 4]).unwrap();
+        std::fs::write(inbox.join("item.json"), r#"{"id":"item"}"#).unwrap();
 
         let mut set_aside = prune_done(&run);
         set_aside.sort();
-        assert_eq!(set_aside, ["legacy.md", "other.json"]);
+        assert_eq!(
+            set_aside,
+            ["item.json", "plain.md", "renamed.md", "unclosed.md"]
+        );
         assert!(!old_path.exists());
-        assert!(run.dir.join(format!("inbox/done/{recent}.json")).exists());
-        assert!(run.dir.join("inbox/done/legacy.md").exists());
+        assert!(run.dir.join(format!("inbox/done/{recent}.md")).exists());
+        assert!(run.dir.join("inbox/done/plain.md").exists());
         assert_eq!(ids(&unhandled(&run)), [&open]);
         assert!(
             prune_done(&run).is_empty(),
-            "each foreign file is reported once"
+            "each file that does not parse is reported once"
         );
     }
 }
