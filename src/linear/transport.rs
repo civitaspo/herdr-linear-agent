@@ -30,16 +30,8 @@ pub struct Allowance {
     pub reset: Option<Timestamp>,
 }
 
-impl Allowance {
-    /// Takes every value `newer` knows and keeps the others.
-    pub fn update(&mut self, newer: &Allowance) {
-        self.limit = newer.limit.or(self.limit);
-        self.remaining = newer.remaining.or(self.remaining);
-        self.reset = newer.reset.or(self.reset);
-    }
-}
-
-/// The rate-limit headers of one response.
+/// The rate-limit headers of one response, or Linear's budget as the latest
+/// responses reported it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RateHeaders {
     pub requests: Allowance,
@@ -69,6 +61,43 @@ impl RateHeaders {
             complexity: allowance("complexity"),
             cost: count("x-complexity"),
         }
+    }
+
+    /// Takes every value `newer` knows and keeps the others.
+    pub fn observe(&mut self, newer: &RateHeaders) {
+        let take = |old: &mut Allowance, new: &Allowance| {
+            old.limit = new.limit.or(old.limit);
+            old.remaining = new.remaining.or(old.remaining);
+            old.reset = new.reset.or(old.reset);
+        };
+        take(&mut self.requests, &newer.requests);
+        take(&mut self.complexity, &newer.complexity);
+        self.cost = newer.cost.or(self.cost);
+    }
+
+    /// The latest reset known.
+    pub fn reset(&self) -> Option<Timestamp> {
+        self.requests.reset.max(self.complexity.reset)
+    }
+
+    /// `<n>/<limit> requests, <n>/<limit> points, resets <time>`, or `None`
+    /// while a value is unknown.
+    pub fn describe(&self) -> Option<String> {
+        let (r, c) = (&self.requests, &self.complexity);
+        Some(format!(
+            "{}/{} requests, {}/{} points, resets {:.0}",
+            r.remaining?,
+            r.limit?,
+            c.remaining?,
+            c.limit?,
+            self.reset()?
+        ))
+    }
+
+    /// `describe`, or `the budget is unknown`.
+    pub fn summary(&self) -> String {
+        self.describe()
+            .unwrap_or_else(|| "the budget is unknown".into())
     }
 }
 
@@ -261,16 +290,48 @@ mod tests {
             RateHeaders::default()
         );
 
-        let mut known = parsed.requests;
-        known.update(&Allowance {
-            remaining: Some(4998),
-            ..Allowance::default()
+        let mut known = parsed;
+        known.observe(&RateHeaders {
+            requests: Allowance {
+                remaining: Some(4998),
+                ..Allowance::default()
+            },
+            ..RateHeaders::default()
         });
         assert_eq!(
-            (known.limit, known.remaining),
+            (known.requests.limit, known.requests.remaining),
             (Some(5000), Some(4998)),
             "a missing value keeps the previous one"
         );
+    }
+
+    #[test]
+    fn the_budget_is_described_when_every_value_is_known() {
+        let mut budget = RateHeaders::default();
+        assert_eq!(budget.describe(), None);
+        assert_eq!(budget.summary(), "the budget is unknown");
+        let reset = "2026-09-28T01:00:00.250Z".parse().unwrap();
+        budget.observe(&RateHeaders {
+            requests: Allowance {
+                limit: Some(5_000),
+                remaining: Some(4_321),
+                reset: Some(reset),
+            },
+            complexity: Allowance {
+                limit: Some(2_000_000),
+                remaining: Some(1_999_000),
+                reset: None,
+            },
+            cost: Some(12),
+        });
+        assert_eq!(
+            budget.describe().as_deref(),
+            Some("4321/5000 requests, 1999000/2000000 points, resets 2026-09-28T01:00:00Z")
+        );
+        budget.observe(&RateHeaders::default());
+        assert_eq!(budget.requests.remaining, Some(4_321), "headers missing");
+        budget.complexity = Allowance::default();
+        assert_eq!(budget.describe(), None);
     }
 
     #[test]

@@ -480,7 +480,7 @@ Rules:
   - `RATELIMITED` is never a definitive refusal: an outbox request that met it stays queued (today's `decode` maps any HTTP 400 GraphQL error to `Graphql`, which the outbox treats as definitive; the rewrite must not).
 - At 5 s intervals with one run the plugin sends about 1,440 reads per hour, within the limit; complexity of `HlaRuns` with several runs is not measured.
 - As implemented (`src/linear/task.rs`), where it differs from or refines the text above and decisions 18 and 20:
-  - The client keeps the parsed headers of every response until the Linear task takes them into its `Budget`; a missing or unparsable header keeps the previous value.
+  - The client keeps the parsed headers of every response until the Linear task merges them into its budget, a `RateHeaders` of the latest values; a missing or unparsable header keeps the previous value.
   - A read's cost is what its last run measured: the number of responses it got and the sum of their `X-Complexity`, including the issue-detail reads of the run read; the viewer read is not counted; an unmeasured read counts as 1 request and 0 points.
   - The reads until the reset may use 90% of the remainder, so a tenth of what remains is kept for writes; both read intervals are stretched by the same factor, and never past the reset of the short allowance.
   - A reset time at or before now counts as unknown: that allowance is not short and gives no pause.
@@ -489,7 +489,7 @@ Rules:
   - While the budget is short the order of a step is flush, viewer, run read, delegated poll; otherwise viewer, delegated poll, run read, flush.
   - Every run-read batch answered by one request updates the cost per run (its `X-Complexity` divided by its runs, rounded up); a batch takes at most `4999 / cost` runs, at least 1; with no measurement, 10.
   - A rate-limited run read or delegated poll logs no per-run line; the pause line reports it. A rate-limited write still logs `<KEY>: Linear write failed, will retry: <error>`.
-  - Ticker log lines: `Linear budget is short (<budget>): the intake poll runs every <d> and the run read every <d>`, the same with `is no longer short`, and `Linear rate-limited the requests (<budget>): every read and write waits <d>, until <time>`, where `<budget>` is the doctor's text or `the budget is unknown`.
+  - Ticker log lines: `Linear budget is short (<budget>): the intake poll runs every <d> and the run read every <d>`, the same with `is no longer short`, and `Linear rate-limited the requests (<budget>): every read and write waits <d>, until <time>`, where `<budget>` is the doctor's text or `the budget is unknown`, `<d>` is jiff's friendly duration (`10s`, `5m`, `8s 421ms`) and `<time>` is in whole seconds.
 
 ## Intake and claim
 
@@ -1063,5 +1063,5 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 17. `scripts/install.sh` downloads the asset and its `.sha256` and refuses to install on a mismatch. **Kept:** the build version is the contents of `.release-version`, a `+`, and a build id made from the git short hash and the build time, so a rebuilt binary always differs from the running one.
 18. The interval keys are `linear.intake_interval_seconds` and `linear.run_read_interval_seconds`, both defaulting to 5. Backoff starts when fewer than 20% of the requests or of the complexity points remain. The read intervals are then stretched so that the reads until the reset use at most the remainder minus 10%, which is kept for writes.
 19. Run records, worker records and outbox files written by the current build must stay readable, so a ticker can be upgraded in place. Inbox items and progress records in another format are skipped, with one log line each.
-20. The batched run read is split so that each query's measured `X-Complexity` stays under 5,000, half the per-query limit. The first read of a batch measures the cost per run, and later batches use that measurement. The result is recorded in `docs/verification.md` #8.
+20. The batched run read is split so that each query's measured `X-Complexity` stays under 5,000, half the per-query limit. The first read of a batch measures the cost per run, and later batches use that measurement. When the measured cost per run changes, the ticker logs `Linear run read costs <n> points per run; up to <k> runs per query`, where `<k>` is the batch size the split now uses. The result is recorded in `docs/verification.md` #8.
 21. The PR is the first line of the report that starts with `PR:`. It counts only when it names a GitHub pull request URL.
