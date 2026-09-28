@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+use jiff::Timestamp;
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -18,6 +20,57 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// One of Linear's two hourly allowances as a response reported it. A value
+/// whose header is missing or does not parse is `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Allowance {
+    pub limit: Option<u64>,
+    pub remaining: Option<u64>,
+    pub reset: Option<Timestamp>,
+}
+
+impl Allowance {
+    /// Takes every value `newer` knows and keeps the others.
+    pub fn update(&mut self, newer: &Allowance) {
+        self.limit = newer.limit.or(self.limit);
+        self.remaining = newer.remaining.or(self.remaining);
+        self.reset = newer.reset.or(self.reset);
+    }
+}
+
+/// The rate-limit headers of one response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateHeaders {
+    pub requests: Allowance,
+    pub complexity: Allowance,
+    /// `X-Complexity`: the points this query cost.
+    pub cost: Option<u64>,
+}
+
+impl RateHeaders {
+    pub fn parse(headers: &HeaderMap) -> Self {
+        let text = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+        };
+        let count = |name: &str| text(name).and_then(|v| v.parse::<u64>().ok());
+        let allowance = |kind: &str| Allowance {
+            limit: count(&format!("x-ratelimit-{kind}-limit")),
+            remaining: count(&format!("x-ratelimit-{kind}-remaining")),
+            reset: text(&format!("x-ratelimit-{kind}-reset"))
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+        };
+        RateHeaders {
+            requests: allowance("requests"),
+            complexity: allowance("complexity"),
+            cost: count("x-complexity"),
+        }
+    }
+}
 
 /// Exactly one `application/json` content type, parameters allowed.
 pub(crate) fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
@@ -164,6 +217,59 @@ mod tests {
         assert_eq!(
             ApiError::RateLimited.to_string(),
             "Linear rate-limited the request"
+        );
+    }
+
+    #[test]
+    fn rate_limit_headers_parse_into_counts_and_reset_times() {
+        use reqwest::header::{HeaderName, HeaderValue};
+        let headers: HeaderMap = [
+            ("x-ratelimit-requests-limit", "5000"),
+            ("x-ratelimit-requests-remaining", " 4999 "),
+            ("x-ratelimit-requests-reset", "1790550000000"),
+            ("x-ratelimit-complexity-limit", "2000000"),
+            ("x-ratelimit-complexity-remaining", "many"),
+            ("x-ratelimit-complexity-reset", "1790550000500"),
+            ("x-complexity", "251"),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+        })
+        .collect();
+        let parsed = RateHeaders::parse(&headers);
+        assert_eq!(
+            parsed.requests,
+            Allowance {
+                limit: Some(5000),
+                remaining: Some(4999),
+                reset: Some("2026-09-27T23:00:00Z".parse().unwrap()),
+            }
+        );
+        assert_eq!(parsed.complexity.limit, Some(2_000_000));
+        assert_eq!(parsed.complexity.remaining, None, "unparsable");
+        assert_eq!(
+            parsed.complexity.reset,
+            Some("2026-09-27T23:00:00.5Z".parse().unwrap())
+        );
+        assert_eq!(parsed.cost, Some(251));
+        assert_eq!(
+            RateHeaders::parse(&HeaderMap::new()),
+            RateHeaders::default()
+        );
+
+        let mut known = parsed.requests;
+        known.update(&Allowance {
+            remaining: Some(4998),
+            ..Allowance::default()
+        });
+        assert_eq!(
+            (known.limit, known.remaining),
+            (Some(5000), Some(4998)),
+            "a missing value keeps the previous one"
         );
     }
 

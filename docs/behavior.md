@@ -479,6 +479,17 @@ Rules:
   - The intake poll yields to the run read, and reads yield to writes that are due, when the budget is short.
   - `RATELIMITED` is never a definitive refusal: an outbox request that met it stays queued (today's `decode` maps any HTTP 400 GraphQL error to `Graphql`, which the outbox treats as definitive; the rewrite must not).
 - At 5 s intervals with one run the plugin sends about 1,440 reads per hour, within the limit; complexity of `HlaRuns` with several runs is not measured.
+- As implemented (`src/linear/task.rs`), where it differs from or refines the text above and decisions 18 and 20:
+  - The client keeps the parsed headers of every response until the Linear task takes them into its `Budget`; a missing or unparsable header keeps the previous value.
+  - A read's cost is what its last run measured: the number of responses it got and the sum of their `X-Complexity`, including the issue-detail reads of the run read; the viewer read is not counted; an unmeasured read counts as 1 request and 0 points.
+  - The reads until the reset may use 90% of the remainder, so a tenth of what remains is kept for writes; both read intervals are stretched by the same factor, and never past the reset of the short allowance.
+  - A reset time at or before now counts as unknown: that allowance is not short and gives no pause.
+  - The exponential pause starts at the run-read interval (5 s, 10 s, 20 s, up to 5 minutes) and starts over after a step without a rate limit.
+  - A rate limit ends the step at once; the requests not sent yet wait for the pause to end.
+  - While the budget is short the order of a step is flush, viewer, run read, delegated poll; otherwise viewer, delegated poll, run read, flush.
+  - Every run-read batch answered by one request updates the cost per run (its `X-Complexity` divided by its runs, rounded up); a batch takes at most `4999 / cost` runs, at least 1; with no measurement, 10.
+  - A rate-limited run read or delegated poll logs no per-run line; the pause line reports it. A rate-limited write still logs `<KEY>: Linear write failed, will retry: <error>`.
+  - Ticker log lines: `Linear budget is short (<budget>): the intake poll runs every <d> and the run read every <d>`, the same with `is no longer short`, and `Linear rate-limited the requests (<budget>): every read and write waits <d>, until <time>`, where `<budget>` is the doctor's text or `the budget is unknown`.
 
 ## Intake and claim
 
@@ -982,6 +993,7 @@ Errors: `this action needs a pane of a run`, `this pane does not belong to a run
   - config: `config <path>` OK or its error;
   - with a config: ``Herdr session `<name or default>` is reachable`` (a snapshot or ping answers), `the configured Herdr session does not answer`, or the session error; each distinct executable of the profiles' kinds and `git`: `` `<program>` found `` or `` `<program>` is not on the ticker's PATH `` (resolved from this process's `PATH`); each repository without `.git`: ``repository `<name>`: <path> is not a git checkout``; credential: `Linear credential stored` (ready or refresh needed), else `Linear credential is <status>; run the login action` or `Linear credential: <error>`;
   - ticker: `ticker running` (same version), `the ticker runs <v>, this binary is <v>`, `the ticker is not running`;
+  - with a stored credential, one viewer read: `Linear budget: <requests remaining>/<limit> requests, <points remaining>/<limit> points, resets <latest reset, whole seconds>` OK, or `Linear budget: unknown` when the read failed, a header was missing, or no credential is stored;
   - `<n> active run(s)` OK.
   - Text: `All checks passed.` or `<n> problem(s):\n- <problem>\n- ...`, then `\nOK:\n- <ok>\n- ...`.
 - The manifest names only existing actions; `command[2]` equals the action id; every link handler has a non-empty title (Herdr 0.9.1 refuses one without). `src/cli.rs:the_manifest_names_only_existing_actions`

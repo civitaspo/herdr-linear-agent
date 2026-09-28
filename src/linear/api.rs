@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ApiError;
+use super::transport::RateHeaders;
 
 /// Pages read per poll at most: 50 issues each.
 const MAX_PAGES: usize = 4;
@@ -274,6 +275,10 @@ pub trait LinearApi: Sync {
         variables: Value,
         write: bool,
     ) -> impl Future<Output = Result<Value, ApiError>> + Send;
+
+    /// The rate-limit headers of every response since the last call, oldest
+    /// first.
+    fn take_headers(&self) -> Vec<RateHeaders>;
 
     /// Sends a mutation and returns its `payload` field once its `success`
     /// is true.
@@ -701,6 +706,12 @@ pub mod fake {
         /// The present the fake stamps activities after; the wall clock when
         /// unset, a test clock otherwise.
         pub present: Option<jiff::Timestamp>,
+        /// The rate-limit headers of the response to (operation, variables);
+        /// none when unset.
+        #[allow(clippy::type_complexity)]
+        pub headers: Option<Box<dyn FnMut(&str, &Value) -> RateHeaders + Send>>,
+        /// Headers of the responses not taken yet.
+        pub received: Vec<RateHeaders>,
         clock: i64,
     }
 
@@ -1009,6 +1020,9 @@ pub mod fake {
         ) -> Result<Value, ApiError> {
             self.calls
                 .push((operation.to_string(), variables.clone(), write));
+            if let Some(headers) = &mut self.headers {
+                self.received.push(headers(operation, &variables));
+            }
             if let Some(error) = self.fail_next.take() {
                 return Err(error);
             }
