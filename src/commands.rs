@@ -415,7 +415,17 @@ pub async fn worker_start<H: Herdr>(
             bail!("could not create the worktree for {}: {error}", worker.id);
         }
     };
-    let worker = place(ctx, &run, &record, worker, &placed, args.task.trim(), false).await?;
+    let worker = place(
+        ctx,
+        &run,
+        &record,
+        worker,
+        &placed,
+        args.task.trim(),
+        false,
+        profile.instructions.as_deref(),
+    )
+    .await?;
     ticker::poke(&ctx.state_dir());
     println!(
         "{} is placed in {} on branch {}; herdr-linear-agent starts its agent shortly",
@@ -434,6 +444,7 @@ async fn place(
     placed: &Placed,
     task: &str,
     restart: bool,
+    instructions: Option<&str>,
 ) -> Result<Worker> {
     let worktree = placed
         .worktree_path
@@ -459,6 +470,7 @@ async fn place(
         task,
         restart,
         binary: &coordinator::binary_command()?,
+        instructions,
     });
     files::write_atomic(
         &Path::new(&worker.brief_dir).join("brief.md"),
@@ -623,7 +635,17 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.resume = false;
     })?;
     let task = std::fs::read_to_string(worker::task_path(&run, id)).unwrap_or_default();
-    let worker = place(ctx, &run, &record, reset, &placed, task.trim(), true).await?;
+    let worker = place(
+        ctx,
+        &run,
+        &record,
+        reset,
+        &placed,
+        task.trim(),
+        true,
+        profile.instructions.as_deref(),
+    )
+    .await?;
     ticker::poke(&ctx.state_dir());
     println!(
         "{id} restarts in {} with the `{profile_name}` profile",
