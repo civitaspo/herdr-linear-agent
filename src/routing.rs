@@ -208,6 +208,8 @@ pub struct Invocation {
     /// Set on top of the ticker's own environment, which the call keeps
     /// (the login of most kinds lives under the real HOME and config dir).
     pub env: Vec<(String, String)>,
+    /// Files the recipe needs in the call's folder, written before it runs.
+    pub files: Vec<(PathBuf, String)>,
     /// The answer file, when the kind writes one; otherwise standard output.
     pub answer_file: Option<PathBuf>,
 }
@@ -293,6 +295,7 @@ fn claude_invocation(call: &Call) -> Invocation {
         program: "claude".into(),
         args,
         env,
+        files: Vec::new(),
         answer_file: None,
     }
 }
@@ -306,35 +309,101 @@ fn claude_answer(text: &str) -> Option<Value> {
     serde_json::from_str(value.get("result")?.as_str()?.trim()).ok()
 }
 
+/// Short system instructions for Codex, in place of its default prompt.
+const CODEX_INSTRUCTIONS: &str =
+    "You classify text. Reply with only the JSON object that the output schema requires.\n";
+
+/// Codex features that bring tools, plugins, apps, memories or hooks into a
+/// turn. Codex rejects unknown names, so this list follows the tested
+/// version (codex-cli 0.156.1).
+const CODEX_DISABLED_FEATURES: &[&str] = &[
+    "plugins",
+    "apps",
+    "tool_suggest",
+    "memories",
+    "hooks",
+    "shell_tool",
+    "unified_exec",
+    "multi_agent",
+    "image_generation",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "in_app_browser",
+    "goals",
+    "sleep_tool",
+    "skill_search",
+    "skill_mcp_dependency_install",
+    "workspace_dependencies",
+    "code_mode_host",
+    "shell_snapshot",
+    "view_image",
+];
+
+/// Codex keeps its login in the real CODEX_HOME, which stays; the user
+/// config and project layers are ignored and the rest is switched off with
+/// overrides (docs/verification.md). `~/.codex/AGENTS.md` still loads, and
+/// the model keeps two code-mode tool definitions that cannot run.
 fn codex_invocation(call: &Call) -> Invocation {
-    let answer = call.sandbox.dir().join("answer.json");
-    let mut args = vec!["exec".to_string()];
-    if let Some(model) = &call.profile.model {
-        args.extend(["-m".into(), model.clone()]);
-    }
-    if let Some(effort) = &call.profile.effort {
-        args.extend(["-c".into(), format!("model_reasoning_effort={effort}")]);
-    }
-    args.extend(
-        [
-            "-s",
-            "read-only",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--output-schema",
-        ]
-        .map(String::from),
-    );
+    let dir = call.sandbox.dir();
+    let answer = dir.join("answer.json");
+    let instructions_file = dir.join("instructions.md");
+    let mut args: Vec<String> = [
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "-s",
+        "read-only",
+        "--output-schema",
+    ]
+    .map(String::from)
+    .to_vec();
     args.push(call.schema_path.to_string_lossy().into_owned());
     args.push("-o".into());
     args.push(answer.to_string_lossy().into_owned());
+    if let Some(model) = &call.profile.model {
+        args.extend(["-m".into(), model.clone()]);
+    }
+    let mut overrides = vec![
+        format!(
+            "model_instructions_file={}",
+            toml_string(&instructions_file.to_string_lossy())
+        ),
+        "project_doc_max_bytes=0".into(),
+        "include_permissions_instructions=false".into(),
+        "include_apps_instructions=false".into(),
+        "include_environment_context=false".into(),
+        "skills.include_instructions=false".into(),
+        "skills.bundled.enabled=false".into(),
+        "web_search=\"disabled\"".into(),
+        "agents.enabled=false".into(),
+        "tools.experimental_request_user_input.enabled=false".into(),
+        "history.persistence=\"none\"".into(),
+    ];
+    if let Some(effort) = &call.profile.effort {
+        overrides.push(format!("model_reasoning_effort={}", toml_string(effort)));
+    }
+    for o in overrides {
+        args.extend(["-c".into(), o]);
+    }
+    for feature in CODEX_DISABLED_FEATURES {
+        args.extend(["--disable".into(), feature.to_string()]);
+    }
     args.push(call.instructions.to_string());
     Invocation {
         program: "codex".into(),
         args,
         env: Vec::new(),
+        files: vec![(instructions_file, CODEX_INSTRUCTIONS.to_string())],
         answer_file: Some(answer),
     }
+}
+
+/// A TOML basic string, for `-c key=value` overrides.
+fn toml_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_default()
 }
 
 fn plain_answer(text: &str) -> Option<Value> {
@@ -380,6 +449,9 @@ async fn run(
         schema_path: &schema_path,
         instructions: &instructions,
     });
+    for (path, text) in &invocation.files {
+        std::fs::write(path, text)?;
+    }
     let mut cmd = Command::new(&invocation.program);
     cmd.args(&invocation.args)
         .current_dir(sandbox.dir())
@@ -636,7 +708,11 @@ mod tests {
     async fn the_call_runs_in_a_fresh_folder_that_is_gone_afterwards() {
         for (kind, answer, contents) in [
             ("claude", PICKS_DOCS, "schema.json\n"),
-            ("codex", r#"{"coordinator":"docs"}"#, "schema.json\n"),
+            (
+                "codex",
+                r#"{"coordinator":"docs"}"#,
+                "instructions.md\nschema.json\n",
+            ),
         ] {
             let fake = Fake::new(kind, answer);
             fake.choose(kind, Duration::from_secs(10)).await;
@@ -691,6 +767,70 @@ mod tests {
         // The login lives under the real HOME: the call keeps the ticker's.
         let home = std::env::var("HOME").unwrap();
         assert!(env.lines().any(|l| l == format!("HOME={home}")), "{env}");
+    }
+
+    #[tokio::test]
+    async fn the_codex_recipe_ignores_the_user_config_and_switches_the_rest_off() {
+        let fake = Fake::new("codex", r#"{"coordinator":"docs"}"#);
+        fake.choose("codex", Duration::from_secs(10)).await;
+        let args: Vec<String> = fake.seen("args").lines().map(String::from).collect();
+        let has = |a: &str| args.iter().any(|x| x == a);
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(!has("--dangerously-skip-permissions"));
+        for flag in [
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--ephemeral",
+            "--skip-git-repo-check",
+        ] {
+            assert!(has(flag), "{flag}");
+        }
+        assert!(pair("-s", "read-only") && pair("-m", "small"));
+        for o in [
+            "project_doc_max_bytes=0",
+            "history.persistence=\"none\"",
+            "model_reasoning_effort=\"low\"",
+            "skills.include_instructions=false",
+        ] {
+            assert!(pair("-c", o), "{o}");
+        }
+        for feature in ["hooks", "plugins", "memories", "shell_tool"] {
+            assert!(pair("--disable", feature), "{feature}");
+        }
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("model_instructions_file=")
+                    && a.ends_with("instructions.md\"")),
+            "{args:?}"
+        );
+    }
+
+    /// Runs the real `claude` and `codex` CLIs once each; `cargo test --
+    /// --ignored routing_live` with both logged in.
+    #[tokio::test]
+    #[ignore]
+    async fn routing_live() {
+        let parent = tempfile::tempdir().unwrap();
+        for (kind, model) in [("claude", "haiku"), ("codex", "gpt-5.6-luna")] {
+            let p = Profile {
+                model: Some(model.into()),
+                effort: Some("low".into()),
+                ..profile(kind)
+            };
+            let started = std::time::Instant::now();
+            let choice = choose(
+                &p,
+                &two(),
+                &issue(),
+                Duration::from_secs(120),
+                std::env::var("PATH").ok().as_deref(),
+                parent.path(),
+            )
+            .await;
+            println!("{kind}: {choice:?} in {:?}", started.elapsed());
+            assert!(matches!(choice, Choice::Agent(_)), "{kind}: {choice:?}");
+        }
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
     }
 
     #[test]
