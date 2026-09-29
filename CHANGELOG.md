@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- record the live check of profile inheritance and config reload (#66)
 - record the live check with two Linear workspaces (#63)
 - record the live check of workspace-qualified runs (#62)
 - record that no Linear scope or mutation exposes a worker's checks (#59)
@@ -19,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- reload the config without restarting the ticker (#65)
+- let a profile inherit from another profile (#64)
 - support several Linear workspaces and per-team settings (#61)
 - read each profile from a folder of its own (#60)
 - keep coordinators off their own subagents and workers off CI polling (#56)
