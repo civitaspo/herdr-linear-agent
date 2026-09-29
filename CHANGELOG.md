@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update dependency jdx/mise to v2026.9.17 (#49)
 - update jdx/mise-action action to v5 (#50)
 
 ## [0.3.0] - 2026-09-29
