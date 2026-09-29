@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-09-29
 
 
+### Documentation
+
+- record which Linear fields carry pull request checks and reviews (#57)
+
+
 ### Features
 
 - keep coordinators off their own subagents and workers off CI polling (#56)
