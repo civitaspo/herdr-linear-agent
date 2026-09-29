@@ -172,4 +172,6 @@ With a build of `8b4c4b8` and the ticker running in the default Herdr session, t
 | Next worker | worker w1, started after the reload, ran as `claude --model sonnet --effort medium --permission-mode auto --disallowed-tools=WebSearch` |
 | Close | Canceled closed the run 3 s later |
 
-THLA-17 was picked up 20.5 s after it was created, where the earlier checks took 2 to 6 s; the log shows nothing in between. A reload builds the Linear clients again, which reads the Keychain again, and a freshly built binary makes macOS ask before each read unless it is always allowed; that is the likely cause, not confirmed.
+THLA-17 was picked up 20.5 s after it was created, where the earlier checks took 2 to 6 s; the log shows nothing in between. A reload builds the Linear clients again, which reads the Keychain again, and macOS asked before those reads of the freshly built binary; the pickup waited until the prompts were approved, as the person who approved them confirmed.
+
+The first workspace's webhook delivery was disabled about 20 minutes before THLA-17, whose run opened its session and sent every activity with nothing left in its outbox.
