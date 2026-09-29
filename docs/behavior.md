@@ -157,7 +157,8 @@ runs/<KEY>/
   .state/outbox/failed/         requests Linear refused or that do not parse
   .state/outbox-counter.json    the last outbox counter
   .state/ignored-prompts.md     replies from users who are not allowed
-  .claude/settings.local.json   the coordinator's allow-list
+  .claude/settings.local.json   the coordinator's allow-list for Claude Code
+  .cursor/cli.json              the coordinator's allow-list for Cursor Agent
 ```
 
 Rules:
@@ -256,7 +257,7 @@ Kinds (`agents`):
 - `has_effort_flag`: true for `claude` and `codex`, false for every other kind.
 - The executable Herdr starts for kind `cursor` is `cursor-agent`; for every other kind it is the kind name.
 
-`profile_args(profile)`, in this order: model flag, effort flag, then `args` unchanged.
+`profile_args(profile)`, in this order: model flag, effort flag, then `args` unchanged. An `opencode` profile starts with `mini`: OpenCode's full interface takes no `--model`, and `mini` takes `--model` and `--session` (measured with OpenCode 2.0.15, which exits with `Unrecognized flag: --model` otherwise). `src/agents.rs:a_profile_becomes_model_effort_and_extra_flags_per_kind`
 
 | Kind | Model | Effort |
 | --- | --- | --- |
@@ -697,6 +698,7 @@ For an active run whose coordinator is `pending`:
      ```
    - `CLAUDE.md`: a symlink to `AGENTS.md`, replaced when it points elsewhere.
    - `.claude/settings.local.json`: `{"permissions":{"allow":["Bash(<bin> skill:*)", "Bash(<bin> context:*)", "Bash(<bin> inbox done:*)", "Bash(<bin> plan:*)", "Bash(<bin> say:*)", "Bash(<bin> ask:*)", "Bash(<bin> worker:*)", "Bash(<bin> finish:*)"]}}`. `startup`, `action` and `ticker` are never allowed.
+   - `.cursor/cli.json`: `{"permissions":{"allow":["Shell(<bin>)"],"deny":[]}}`. Cursor Agent matches the command as typed, so the entry is the path the sheet gives; without it every `herdr-linear-agent` command waits for approval (measured with Cursor Agent 2026.09.26). `src/coordinator.rs:priming_points_the_coordinator_at_the_binary_and_allows_only_agent_commands`
    - `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
 2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused.
 3. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` from the root pane; set `status open`, `prompt_pending true`, `launch_attempts 0`.

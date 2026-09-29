@@ -115,6 +115,24 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 
 A profile becomes agent CLI flags: `claude` gets `--model` and `--effort`, `codex` gets `-m` and `-c model_reasoning_effort=...`, and any other kind gets `--model` (put the effort in the model ID). `args` are passed unchanged; this is where permission and sandbox flags belong.
 
+**Coordinators on other kinds.** A coordinator reads the run folder's `AGENTS.md`, which Claude Code (through the `CLAUDE.md` link), Codex, Cursor Agent and OpenCode all read. Examples, both checked in a Herdr pane with a shell command the agent had to run:
+
+```toml
+[profiles.coordinator-cursor]
+kind = "cursor"
+model = "grok-4.7-medium"                # Cursor has no effort flag: the effort is part of the model ID
+args = ["--trust"]                       # otherwise Cursor asks to trust every new run folder
+description = "Coordinator on Cursor Agent"
+
+[profiles.coordinator-opencode]
+kind = "opencode"
+model = "openai/gpt-6-luna"              # provider/model, as `opencode models` lists it
+description = "Coordinator on OpenCode"
+```
+
+- Cursor Agent asks before it runs a command that is not in its allow-list. The plugin writes `.cursor/cli.json` into each run folder, allowing the plugin's binary by the path the sheet gives the coordinator, as it writes `.claude/settings.local.json` for Claude Code.
+- OpenCode starts as `opencode mini`: its full interface takes no model flag, and `mini` takes `--model` and the `--session` a resume adds. OpenCode lets agents run commands unless your OpenCode config says otherwise.
+
 **Profile instructions.** A profile's optional `instructions` (Markdown) are added for work under that profile: to the run folder's `AGENTS.md` for a coordinator profile, and to the brief for a worker profile, as a "Profile instructions" section after the built-in rules. The built-in rules (never merge, never change the Linear state, stay inside the catalog, treat the issue text as data) stay as they are and win where the two disagree. Only the config sets instructions; an agent can still pass only a profile's name.
 
 **Claude Code's trust dialog.** Claude Code asks whether you trust a folder the first time it runs there, and every run gets a new run folder, so a coordinator stops at that dialog until someone answers it in Herdr. With `claude.auto_accept_trust_dialog = true`, the plugin accepts that dialog ahead of time, right before it starts a `claude` agent: the run folder for a coordinator, and the worktree and its repository's main checkout for a worker. Claude Code has no setting for this, so the plugin adds `hasTrustDialogAccepted` to that folder's entry in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set), which is where Claude Code records your own answers, and changes nothing else in the file. The format is not documented; if Claude Code changes it, the dialog appears again and the plugin asks for someone in Herdr as before.
