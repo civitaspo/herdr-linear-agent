@@ -160,3 +160,16 @@ Then with a second workspace (its own OAuth application and app user, and a team
 | Close | canceling both issues closed both runs and their workspaces within 4 s |
 
 The same issue key in both workspaces at once (for example THLA-1 in each) was not run against Linear; `tests/scenarios:two_workspaces_with_the_same_issue_key_run_apart_under_their_own_team_rules` covers it.
+
+## Profile inheritance and config reload (2026-09-29)
+
+With a build of `8b4c4b8` and the ticker running in the default Herdr session, the profiles were rewritten without stopping it: a new `claude-base` (`kind = "claude"`, `args = ["--permission-mode", "auto"]`, an `instructions.md`), `coordinator` made `base = "claude-base"` with its own `instructions.md` and no `args`, and `--disallowed-tools=WebSearch` added to the `worker` profile's `args`.
+
+| Step | Result |
+| --- | --- |
+| Reload | `config changed; restarting the ticker's tasks` was logged 1 s after the files were written, and again 4 s after they were put back at the end |
+| Inheritance | THLA-17's routing agent chose `coordinator`; its `AGENTS.md` had the multi-layer section with `### From the claude-base profile` and then `### From the coordinator profile`, and the coordinator ran as `claude --model sonnet --effort medium --permission-mode auto`, the args coming from the base |
+| Next worker | worker w1, started after the reload, ran as `claude --model sonnet --effort medium --permission-mode auto --disallowed-tools=WebSearch` |
+| Close | Canceled closed the run 3 s later |
+
+THLA-17 was picked up 20.5 s after it was created, where the earlier checks took 2 to 6 s; the log shows nothing in between. A reload builds the Linear clients again, which reads the Keychain again, and a freshly built binary makes macOS ask before each read unless it is always allowed; that is the likely cause, not confirmed.
