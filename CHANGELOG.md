@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- record the Cursor Agent and OpenCode coordinator checks (#52)
 - record the live routing check in the scratch Linear team (#48)
 
 
