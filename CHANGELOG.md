@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- let the routing agent's profile set environment variables (#53)
 - support Cursor Agent and OpenCode as coordinators and routing agents (#51)
 - let a routing agent pick each issue's coordinator profile (#46)
 
