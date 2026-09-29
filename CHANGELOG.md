@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-09-29
 
 
+### Bug Fixes
+
+- end the Linear session when a run closes (#68)
+
+
 ### Documentation
 
 - tell users to disable the webhook's delivery (#67)
