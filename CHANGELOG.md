@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - support Cursor Agent and OpenCode as coordinators and routing agents (#51)
 - let a routing agent pick each issue's coordinator profile (#46)
 
+
+### Maintenance
+
+- update mise to 2026.9.16 (#54)
+
 ## [0.2.1] - 2026-09-28
 
 
