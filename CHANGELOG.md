@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- record the live check with two Linear workspaces (#63)
 - record the live check of workspace-qualified runs (#62)
 - record that no Linear scope or mutation exposes a worker's checks (#59)
 - record that the app user cannot read a worker's checks from Linear (#58)
