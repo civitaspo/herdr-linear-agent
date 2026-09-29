@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- record that the app user cannot read a worker's checks from Linear (#58)
 - record which Linear fields carry pull request checks and reviews (#57)
 
 
