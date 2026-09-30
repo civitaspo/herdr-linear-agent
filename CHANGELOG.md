@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- take only issues delegated by allowed users (#71)
 - reload the config on request and tell when it changed (#69)
 - reload the config without restarting the ticker (#65)
 - let a profile inherit from another profile (#64)
