@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - record agent sessions and keep their transcripts in the run folder (#76)
 - browse past runs and their agent transcripts (#74)
 
+
+### Maintenance
+
+- update dependency jdx/mise to v2026.9.18 (#77)
+
 ## [0.4.0] - 2026-09-30
 
 
