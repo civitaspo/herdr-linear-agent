@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.0] - 2026-09-30
 
 
+### Bug Fixes
+
+- color the history screens with the theme's palette (#78)
+
+
 ### Features
 
 - record agent sessions and keep their transcripts in the run folder (#76)
