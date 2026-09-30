@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- begin each postmortem with how the run stands (#81)
 - tell the final postmortem which state the issue closed in (#80)
 - color the history screens with the theme's palette (#78)
 
