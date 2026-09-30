@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- take the delegator from the latest delegation in the issue history (#73)
 - end the Linear session when a run closes (#68)
 
 
