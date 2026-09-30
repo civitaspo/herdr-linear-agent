@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- record the live check of the closing response and manual reload (#70)
 - tell users to disable the webhook's delivery (#67)
 - record the live check of profile inheritance and config reload (#66)
 - record the live check with two Linear workspaces (#63)
