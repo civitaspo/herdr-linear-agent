@@ -197,25 +197,38 @@ Before the change, Linear's API was read to find who delegated an issue:
 
 | Source | Result |
 | --- | --- |
-| `AgentSession.creator` (`issue.agentSessions.nodes[].creator { id name }`) | the person who delegated: every session of the civitaspo app (THLA-3 to THLA-18) had the user's own ID, `6b7b1cde-f3cc-4886-8339-660f4851e476` |
-| `AgentSession.creator` of an issue the app user created and delegated to itself | `null`: the second workspace's THLA-1 and THLA-2, created with that app's token, have a session without a creator |
-| `IssueHistory` (`actor`, `fromDelegate`, `toDelegate`) | no entry: none of THLA-3, 15, 16, 17 and 18 shows a delegate change, since each was delegated when it was created |
+| `AgentSession.creator` (`issue.agentSessions.nodes[].creator { id name }`) | the person who delegated when the session opened: every session of the civitaspo app (THLA-3 to THLA-18) had the user's own ID, `6b7b1cde-f3cc-4886-8339-660f4851e476` |
+| `AgentSession.creator` of an issue the app user created and delegated to itself | `null`: the second workspace's THLA-1 and THLA-2, created with that app's token |
+| `AgentSession.creator` of an issue made through Linear's Slack integration | the person who asked in Slack: the second workspace's THLA-3, made from a Slack DM, has the user's ID there, `40bb3469-bb61-49b4-b444-cf9ebd0b1fc1`, and `sourceMetadata` `{ type: "integration", subType: "slack", aiMetadata: { source: "intake", invokedByUserId: <the same ID> } }` |
+| `IssueHistory` (`actor`, `fromDelegate`, `toDelegate`) | an entry for each delegation made after the issue was created, with the person as `actor`. There is none for a delegation made as the issue was created, which is why THLA-3 to THLA-18 show none |
 | workspace-wide `agentSessions(first: 50)` | holds other apps' sessions too: in the second workspace, 2 of the 50 were this app's. `Issue.agentSessions`, marked internal, gives an issue's own sessions |
 
-With a build of `a6e5452` in the default Herdr session:
+With a build of `a6e5452` (#71) in the default Herdr session:
 
 | Step | Result |
 | --- | --- |
-| Allowed delegator | THLA-19, delegated by the user at 04:41:32, was picked up 2 s later with Linear's session (creator the user) stored at the claim; its coordinator read the issue, called `finish`, and the issue went to In Review with the session `complete` |
+| Allowed delegator | THLA-19, delegated by the user at 04:41:32, was picked up 2 s later with Linear's session (creator the user) stored at the claim; its coordinator read the issue, called `finish`, and the issue went to In Review |
 | Delegator not allowed | with `allowed_delegator_ids` set to a placeholder ID for the THLA team and the config reloaded, THLA-20, delegated by the user at 04:42:10, got no run 5 s later, while THLA-19 held the only run allowed by `max_runs = 1`. The ticker logged `civitaspo/THLA-20: not picked up: delegated by civi@hey.com (6b7b1cde-f3cc-4886-8339-660f4851e476), who is not in allowed_delegator_ids of team THLA`, and its session got one response, `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.`, which made it `complete` |
 | Once | after more polls and a ticker restart, the log line appeared once and the session still had one activity |
-| Query | the new `HlaDelegatedIssues` text cost 44 complexity points in both workspaces with nothing delegated |
+| Slack | the second workspace's THLA-3, made and delegated through Slack while THLA-19 held the only run, was picked up the moment THLA-19 was canceled, in the session Linear opened from Slack |
 
-The config was put back afterwards, and THLA-20 was canceled.
+Delegating again, on the same build:
 
-Not checked live:
+| Step | Result |
+| --- | --- |
+| Canceled issue | taking the delegation off THLA-19 and giving it back added two history entries (`fromDelegate`, then `toDelegate`, actor the user) and no session; the only session stayed `complete` |
+| Open issue | THLA-19 moved to Todo restarted its closed run in its old session; taking the delegation off detached it, and giving it back again added no session either (the old one stayed `active`) |
 
-- A delegation through Linear's Slack integration.
-- Whether Linear opens a new session when an issue is delegated again. Taking the delegation off THLA-18 was a Linear write outside this check.
+So the creator of the newest session names whoever delegated first, and a closed run that someone else delegated again would have started again. #73 takes the delegator from the history. Its live check also found that a session's `endedAt` and `updatedAt` stay at its first completion: THLA-19's stayed at 05:00:30 after a closing response at 05:04:54 and a decline at 05:05:08.
 
-A closed run that another person delegates again stays closed only if Linear opens a new session for that delegation. `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_not_allowed_stays_closed` assumes it does.
+With a build of #73:
+
+| Step | Result |
+| --- | --- |
+| Delegated again by someone not allowed | with the placeholder ID allowed again, THLA-19's run was closed (canceled), its delegation taken off and given back, and the issue moved to Todo. The ticker logged `civitaspo/THLA-19: not picked up: delegated by civi@hey.com (6b7b1cde-f3cc-4886-8339-660f4851e476), who is not in allowed_delegator_ids of team THLA`; the run stayed closed, and the session got the decline after its closing response |
+| Once | after a restart on the final build, which tells an answered decline by the session's latest activity, no second decline went out |
+| Query | `HlaDelegatedIssues` with the sessions' latest activity and the history cost 116 complexity points with one delegated issue |
+
+The config was put back afterwards, and THLA-19 and THLA-20 were canceled.
+
+The Herdr notification, shown with `notification_show`, was not checked by eye; Herdr's CLI lists no past notifications.
