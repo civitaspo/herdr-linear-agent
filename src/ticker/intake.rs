@@ -27,8 +27,8 @@ fn after_cursor(created: &str, cursor: &str) -> bool {
 enum Delegation {
     /// Someone the team allows to delegate delegated it.
     Allowed,
-    /// Someone else, or no person, and the app's session ended after the
-    /// delegation: it was declined already.
+    /// Someone else, or no person, and the app's session was answered after
+    /// the delegation: it was declined already.
     Answered,
     /// Someone else, or no person (automation or an agent): the decline for
     /// the app's session, or `None` when there is no session to answer.
@@ -47,9 +47,9 @@ fn delegation(key: &str, issue: &IssueRef, delegators: &[String]) -> Delegation 
         return Delegation::Declined(None);
     };
     let at = |text: &str| text.parse::<Timestamp>().ok();
-    let ended = session.ended_at.as_deref().and_then(at);
+    let responded = session.responded_at.as_deref().and_then(at);
     let delegated = delegator.and_then(|d| at(&d.at));
-    if session.status == "complete" && ended.is_some() && ended >= delegated {
+    if responded.is_some() && responded >= delegated {
         Delegation::Answered
     } else {
         Delegation::Declined(Some(Decline {

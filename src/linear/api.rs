@@ -31,7 +31,12 @@ const DELEGATED_QUERY: &str = r#"query HlaDelegatedIssues($teamKeys: [String!]!,
   ) {
     nodes {
       id identifier title url updatedAt state { type } team { key }
-      agentSessions(first: 10) { nodes { id status createdAt endedAt appUser { id } creator { id name } } }
+      agentSessions(first: 10) {
+        nodes {
+          id status createdAt appUser { id } creator { id name }
+          activities(first: 1) { nodes { createdAt content { __typename } } }
+        }
+      }
       history(first: 20) { nodes { createdAt actor { id name } toDelegate { id } } }
     }
     pageInfo { hasNextPage endCursor }
@@ -130,12 +135,13 @@ pub struct Delegator {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionRef {
     pub id: String,
     pub status: String,
-    pub ended_at: Option<String>,
+    /// When the session's latest activity is a response, when it was sent.
+    /// A session's `endedAt` and `updatedAt` stay at its first completion.
+    pub responded_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -659,7 +665,17 @@ fn delegation(
     let session = sessions
         .into_iter()
         .max_by(created)
-        .map(|s| serde_json::from_value(s.clone()))
+        .map(|s| {
+            let latest = nodes(&s["activities"]).next();
+            Ok::<_, serde_json::Error>(SessionRef {
+                id: serde_json::from_value(s["id"].clone())?,
+                status: serde_json::from_value(s["status"].clone())?,
+                responded_at: latest
+                    .filter(|a| a["content"]["__typename"] == "AgentActivityResponseContent")
+                    .and_then(|a| a["createdAt"].as_str())
+                    .map(str::to_string),
+            })
+        })
         .transpose()?;
     Ok((delegator, session))
 }
@@ -769,7 +785,6 @@ pub mod fake {
         pub created_at: String,
         /// `{ id, name }` of the person who delegated, or null.
         pub creator: Value,
-        pub ended_at: Option<String>,
         /// Activity records in the shape the API returns, oldest first.
         pub activities: Vec<Value>,
         pub plan: Option<Value>,
@@ -1083,7 +1098,11 @@ pub mod fake {
                                 "id": i["id"], "identifier": i["identifier"], "title": i["title"], "url": i["url"],
                                 "updatedAt": i["updatedAt"], "state": { "type": i["state"]["type"] }, "team": { "key": i["team"]["key"] },
                                 "agentSessions": { "nodes": self.sessions.iter().filter(|s| s.issue_id == i["id"]).map(|s| json!({
-                                    "id": s.id, "status": s.status, "createdAt": s.created_at, "endedAt": s.ended_at, "appUser": { "id": APP_USER }, "creator": s.creator
+                                    "id": s.id, "status": s.status, "createdAt": s.created_at, "appUser": { "id": APP_USER }, "creator": s.creator,
+                                    "activities": { "nodes": s.activities.last().map(|a| json!({
+                                        "createdAt": a["createdAt"],
+                                        "content": { "__typename": if a["type"] == "response" { "AgentActivityResponseContent" } else { "AgentActivityThoughtContent" } }
+                                    })).into_iter().collect::<Vec<_>>() }
                                 })).collect::<Vec<_>>() },
                                 "history": i["history"]
                             })
@@ -1144,7 +1163,6 @@ pub mod fake {
                     // A response ends the session, as in Linear.
                     if activity["type"] == "response" {
                         session.status = "complete".into();
-                        session.ended_at = Some(created.clone());
                     }
                     session.activities.push(activity);
                     if input["ephemeral"] != true {

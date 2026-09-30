@@ -864,7 +864,7 @@ mod tests {
                         session: Some(crate::linear::api::SessionRef {
                             id: format!("session-{key}"),
                             status: "pending".into(),
-                            ended_at: None,
+                            responded_at: None,
                         }),
                     }],
                 }),

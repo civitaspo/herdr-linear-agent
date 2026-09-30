@@ -463,7 +463,7 @@ The kept modules `src/linear/*` define the operations; the rewrite may make them
 | Operation | Name | Behavior |
 | --- | --- | --- |
 | `viewer` | `HlaViewer` | `{id, name}` |
-| `delegated_issues(teams)` | `HlaDelegatedIssues` | issues with `delegate.isMe`, team key in the list, state type not `completed`/`canceled`; 50 per page, at most 4 pages. Each issue also brings its first 10 `agentSessions` (`id`, `status`, `createdAt`, `endedAt`, `appUser`, `creator { id name }`) and its first 20 `history` entries (`createdAt`, `actor { id name }`, `toDelegate { id }`), from which the client keeps the delegator and the app's newest session (see [Who delegated](#who-delegated)). `Issue.agentSessions` is marked internal in Linear's schema; the workspace-wide `agentSessions` list holds other apps' sessions too, so the app's own may be missing from its first page |
+| `delegated_issues(teams)` | `HlaDelegatedIssues` | issues with `delegate.isMe`, team key in the list, state type not `completed`/`canceled`; 50 per page, at most 4 pages. Each issue also brings its first 10 `agentSessions` (`id`, `status`, `createdAt`, `appUser`, `creator { id name }`, and the latest activity's `createdAt` and content type) and its first 20 `history` entries (`createdAt`, `actor { id name }`, `toDelegate { id }`), from which the client keeps the delegator and the app's newest session (see [Who delegated](#who-delegated)). `Issue.agentSessions` is marked internal in Linear's schema; the workspace-wide `agentSessions` list holds other apps' sessions too, so the app's own may be missing from its first page |
 | `issue(id)` | `HlaIssue` | `IssueDetail`: team states, estimation type (default `notUsed`), labels with parent group name, first 50 comments (author default `(unknown)`) |
 | `open_session(issue)` | `HlaSessions`, then `HlaSessionCreate` | the newest (by `createdAt`) session of this app user on the issue whose status is not `complete`; otherwise creates one with `agentSessionCreateOnIssue` |
 | `create_activity(session, id, activity)` | `HlaActivityCreate` | input `agentSessionId`, `id` (the caller's UUID), `content`, `ephemeral`, and `signal`/`signalMetadata` when set |
@@ -564,7 +564,7 @@ The delegator and the app's newest session decide, with the team's delegators: `
 | Delegator and session | Result |
 | --- | --- |
 | delegator in the delegators | taken: claimed, or a stopped run is set active |
-| otherwise, the session `complete` with `endedAt` at or after the delegation | skipped silently: declined before, or ended after it |
+| otherwise, the session's latest activity a response sent at or after the delegation | skipped silently: declined already |
 | otherwise, with a session | declined: no run, no routing agent; the session is answered once |
 | otherwise, no session of the app | declined: nothing to answer |
 
@@ -578,7 +578,7 @@ A decline is told once per delegation, in the log and a Herdr notification title
 | no person | `no person delegated it (automation or an agent did)` |
 | not told | `Linear does not tell who delegated it` |
 
-The reconciler hands the declines with a session to the Linear task, which sends the response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.` once per session and delegation; the response ends the session and sets its `endedAt` after the delegation, so later polls skip it, across restarts too. `src/ticker/scenarios.rs:an_issue_delegated_by_someone_not_allowed_is_declined_once`, `src/ticker/scenarios.rs:an_issue_no_person_is_known_to_have_delegated_is_not_picked_up`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_not_allowed_stays_closed`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_allowed_continues`, `src/ticker/scenarios.rs:the_latest_delegation_decides_who_delegated`
+The reconciler hands the declines with a session to the Linear task, which sends the response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.` once per session and delegation. The response ends the session and becomes its latest activity, so later polls, across restarts too, see it answered. A session's `endedAt` and `updatedAt` stay at its first completion, so they cannot tell. `src/ticker/scenarios.rs:an_issue_delegated_by_someone_not_allowed_is_declined_once`, `src/ticker/scenarios.rs:an_issue_no_person_is_known_to_have_delegated_is_not_picked_up`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_not_allowed_stays_closed`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_allowed_continues`, `src/ticker/scenarios.rs:the_latest_delegation_decides_who_delegated`
 
 A run that is active is not checked: its issue keeps going whoever opens another session on it, for example by mentioning the agent.
 
