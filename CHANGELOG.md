@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- record agent sessions and keep their transcripts in the run folder (#76)
 - browse past runs and their agent transcripts (#74)
 
 ## [0.4.0] - 2026-09-30
