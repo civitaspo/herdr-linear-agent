@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- post interim and final postmortems per team (#79)
 - record agent sessions and keep their transcripts in the run folder (#76)
 - browse past runs and their agent transcripts (#74)
 
