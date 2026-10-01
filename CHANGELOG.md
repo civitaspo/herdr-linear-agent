@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - pick routings per team and postmortems when they are written (#82)
 
+
+### Maintenance
+
+- update jdx/mise-action action to v5.0.1 (#84)
+
 ## [0.5.0] - 2026-09-30
 
 
