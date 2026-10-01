@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - protect persisted state and recover failed worker launches (#86)
 
+
+### Maintenance
+
+- update dependency rust to v1.99.0 (#88)
+
 ## [0.6.0] - 2026-10-01
 
 
