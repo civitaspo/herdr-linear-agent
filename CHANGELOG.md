@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- spell out herdr-linear-agent in pane tokens and other names (#85)
 - pick routings per team and postmortems when they are written (#82)
 
 
