@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update rust crate libc to v0.2.190 (#93)
 - update dependency jdx/mise to v2026.10.0 (#89)
 - update dependency rust to v1.99.0 (#88)
 
