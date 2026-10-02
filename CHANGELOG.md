@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- resume crashed agents with a persistent retry limit (#92)
 - preserve native Linear input while agents report progress (#91)
 - protect persisted state and recover failed worker launches (#86)
 
