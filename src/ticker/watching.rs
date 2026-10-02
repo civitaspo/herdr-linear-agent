@@ -388,13 +388,16 @@ impl Reconciler {
             .await?;
             let report =
                 std::fs::read_to_string(worker::home_report_path(run, &w.id)).unwrap_or_default();
-            let summary = worker::report_summary(&report);
+            // A thought, since Linear renders its body as Markdown and an
+            // action's result as code.
+            let section = worker::report_section(&report);
+            let body = if section.is_empty() {
+                format!("{} ({}) wrote a report.", w.id, w.repo)
+            } else {
+                format!("{} ({}) reported:\n\n{section}", w.id, w.repo)
+            };
             milestones.push(Op::Activity {
-                activity: Activity::new(Content::Action {
-                    action: "Worker report".into(),
-                    parameter: format!("{} ({})", w.id, w.repo),
-                    result: (!summary.is_empty()).then_some(summary),
-                }),
+                activity: Activity::new(Content::Thought { body }),
             });
             next.announced_report_hash = next.report_hash.clone();
         }

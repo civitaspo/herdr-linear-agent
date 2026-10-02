@@ -261,18 +261,25 @@ pub fn copy_report_home(run: &Run, worker: &Worker) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// The first paragraph of the report's `## Report` section on one line,
-/// at most 300 characters; empty when there is none.
-pub fn report_summary(report: &str) -> String {
-    let paragraph: Vec<&str> = report
+/// The report's `## Report` section as written, without its heading, in
+/// whole lines of at most 1,500 characters together; empty when there is
+/// none.
+pub fn report_section(report: &str) -> String {
+    let mut text = String::new();
+    for line in report
         .lines()
         .skip_while(|l| l.trim() != "## Report")
         .skip(1)
-        .map(str::trim)
-        .skip_while(|l| l.is_empty())
-        .take_while(|l| !l.is_empty() && !l.starts_with("## "))
-        .collect();
-    crate::transcript::clip(&paragraph.join(" "), 300)
+        .take_while(|l| !l.starts_with("## "))
+    {
+        if text.chars().count() + line.chars().count() > 1500 {
+            text.push_str("…\n");
+            break;
+        }
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text.trim_matches('\n').to_string()
 }
 
 /// The pull request of the report's first `PR:` line, when it names one.
@@ -924,22 +931,20 @@ mod tests {
     }
 
     #[test]
-    fn the_report_summary_is_the_first_paragraph_of_the_report_section() {
+    fn the_report_section_keeps_its_lines_and_stops_at_the_next_heading() {
+        let long = format!("## Report\n- {}\n- {}\n", "a".repeat(900), "b".repeat(900));
         let table = [
             (
-                "PR: x\n## Report\n\nChanged the login.\nCI passed.\n\nMore.\n## Next\n- Review\n",
-                "Changed the login. CI passed.".to_string(),
+                "PR: x\n## Report\n\n- Changed the login.\n  - and its test\n\nCI passed.  \n## Next\n- Review\n",
+                "- Changed the login.\n  - and its test\n\nCI passed.".to_string(),
             ),
             ("## Report\nDone.\n## Next\n- Review\n", "Done.".into()),
             ("## Report\n## Next\n- Review\n", String::new()),
             ("No sections.", String::new()),
-            (
-                &format!("## Report\n{}\n", "é".repeat(301)),
-                format!("{}…", "é".repeat(300)),
-            ),
+            (&long, format!("- {}\n…", "a".repeat(900))),
         ];
         for (report, expected) in table {
-            assert_eq!(report_summary(report), expected, "{report:?}");
+            assert_eq!(report_section(report), expected, "{report:?}");
         }
     }
 

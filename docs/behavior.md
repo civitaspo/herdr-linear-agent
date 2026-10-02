@@ -733,13 +733,13 @@ For every worker that is `open` or `failed`, except an `open` worker without a p
    - Waiting on you: `<id> (<repo>) is Waiting on you: <reason>.` with `<reason>` the first that holds: `failed: <error>`; `its pane closed before it wrote a report`; `it asked a question in its report`; `it waits on a dialog in pane <pane id>`; the agent status; `no agent`. Unless it waits on a dialog, which step 6 already asks a person about, also queue the action `Worker waiting` with parameter `<id> (<repo>): <reason>`.
    - Idle: `<id> (<repo>) is idle without a report; check its pane <pane id>.`
    - Reported and Working write nothing.
-5. When the group is Reported and the report hash differs from `announced_report_hash`: write `<id> (<repo>) has a new report: workers/<id>.md`, queue the action `Worker report` with parameter `<id> (<repo>)` and as result the first paragraph of the report's `## Report` section on one line (at most 300 characters, then `…`; no result when empty), and store the hash. The actions of steps 4 and 5 are queued in the critical section that stores `last_group` and `announced_report_hash`. `src/worker.rs:the_report_summary_is_the_first_paragraph_of_the_report_section`
+5. When the group is Reported and the report hash differs from `announced_report_hash`: write `<id> (<repo>) has a new report: workers/<id>.md`, queue the thought `<id> (<repo>) reported:` followed by a blank line and the report's `## Report` section as written (its lines up to the next `## ` heading, in whole lines of at most 1,500 characters together, then `…`), or `<id> (<repo>) wrote a report.` when the section is missing or empty, and store the hash. It is a thought because Linear renders a thought's body as Markdown and an action's result as code. The activities of steps 4 and 5 are queued in the critical section that stores `last_group` and `announced_report_hash`. `src/worker.rs:the_report_section_keeps_its_lines_and_stops_at_the_next_heading`
 6. When it needs a person and was not reported: ask for a person (`Worker <id> (<repo>)`), set `blocked_reported`.
 7. When it is `open`, its pane is gone, no report exists and this was not reported: queue the error activity `Worker <id> (<repo>) lost its pane before it wrote a report.` and set `gone_reported`.
 8. When the pane exists: report pane metadata with display `<KEY> · <id> <title>` and state the group label.
 9. Save the record when it changed, keeping its `created` and `updated`.
 
-Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a new report`, the home copy `workers/w1.md`, the actions `Start worker`, `Pull request` and `Worker report` (result `Done.`), the external URL `https://github.com/acme/api/pull/7`. `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`. A blocked worker gives one elicitation containing its pane id, a Herdr notification, and an inbox item containing `Waiting on you`. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a new report`, the home copy `workers/w1.md`, the actions `Start worker` then `Pull request`, the thought `w1 (api) reported:` with `Done.`, the external URL `https://github.com/acme/api/pull/7`. `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`. A blocked worker gives one elicitation containing its pane id, a Herdr notification, and an inbox item containing `Waiting on you`. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
 
 ### Pane metadata tokens
 
@@ -886,7 +886,7 @@ After the runs, the task answers each decline it has not answered yet with a `re
 | PR in a report | action `Pull request` and the URL list |
 | worker's own activity changed | ephemeral thought `<id> (<repo>): <activity>` |
 | worker Waiting on you | action `Worker waiting` |
-| worker's new report | action `Worker report` with the report's first paragraph |
+| worker's new report | thought with the report's `## Report` section |
 | dialog in a pane | elicitation (and notification) |
 | coordinator pane gone | elicitation with `Resume` |
 | worker pane gone before a report | error activity |

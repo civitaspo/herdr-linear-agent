@@ -490,13 +490,10 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
     let items = world.inbox(KEY);
     assert!(mentions(&items, "w1 (api) has a new report"), "{items:?}");
     assert!(worker::home_report_path(&world.run(KEY), "w1").is_file());
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
     assert_eq!(
-        world.actions(KEY),
-        ["Start worker", "Pull request", "Worker report"]
-    );
-    assert_eq!(
-        world.sent(KEY, "action")[2]["content"],
-        json!({"type": "action", "action": "Worker report", "parameter": "w1 (api)", "result": "Done."})
+        count(&world.bodies(KEY, "thought"), "w1 (api) reported:\n\nDone."),
+        1
     );
     {
         let linear = world.fake();
@@ -1433,9 +1430,10 @@ async fn every_pass_repeated_at_once_changes_nothing() {
     assert_eq!(world.herdr.starts().len(), 2);
     assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
     assert_eq!(count(&to(&world, &coordinator), NUDGE_INBOX), 1);
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
     assert_eq!(
-        world.actions(KEY),
-        ["Start worker", "Pull request", "Worker report"]
+        count(&world.bodies(KEY, "thought"), "w1 (api) wrote a report."),
+        1
     );
 }
 
@@ -1575,9 +1573,10 @@ async fn a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails() {
     }
     std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
     world.settle().await;
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
     assert_eq!(
-        world.actions(KEY),
-        ["Start worker", "Pull request", "Worker report"]
+        count(&world.bodies(KEY, "thought"), "w1 (api) reported:\n\nDone."),
+        1
     );
     assert!(mentions(&world.inbox(KEY), "w1 (api) has a new report"));
 }
@@ -2114,9 +2113,10 @@ async fn a_run_under_every_lag_knob_writes_each_fact_once() {
     assert_eq!(to(&world, &coordinator)[0], LAUNCH);
     assert_eq!(count(&to(&world, &coordinator), LAUNCH), 1);
     assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
     assert_eq!(
-        world.actions(KEY),
-        ["Start worker", "Pull request", "Worker report"]
+        count(&world.bodies(KEY, "thought"), "w1 (api) wrote a report."),
+        1
     );
     assert_eq!(count(&world.bodies(KEY, "thought"), "Picked up DATA-1."), 1);
     let relayed = world.text(KEY, "conversation.md");

@@ -342,7 +342,7 @@ enum Item {
 const LINE: usize = 200;
 const RESULT_LINES: usize = 5;
 
-pub(crate) fn clip(text: &str, max: usize) -> String {
+fn clip(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((at, _)) => format!("{}…", &text[..at]),
         None => text.to_string(),
