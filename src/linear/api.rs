@@ -1305,10 +1305,13 @@ pub mod fake {
                     if activity["signal"].is_null() {
                         activity["signal"] = Value::Null;
                     }
-                    // A response ends the session, as in Linear.
-                    if activity["type"] == "response" {
-                        session.status = "complete".into();
+                    session.status = match activity["type"].as_str() {
+                        Some("elicitation") => "awaitingInput",
+                        Some("thought" | "action") => "active",
+                        Some("response") => "complete",
+                        _ => session.status.as_str(),
                     }
+                    .into();
                     session.activities.push(activity);
                     if input["ephemeral"] != true {
                         let body = input["content"]["body"].as_str().unwrap_or("").to_string();
@@ -1560,6 +1563,11 @@ mod tests {
             })
         };
         linear.create_activity(&session, "a-2", &ask).await.unwrap();
+        assert_eq!(
+            linear.lock().unwrap().sessions[0].status,
+            "awaitingInput",
+            "elicitation waits for a person"
+        );
         linear
             .set_plan(
                 &session,
@@ -1586,6 +1594,7 @@ mod tests {
             let mut fake = linear.lock().unwrap();
             let stored = &fake.sessions[0];
             assert_eq!(stored.sent_types(), ["thought", "elicitation"]);
+            assert_eq!(stored.status, "awaitingInput");
             assert_eq!(
                 stored.sent("elicitation")[0]["signalMetadata"]["options"][0]["value"],
                 "yes"
@@ -1595,6 +1604,18 @@ mod tests {
             fake.add_prompt("DATA-1", "user-1", "first", None);
             fake.add_prompt("DATA-1", "user-2", "stop now", Some("stop"));
         }
+
+        linear
+            .create_activity(
+                &session,
+                "a-3",
+                &Activity::new(Content::Response {
+                    body: "Done".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(linear.lock().unwrap().sessions[0].status, "complete");
 
         let query = RunQuery {
             issue_id: issue.clone(),

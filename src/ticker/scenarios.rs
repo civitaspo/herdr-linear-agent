@@ -747,6 +747,49 @@ async fn quiet_runs_get_a_heartbeat_and_long_ones_ask_to_go_on() {
 }
 
 #[tokio::test]
+async fn an_explicit_question_stays_the_latest_activity_past_the_heartbeat_deadline() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    assert_eq!(world.sent(KEY, "elicitation").last().unwrap()["content"]["body"], "Should I proceed?");
+
+    world.later(10 * 60);
+    world.settle().await;
+
+    assert_eq!(
+        world.fake().session("DATA-1").sent_types().last().map(String::as_str),
+        Some("elicitation"),
+        "no heartbeat or worker activity should replace the outstanding question"
+    );
+    assert_eq!(world.fake().session("DATA-1").status, "awaitingInput");
+}
+
+#[tokio::test]
+async fn a_worker_report_is_saved_locally_while_linear_waits_for_an_answer() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.settle().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+
+    world.report(&worker, "## Report\n\nThe tests pass.\n");
+    world.settle().await;
+
+    assert!(crate::worker::home_report_path(&world.run(KEY), "w1").is_file());
+    assert_eq!(
+        world.fake().session("DATA-1").sent_types().last().map(String::as_str),
+        Some("elicitation"),
+        "saving the worker report must not publish progress over the question"
+    );
+}
+
+#[tokio::test]
 async fn a_completed_issue_closes_its_run_and_a_reopened_one_resumes() {
     let mut world = World::sample();
     world.running_issue().await;
