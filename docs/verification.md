@@ -344,4 +344,6 @@ With a build of the branch in the default Herdr session, THLA-29 asked for one w
 | Report | the `Worker report` action was in the session after `Pull request`, but Linear showed its result as code and the bullets joined into one line were hard to read. The report is now a thought with the `## Report` section as written, which Linear renders as Markdown |
 | Heartbeat | not seen: the run never had 10 quiet minutes. `a_workers_activity_goes_to_linear_once_and_the_heartbeat_says_how_long` covers it |
 
+After the fix, THLA-30 had one worker list the testing repository's files without a change. Its report reached the session as the thought `w1 (testing) reported:` with the `## Report` section, and Linear rendered its lines and bullets as Markdown.
+
 The first attempt, THLA-28, was picked up by the installed release build, whose startup hook had replaced the branch's ticker, and its catalog had no `testing` repository; it was canceled.
