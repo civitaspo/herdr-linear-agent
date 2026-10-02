@@ -49,6 +49,10 @@ pub struct Worker {
     pub pr_url: String,
     /// The "lost its pane before a report" error was sent.
     pub gone_reported: bool,
+    /// The activity of the worker's own progress record last sent to
+    /// Linear, and when it was first seen.
+    pub activity: String,
+    pub activity_since: String,
     /// `worker restart` is moving it to a new pane: the watcher leaves it
     /// alone until a snapshot shows the recorded pane.
     pub restarting: bool,
@@ -255,6 +259,20 @@ pub fn copy_report_home(run: &Run, worker: &Worker) -> Result<Option<String>> {
     };
     write_atomic(&home_report_path(run, &worker.id), &bytes)?;
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The first paragraph of the report's `## Report` section on one line,
+/// at most 300 characters; empty when there is none.
+pub fn report_summary(report: &str) -> String {
+    let paragraph: Vec<&str> = report
+        .lines()
+        .skip_while(|l| l.trim() != "## Report")
+        .skip(1)
+        .map(str::trim)
+        .skip_while(|l| l.is_empty())
+        .take_while(|l| !l.is_empty() && !l.starts_with("## "))
+        .collect();
+    crate::transcript::clip(&paragraph.join(" "), 300)
 }
 
 /// The pull request of the report's first `PR:` line, when it names one.
@@ -902,6 +920,26 @@ mod tests {
         ];
         for (report, expected) in table {
             assert_eq!(pr_line(report).as_deref(), expected, "{report:?}");
+        }
+    }
+
+    #[test]
+    fn the_report_summary_is_the_first_paragraph_of_the_report_section() {
+        let table = [
+            (
+                "PR: x\n## Report\n\nChanged the login.\nCI passed.\n\nMore.\n## Next\n- Review\n",
+                "Changed the login. CI passed.".to_string(),
+            ),
+            ("## Report\nDone.\n## Next\n- Review\n", "Done.".into()),
+            ("## Report\n## Next\n- Review\n", String::new()),
+            ("No sections.", String::new()),
+            (
+                &format!("## Report\n{}\n", "é".repeat(301)),
+                format!("{}…", "é".repeat(300)),
+            ),
+        ];
+        for (report, expected) in table {
+            assert_eq!(report_summary(report), expected, "{report:?}");
         }
     }
 
