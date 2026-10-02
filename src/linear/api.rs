@@ -1202,6 +1202,9 @@ pub mod fake {
                 "id": format!("prompt-{n}"), "type": "prompt", "createdAt": created, "signal": signal,
                 "user": { "id": user_id, "name": name_of(user_id) }, "content": { "type": "prompt", "body": body }
             }));
+            // Linear moves an awaiting-input session back to active as soon
+            // as the user replies, before the plugin next polls it.
+            session.status = "active".into();
             let session_id = session.id.clone();
             self.session_comment(&session_id, user_id, false, body);
         }
