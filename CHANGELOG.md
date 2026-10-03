@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update rust crate tokio to v1.53.2 (#97)
 - sign local macOS development builds (#96)
 - update rust crate uuid to v1.27.0 (#94)
 
