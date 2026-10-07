@@ -301,6 +301,10 @@ fn worktree_of(listing: &str, branch: &str) -> Option<String> {
     })
 }
 
+fn worker_label(run: &Run, id: &str) -> String {
+    format!("{} · {id}", run.key)
+}
+
 async fn find_worktree(runner: &dyn Runner, repo_path: &str, branch: &str) -> Option<String> {
     let out = runner
         .run(&Cmd::new("git", GIT_TIMEOUT).args([
@@ -323,11 +327,12 @@ async fn create_worktree<H: Herdr>(
     repo_path: &str,
     branch: &str,
     base: &str,
+    label: &str,
 ) -> Result<Placed, herdr::HerdrError> {
-    match herdr.worktree_create(repo_path, branch, base).await {
+    match herdr.worktree_create(repo_path, branch, base, label).await {
         Err(herdr::HerdrError::OutcomeUnknown(detail)) => {
             match find_worktree(runner, repo_path, branch).await {
-                Some(path) => herdr.worktree_open(repo_path, &path).await,
+                Some(path) => herdr.worktree_open(repo_path, &path, label).await,
                 None => Err(herdr::HerdrError::OutcomeUnknown(detail)),
             }
         }
@@ -434,6 +439,7 @@ pub async fn worker_start<H: Herdr>(
         &repo_path,
         &worker.branch,
         &base,
+        &worker_label(&run, &worker.id),
     )
     .await
     {
@@ -587,6 +593,7 @@ async fn reopen<H: Herdr>(
     config: &Config,
     session: &Session<H>,
     w: &Worker,
+    label: &str,
 ) -> Result<Placed> {
     let id = &w.id;
     if !w.worktree_path.is_empty() {
@@ -599,7 +606,7 @@ async fn reopen<H: Herdr>(
         }
         return session
             .herdr
-            .worktree_open(&w.repo_path, &w.worktree_path)
+            .worktree_open(&w.repo_path, &w.worktree_path, label)
             .await
             .with_context(|| format!("could not open the worktree of {id}"));
     }
@@ -609,16 +616,23 @@ async fn reopen<H: Herdr>(
         // A creation whose answer was lost left the checkout behind.
         Some(path) => session
             .herdr
-            .worktree_open(&repo_path, &path)
+            .worktree_open(&repo_path, &path, label)
             .await
             .with_context(|| format!("could not open the worktree of {id}")),
         // The worktree was never created: place it again from its base.
         None => {
             fetch(ctx.runner, &repo).await?;
             let base = format!("origin/{}", repo.base);
-            create_worktree(ctx.runner, &session.herdr, &repo_path, &w.branch, &base)
-                .await
-                .with_context(|| format!("could not create the worktree for {id}"))
+            create_worktree(
+                ctx.runner,
+                &session.herdr,
+                &repo_path,
+                &w.branch,
+                &base,
+                label,
+            )
+            .await
+            .with_context(|| format!("could not create the worktree for {id}"))
         }
     }
 }
@@ -690,7 +704,7 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.last_group.clear();
         w.agent.blocked_reported = false;
     })?;
-    let placed = match reopen(ctx, &config, session, &w).await {
+    let placed = match reopen(ctx, &config, session, &w, &worker_label(&run, id)).await {
         Ok(placed) => placed,
         Err(error) => {
             let message = format!("{error:#}");
@@ -1051,6 +1065,10 @@ mod tests {
         );
         assert_eq!(retried.repo, "api");
         assert_eq!(setup.session.herdr.worktrees().len(), 1);
+        assert_eq!(
+            setup.session.herdr.label("w1").as_deref(),
+            Some("acme/DATA-1 · w2")
+        );
     }
 
     #[tokio::test]
@@ -1095,6 +1113,10 @@ mod tests {
         );
         assert_eq!(retried.agent.pane_id, "w2:p1");
         assert_eq!(retried.worktree_path, worktree.to_string_lossy());
+        assert_eq!(
+            setup.session.herdr.label("w2").as_deref(),
+            Some("acme/DATA-1 · w1")
+        );
     }
 
     #[tokio::test]
@@ -1193,6 +1215,10 @@ mod tests {
         let w = setup.start("api", "standard").await.unwrap();
         assert_eq!(w.agent.status, AgentStatus::Open);
         assert_eq!(setup.session.herdr.worktrees().len(), 1);
+        assert_eq!(
+            setup.session.herdr.label("w2").as_deref(),
+            Some("acme/DATA-1 · w1")
+        );
         let opened: Vec<String> = setup
             .session
             .herdr

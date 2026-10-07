@@ -364,8 +364,8 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 | `workspace.create` | `cwd`, `label`, `focus: false` | coordinator placement |
 | `workspace.close` | `workspace_id` | run close, worker restart |
 | `workspace.focus` | `workspace_id` | focus-run action |
-| `worktree.create` | `cwd`, `branch`, `base`, `focus: false` | worker start; result has `root_pane` and `worktree.path` |
-| `worktree.open` | `cwd` (the repository checkout), `path`, `focus: false` | worker restart in the kept checkout. Without `cwd` Herdr 0.9.1 refuses the request (`not_git_worktree`, or `worktree_not_found`), measured in THLA-10. |
+| `worktree.create` | `cwd`, `branch`, `base`, `label`, `focus: false` | worker start; result has `root_pane` and `worktree.path` |
+| `worktree.open` | `cwd` (the repository checkout), `path`, `label`, `focus: false` | worker restart in the kept checkout. Without `cwd` Herdr 0.9.1 refuses the request (`not_git_worktree`, or `worktree_not_found`), measured in THLA-10. |
 | `agent.start` | `name`, `kind`, `pane_id`, `args` | launch |
 | `agent.prompt` | `target` (pane id), `text` | launch prompt, nudge, worker prompt |
 | `agent.send_keys` | `target`, `keys: ["esc"]` | stop, close, detach |
@@ -376,6 +376,8 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 | `session.snapshot` | none | commands and actions |
 
 `agent.start` args follow the CLI form `agent start <name> --kind <kind> --pane <pane> -- <args...>`; the arguments after `--` go to the agent CLI unchanged. `tests/herdr:errors_carry_herdrs_code_and_calls_carry_the_socket`
+
+Workspace labels identify ticket membership without changing Herdr's repository-based worktree groups. A coordinator uses `<KEY> · coordinator · <title>`; its title drops control characters and keeps at most 60 characters. A worker uses `<KEY> · <id>`. Both use the workspace-qualified run key, so identical issue keys in different Linear workspaces stay distinguishable. Worker creation, recovery of a creation whose answer was lost, and manual restart pass the same label through Herdr's existing `worktree.create` and `worktree.open` methods. Branch names, checkout paths, and workspace close behavior are unchanged. Existing open workspaces are not automatically renamed. Routing and postmortem remain outside this labeling scheme.
 
 ### Identity of an agent
 

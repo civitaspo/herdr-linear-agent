@@ -43,6 +43,7 @@ pub trait Herdr: Send + Sync {
         cwd: &str,
         branch: &str,
         base: &str,
+        label: &str,
     ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
 
     /// `cwd` is the repository checkout: Herdr refuses to open a worktree
@@ -51,6 +52,7 @@ pub trait Herdr: Send + Sync {
         &self,
         cwd: &str,
         path: &str,
+        label: &str,
     ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
 
     fn agent_start(
@@ -162,16 +164,23 @@ impl Herdr for Client {
         cwd: &str,
         branch: &str,
         base: &str,
+        label: &str,
     ) -> Result<Placed, HerdrError> {
-        let params = json!({"cwd": cwd, "branch": branch, "base": base, "focus": false});
+        let params =
+            json!({"cwd": cwd, "branch": branch, "base": base, "label": label, "focus": false});
         let answer: PlacedAnswer = self
             .call_with_timeout("worktree.create", params, WORKTREE_CREATE_TIMEOUT)
             .await?;
         Ok(answer.placed(cwd))
     }
 
-    async fn worktree_open(&self, cwd: &str, path: &str) -> Result<Placed, HerdrError> {
-        let params = json!({"cwd": cwd, "path": path, "focus": false});
+    async fn worktree_open(
+        &self,
+        cwd: &str,
+        path: &str,
+        label: &str,
+    ) -> Result<Placed, HerdrError> {
+        let params = json!({"cwd": cwd, "path": path, "label": label, "focus": false});
         let answer: PlacedAnswer = self.call("worktree.open", params).await?;
         Ok(answer.placed(path))
     }
@@ -311,6 +320,12 @@ mod tests {
                    "root_pane": pane_json("w4:p1", "/wt/api"),
                    "worktree": {"path": "/wt/api", "label": "api"}}),
         );
+        fake.answer(
+            "worktree.open",
+            json!({"type": "worktree_opened", "workspace": {}, "tab": {},
+                   "root_pane": pane_json("w5:p1", "/wt/api"),
+                   "worktree": {"path": "/wt/api", "label": "api"}}),
+        );
         let client = fake.client();
         let placed = client
             .workspace_create("/state/runs/DATA-1", "DATA-1 Fix")
@@ -331,7 +346,12 @@ mod tests {
             json!({"cwd": "/state/runs/DATA-1", "label": "DATA-1 Fix", "focus": false})
         );
         let placed = client
-            .worktree_create("/src/api", "herdr-linear-agent/data-1/w1", "origin/main")
+            .worktree_create(
+                "/src/api",
+                "herdr-linear-agent/data-1/w1",
+                "origin/main",
+                "acme/DATA-1 · w1",
+            )
             .await
             .unwrap();
         assert_eq!(placed.worktree_path.as_deref(), Some("/wt/api"));
@@ -339,6 +359,18 @@ mod tests {
         assert_eq!(
             last_request(&fake, "worktree.create")["params"]["base"],
             "origin/main"
+        );
+        assert_eq!(
+            last_request(&fake, "worktree.create")["params"]["label"],
+            "acme/DATA-1 · w1"
+        );
+        client
+            .worktree_open("/src/api", "/wt/api", "acme/DATA-1 · w1")
+            .await
+            .unwrap();
+        assert_eq!(
+            last_request(&fake, "worktree.open")["params"]["label"],
+            "acme/DATA-1 · w1"
         );
     }
 
