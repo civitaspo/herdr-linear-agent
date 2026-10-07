@@ -21,7 +21,7 @@ body = """
 ### {{ group }}
 
 {% for commit in commits -%}
-- {{ commit.message | split(pat="\n") | first | trim }}
+- {{ commit.message | split(pat="\n") | first | trim }}{% if commit.id == "f24cf7bb5da5a42aabd2a3d7de95fe56eb625a95" %} (#108){% endif %}
 {% endfor %}
 {% endfor %}
 """
