@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- identify tickets in agent workspace labels
+- restore the pull request number for workspace labels (#109)
+- identify tickets in agent workspace labels (#108)
 
 
 ### Documentation
