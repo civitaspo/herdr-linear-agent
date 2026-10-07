@@ -10,6 +10,8 @@ herdr-linear-agent is a [Herdr](https://github.com/herdrdev/herdr) plugin that p
 
 For each issue, the plugin starts one coordinator agent. The coordinator reads the issue, splits the work, and starts one worker agent per repository in its own Herdr worktree. Workers implement the change, open pull requests and check CI. The plugin reports progress, questions and results to the issue's Agent Session in Linear, and people reply there.
 
+Workspace labels put the ticket first. A coordinator is labeled `acme/DATA-1 · coordinator · Fix the API`, and its workers are labeled `acme/DATA-1 · w1`, `acme/DATA-1 · w2`, and so on. Workers remain under their repository's worktree group in Herdr's Spaces sidebar; the shared ticket prefix identifies their coordinator even across repositories. Herdr continues to create and open the worktrees, and branch names remain unchanged. The labels apply when workspaces are created or workers are reopened; existing open workspaces are not automatically renamed.
+
 - **Linear is the front door.** Delegate an issue to the app user; talk to the run in the issue's Agent Session. The plugin opens no endpoint and polls Linear; the webhook Linear requires can point at an endpoint that discards what it receives (see [Set up](#set-up)).
 - **One writer.** Only the plugin's background ticker writes to Linear. Agents call plugin subcommands that queue requests; they never hold a Linear token.
 - **Profiles, not flags.** Agent kind, model, effort and permission flags live in profiles you write in the config. Agents choose a profile by name and nothing else.

@@ -149,7 +149,7 @@ pub fn workspace_label(record: &RunRecord) -> String {
         .take(60)
         .collect();
     format!(
-        "{} {title}",
+        "{} · coordinator · {title}",
         crate::run::run_key(&record.workspace, &record.identifier)
     )
 }
@@ -503,7 +503,10 @@ mod tests {
 
         let f = folder(&format!("Tab\there {}", "z".repeat(80)));
         let label = workspace_label(&f.record);
-        assert_eq!(label, format!("acme/DATA-1 Tabhere {}", "z".repeat(52)));
+        assert_eq!(
+            label,
+            format!("acme/DATA-1 · coordinator · Tabhere {}", "z".repeat(52))
+        );
 
         let pending = pending_record(&f.record, "coordinator-light", "claude");
         assert_eq!(pending.status, AgentStatus::Pending);
