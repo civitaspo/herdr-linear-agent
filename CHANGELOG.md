@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update dependency jdx/mise to v2026.10.4 (#111)
 - update rust crate zeroize to v1.9.1 (#107)
 - update rust crate jiff to v0.2.38 (#106)
 - update dependency jdx/mise to v2026.10.3 (#105)
