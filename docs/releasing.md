@@ -56,3 +56,7 @@ mise exec -- git cliff --tag vX.Y.Z
 ## Credentials
 
 The repository secret `SECUREFIX_CLIENT_PRIVATE_KEY` is the only release credential in this repository. Publishing runs on `civitaspo/securefix-server`. See [securefix.md](securefix.md).
+
+## Merge requests
+
+A human requests the release merge by posting `/merge` on the pull request. Securefix performs the squash merge after the required checks and review pass. Only `civitaspo` may request it; release pull requests are not automerged. See the shared [merge policy](https://github.com/civitaspo/securefix-server/blob/main/docs/merging.md).
