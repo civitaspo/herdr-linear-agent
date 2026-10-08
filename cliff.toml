@@ -11,8 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 """
-# Codex's squash of PR #108 omitted "(#108)". PR #109 added this SHA-only
-# repair to regenerate historical changelogs without rewriting merged history.
+# Codex's squash of PR #108 (f24cf7b) omitted "(#108)". PR #109 (1fc05f8)
+# added this SHA-only repair to regenerate changelogs without rewriting history.
 body = """
 {% if version -%}
 ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
