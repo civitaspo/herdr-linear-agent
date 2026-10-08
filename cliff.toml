@@ -11,6 +11,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 """
+# Historical repair for https://github.com/civitaspo/herdr-linear-agent/pull/108.
+# Codex's squash merge produced f24cf7bb5da5a42aabd2a3d7de95fe56eb625a95
+# without the usual "(#108)" suffix. This template renders subjects and does not
+# infer their PR numbers. PR #109 added the exact-SHA exception below so old
+# changelogs can be regenerated without rewriting merged history or hand-editing
+# generated CHANGELOG.md. Keep it while generating releases containing that commit.
+# This is not a convention for new commits. Securefix leaves commit_title unset
+# and uses GitHub's PR_TITLE setting to retain the PR number on future squashes.
 body = """
 {% if version -%}
 ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
