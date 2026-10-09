@@ -2129,6 +2129,83 @@ async fn a_prompt_read_again_with_an_old_cursor_is_relayed_once() {
 }
 
 #[tokio::test]
+async fn a_queued_prompt_is_not_relayed_before_linear_sends_it() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Wait until the current turn ends.", None);
+    world.fake_for(KEY).sessions.last_mut().unwrap().activities.last_mut().unwrap()["queued"] = json!(true);
+
+    world.settle().await;
+
+    assert!(!world.text(KEY, "conversation.md").contains("Wait until the current turn ends."));
+    assert!(!world.inbox(KEY).iter().any(|item| item.contains("A new reply")));
+}
+
+#[tokio::test]
+async fn a_new_direct_prompt_passes_an_older_queued_prompt() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Queued follow-up.", None);
+    world.fake_for(KEY).sessions.last_mut().unwrap().activities.last_mut().unwrap()["queued"] = json!(true);
+    world.message(KEY, "user-1", "Send this one now.", None);
+
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(conversation.contains("Send this one now."), "{conversation}");
+    assert!(!conversation.contains("Queued follow-up."), "{conversation}");
+}
+
+#[tokio::test]
+async fn a_queued_prompt_is_relayed_once_when_dequeued_after_its_cursor() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Deliver after the current turn.", None);
+    let queued_at = world.fake_for(KEY).sessions.last().unwrap().activities.last().unwrap()["createdAt"]
+        .as_str().unwrap().to_string();
+    world.fake_for(KEY).sessions.last_mut().unwrap().activities.last_mut().unwrap()["queued"] = json!(true);
+
+    world.settle().await;
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(!conversation.contains("Deliver after the current turn."), "{conversation}");
+
+    world.later(60);
+    let sent_at = world.now().to_string();
+    {
+        let mut linear = world.fake_for(KEY);
+        let activity = linear.sessions.last_mut().unwrap().activities.last_mut().unwrap();
+        activity["queued"] = json!(false);
+        activity["sentAt"] = json!(sent_at);
+        activity["createdAt"] = json!(queued_at);
+    }
+    world.settle().await;
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert_eq!(conversation.matches("Deliver after the current turn.").count(), 1, "{conversation}");
+}
+
+#[tokio::test]
+async fn prompts_with_the_same_creation_time_are_both_relayed() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "First at the same time.", None);
+    world.message(KEY, "user-1", "Second at the same time.", None);
+    {
+        let mut linear = world.fake_for(KEY);
+        let activities = &mut linear.sessions.last_mut().unwrap().activities;
+        let created_at = activities[activities.len() - 2]["createdAt"].clone();
+        activities.last_mut().unwrap()["createdAt"] = created_at;
+    }
+
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(conversation.contains("First at the same time."), "{conversation}");
+    assert!(conversation.contains("Second at the same time."), "{conversation}");
+}
+
+#[tokio::test]
 async fn a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails() {
     use std::os::unix::fs::PermissionsExt;
     let mut world = World::sample();
