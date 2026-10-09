@@ -116,6 +116,8 @@ pub struct RunQuery {
     pub session_id: Option<String>,
     /// Prompts created after this RFC 3339 timestamp are read.
     pub prompt_cursor: String,
+    /// Queued prompts whose creation time may be before the cursor.
+    pub pending_prompt_ids: Vec<String>,
     /// The issue's `updatedAt` when `issue.md` was last written; empty for a
     /// fresh claim.
     pub issue_updated_at: Option<String>,
@@ -499,6 +501,7 @@ impl LinearTask {
                 issue_id: query.issue_id.clone(),
                 session_id: session.clone().unwrap_or_default(),
                 cursor: query.prompt_cursor.clone(),
+                pending_ids: query.pending_prompt_ids.clone(),
             })
             .collect();
         let mut spent = Vec::new();
@@ -905,6 +908,7 @@ mod tests {
                 run_dir: self.runs[n].dir.clone(),
                 session_id: session.map(str::to_string),
                 prompt_cursor: "2026-09-24T00:00:00Z".into(),
+                pending_prompt_ids: Vec::new(),
                 issue_updated_at: updated_at.map(str::to_string),
             }
         }

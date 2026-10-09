@@ -68,6 +68,8 @@ enum Command {
         #[arg(long = "option", value_parser = parse_option)]
         options: Vec<(String, String)>,
     },
+    /// End the coordinator's turn without finishing the run.
+    Wait(TextArgs),
     /// Post the final summary and move the issue to review.
     Finish(TextArgs),
     /// Start, prompt or restart workers.
@@ -248,6 +250,11 @@ pub async fn run() -> Result<()> {
         Command::Ask { text, options } => {
             commands::ask(&ctx, &text.key, &read_text_arg(&text.text_file)?, &options).await
         }
+        Command::Wait(args) => {
+            let text = read_text_arg(&args.text_file)?;
+            let session = Session::configured(&ctx).await?;
+            commands::wait(&ctx, &session, &args.key, &text).await
+        }
         Command::Finish(args) => {
             let text = read_text_arg(&args.text_file)?;
             let session = Session::configured(&ctx).await?;
@@ -382,14 +389,8 @@ mod tests {
     fn the_command_line_is_consistent() {
         Cli::command().debug_assert();
         assert!(
-            Cli::try_parse_from([
-                "herdr-linear-agent",
-                "wait",
-                "DATA-1",
-                "--text-file",
-                "-"
-            ])
-            .is_ok(),
+            Cli::try_parse_from(["herdr-linear-agent", "wait", "DATA-1", "--text-file", "-"])
+                .is_ok(),
             "wait ends the coordinator turn without finishing the run"
         );
         let parsed = Cli::try_parse_from([

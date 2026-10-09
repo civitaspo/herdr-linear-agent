@@ -170,11 +170,16 @@ impl Reconciler {
                     !record.stopped
                         && !record.finished
                         && record.awaiting_reply.is_none()
+                        && record.turn_complete.is_none()
                         && !needs,
                     now,
                 )
                 .await;
-            if record.stopped || record.finished || record.status != crate::run::Status::Active {
+            if record.stopped
+                || record.finished
+                || record.status != crate::run::Status::Active
+                || record.turn_complete.is_some()
+            {
                 next.recovery = Recovery::None;
             }
             let mut stale_notice = None;
@@ -194,6 +199,7 @@ impl Reconciler {
                             || r.stopped
                             || r.finished
                             || r.awaiting_reply.is_some()
+                            || r.turn_complete.is_some()
                             || r.coordinator.recovery != expected
                         {
                             return Vec::new();
@@ -227,8 +233,10 @@ impl Reconciler {
                 notices.push(notice);
                 next.blocked_reported = true;
             }
-            let lost = !live.pane_exists && !record.coordinator_lost;
+            let lost =
+                !live.pane_exists && !record.coordinator_lost && record.turn_complete.is_none();
             let ask_to_resume = !live.pane_exists
+                && record.turn_complete.is_none()
                 && (lost || (record.coordinator_lost && record.awaiting_reply.is_none()));
             // A kind that picks its own session id is looked up once it is
             // needed: when the pane is gone, a resume can continue it.
@@ -774,6 +782,7 @@ impl Reconciler {
             || record.stopped
             || record.finished
             || record.awaiting_reply.is_some()
+            || record.turn_complete.is_some()
         {
             return Ok(());
         }
@@ -821,7 +830,11 @@ impl Reconciler {
         }
         if timeout_due {
             self.update_and_push(run, move |r| {
-                    if r.awaiting_reply.is_some() || r.stopped || r.finished {
+                    if r.awaiting_reply.is_some()
+                        || r.stopped
+                        || r.finished
+                        || r.turn_complete.is_some()
+                    {
                         return Vec::new();
                     }
                     vec![Op::awaiting_reply(
@@ -833,11 +846,18 @@ impl Reconciler {
                     )]
                 })
                 .await?;
-            d.notify(
-                &format!("{} ran {hours} hours", run.key),
-                "Reply in the Linear session to let it continue.",
-            )
-            .await;
+            if run
+                .record()?
+                .awaiting_reply
+                .as_ref()
+                .is_some_and(|wait| wait.reason == WaitReason::RunTimeout)
+            {
+                d.notify(
+                    &format!("{} ran {hours} hours", run.key),
+                    "Reply in the Linear session to let it continue.",
+                )
+                .await;
+            }
         }
         Ok(())
     }
@@ -890,6 +910,7 @@ impl Reconciler {
         } else {
             coordinator::NUDGE_INBOX
         };
+        outbox::clear_turn_complete(run)?;
         if super::launch::delivered(d.herdr.agent_prompt(&agent.pane, text).await).is_ok() {
             self.nudged.insert(run.key.clone(), hash);
         }

@@ -273,6 +273,10 @@ pub struct RunRecord {
     pub coordinator: AgentRecord,
     /// Prompts created after this timestamp have not been read yet.
     pub prompt_cursor: String,
+    /// Prompt IDs already observed at `prompt_cursor`; absent in old records.
+    pub prompt_cursor_ids: Option<Vec<String>>,
+    /// Queued prompt IDs that may be delivered after their creation cursor.
+    pub pending_prompt_ids: Vec<String>,
     /// When the ticker last sent an activity.
     pub last_activity: String,
     /// `finish` was accepted.
@@ -285,6 +289,9 @@ pub struct RunRecord {
     pub timeout_asked: bool,
     /// The one Linear-native question whose answer can resume the run.
     pub awaiting_reply: Option<AwaitingReply>,
+    /// The id of the current coordinator-turn completion response.
+    #[serde(default)]
+    pub turn_complete: Option<String>,
     /// Prevents a cleared, still-queued question from being restored after a
     /// restart while its unknown Linear write is being reconciled.
     #[serde(default)]

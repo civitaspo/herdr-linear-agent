@@ -114,8 +114,9 @@ const LABEL_ADD: &str = r#"mutation HerdrLinearAgentLabelAdd($id: String!, $labe
 /// is fixed: only the alias number varies.
 const RUN_PART: &str = r#"  i@: issue(id: $i@) { updatedAt state { type name } delegate { id } }
   s@: agentSession(id: $s@) {
-    activities(first: 50, filter: { type: { eq: "prompt" }, createdAt: { gt: $c@ } }) {
-      nodes { id createdAt signal user { id name } content { ... on AgentActivityPromptContent { body } } }
+    activities(first: 50, after: $a@, orderBy: createdAt, filter: { type: { eq: "prompt" }, or: [{ createdAt: { gte: $c@ } }, { id: { in: $p@ } }] }) {
+      nodes { id createdAt sentAt queued signal user { id name } content { ... on AgentActivityPromptContent { body } } }
+      pageInfo { endCursor hasNextPage }
     }
   }
 "#;
@@ -306,6 +307,7 @@ pub struct RunQuery {
     pub session_id: String,
     /// Prompts created after this RFC 3339 timestamp are returned.
     pub cursor: String,
+    pub pending_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -321,6 +323,8 @@ pub struct IssueStatus {
 pub struct Prompt {
     pub id: String,
     pub created_at: String,
+    pub sent_at: Option<String>,
+    pub queued: bool,
     pub signal: Option<String>,
     pub user_id: String,
     pub user_name: String,
@@ -332,6 +336,86 @@ pub struct RunUpdate {
     pub issue: IssueStatus,
     /// Oldest first.
     pub prompts: Vec<Prompt>,
+}
+
+struct RunUpdatePage {
+    update: RunUpdate,
+    after: Option<String>,
+}
+
+async fn run_updates_page<A: LinearApi + ?Sized>(
+    api: &A,
+    runs: &[RunQuery],
+    after: &[Option<String>],
+) -> Result<Vec<RunUpdatePage>, ApiError> {
+    let mut declarations = Vec::new();
+    let mut body = String::from("  viewer { id app isMe }\n");
+    let mut variables = serde_json::Map::new();
+    for (n, run) in runs.iter().enumerate() {
+        declarations.push(format!(
+            "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!, $p{n}: [ID!]!, $a{n}: String"
+        ));
+        body.push_str(&RUN_PART.replace('@', &n.to_string()));
+        variables.insert(format!("i{n}"), json!(run.issue_id));
+        variables.insert(format!("s{n}"), json!(run.session_id));
+        variables.insert(format!("c{n}"), json!(run.cursor));
+        variables.insert(format!("p{n}"), json!(run.pending_ids));
+        variables.insert(format!("a{n}"), json!(after[n]));
+    }
+    let query = format!(
+        "query HerdrLinearAgentRuns({}) {{\n{body}}}",
+        declarations.join(", ")
+    );
+    let data = api
+        .execute(
+            "HerdrLinearAgentRuns",
+            &query,
+            Value::Object(variables),
+            false,
+        )
+        .await?;
+    (0..runs.len())
+        .map(|n| {
+            let issue = field(&data, &format!("i{n}"))?;
+            let session = field(&data, &format!("s{n}"))?;
+            let connection = &session["activities"];
+            let prompts = nodes(connection)
+                .map(|a| {
+                    Ok(Prompt {
+                        id: text(a, "id")?,
+                        created_at: text(a, "createdAt")?,
+                        sent_at: a["sentAt"].as_str().map(str::to_string),
+                        queued: a["queued"].as_bool().ok_or(ApiError::ReadFieldsInvalid)?,
+                        signal: a["signal"].as_str().map(str::to_string),
+                        user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
+                        user_name: a["user"]["name"].as_str().unwrap_or("").to_string(),
+                        body: a["content"]["body"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, ApiError>>()?;
+            let page_info = &connection["pageInfo"];
+            let next = if page_info["hasNextPage"]
+                .as_bool()
+                .ok_or(ApiError::ReadFieldsInvalid)?
+            {
+                Some(text(page_info, "endCursor")?)
+            } else {
+                None
+            };
+            Ok(RunUpdatePage {
+                update: RunUpdate {
+                    issue: IssueStatus {
+                        updated_at: text(issue, "updatedAt")?,
+                        state_type: text(field(issue, "state")?, "type")?,
+                        state_name: text(field(issue, "state")?, "name")?,
+                        delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
+                    },
+                    prompts,
+                },
+                after: next,
+            })
+        })
+        .collect()
 }
 
 /// The Linear operations the ticker needs. An implementation supplies
@@ -679,56 +763,45 @@ pub trait LinearApi: Sync {
             if runs.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut declarations = Vec::new();
-            let mut body = String::from("  viewer { id app isMe }\n");
-            let mut variables = serde_json::Map::new();
-            for (n, run) in runs.iter().enumerate() {
-                declarations.push(format!(
-                    "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!"
-                ));
-                body.push_str(&RUN_PART.replace('@', &n.to_string()));
-                variables.insert(format!("i{n}"), json!(run.issue_id));
-                variables.insert(format!("s{n}"), json!(run.session_id));
-                variables.insert(format!("c{n}"), json!(run.cursor));
+            let mut results: Vec<Option<RunUpdate>> = vec![None; runs.len()];
+            let mut pending: Vec<(usize, Option<String>)> =
+                (0..runs.len()).map(|index| (index, None)).collect();
+            while !pending.is_empty() {
+                let page_runs: Vec<RunQuery> = pending
+                    .iter()
+                    .map(|(index, _)| runs[*index].clone())
+                    .collect();
+                let after: Vec<Option<String>> =
+                    pending.iter().map(|(_, cursor)| cursor.clone()).collect();
+                let pages = run_updates_page(self, &page_runs, &after).await?;
+                let mut next = Vec::new();
+                for ((index, previous), mut page) in pending.into_iter().zip(pages) {
+                    if let Some(result) = &mut results[index] {
+                        result.prompts.append(&mut page.update.prompts);
+                    } else {
+                        results[index] = Some(page.update);
+                    }
+                    if let Some(cursor) = page.after {
+                        if previous.as_deref() == Some(&cursor) {
+                            return Err(ApiError::ReadFieldsInvalid);
+                        }
+                        next.push((index, Some(cursor)));
+                    }
+                }
+                pending = next;
             }
-            let query = format!(
-                "query HerdrLinearAgentRuns({}) {{\n{body}}}",
-                declarations.join(", ")
-            );
-            let data = self
-                .execute(
-                    "HerdrLinearAgentRuns",
-                    &query,
-                    Value::Object(variables),
-                    false,
-                )
-                .await?;
-            (0..runs.len())
-                .map(|n| {
-                    let issue = field(&data, &format!("i{n}"))?;
-                    let session = field(&data, &format!("s{n}"))?;
-                    let mut prompts = nodes(&session["activities"])
-                        .map(|a| {
-                            Ok(Prompt {
-                                id: text(a, "id")?,
-                                created_at: text(a, "createdAt")?,
-                                signal: a["signal"].as_str().map(str::to_string),
-                                user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
-                                user_name: a["user"]["name"].as_str().unwrap_or("").to_string(),
-                                body: a["content"]["body"].as_str().unwrap_or("").to_string(),
-                            })
-                        })
-                        .collect::<Result<Vec<_>, ApiError>>()?;
-                    prompts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-                    Ok(RunUpdate {
-                        issue: IssueStatus {
-                            updated_at: text(issue, "updatedAt")?,
-                            state_type: text(field(issue, "state")?, "type")?,
-                            state_name: text(field(issue, "state")?, "name")?,
-                            delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
-                        },
-                        prompts,
-                    })
+            results
+                .into_iter()
+                .map(|result| {
+                    let mut update = result.ok_or(ApiError::ReadFieldsInvalid)?;
+                    update.prompts.sort_by(|a, b| {
+                        a.sent_at
+                            .as_deref()
+                            .unwrap_or(&a.created_at)
+                            .cmp(b.sent_at.as_deref().unwrap_or(&b.created_at))
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                    Ok(update)
                 })
                 .collect()
         }
@@ -1199,7 +1272,8 @@ pub mod fake {
                 .find(|s| s.issue_id == id)
                 .expect("fake session");
             session.activities.push(json!({
-                "id": format!("prompt-{n}"), "type": "prompt", "createdAt": created, "signal": signal,
+                "id": format!("prompt-{n}"), "type": "prompt", "createdAt": created,
+                "queued": false, "sentAt": null, "signal": signal,
                 "user": { "id": user_id, "name": name_of(user_id) }, "content": { "type": "prompt", "body": body }
             }));
             // Linear moves an awaiting-input session back to active as soon
@@ -1437,23 +1511,49 @@ pub mod fake {
                             .unwrap()
                             .parse()
                             .unwrap();
+                        let pending: Vec<String> = variables[format!("p{n}")]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                        let offset = variables[format!("a{n}")]
+                            .as_str()
+                            .and_then(|cursor| cursor.strip_prefix("offset:"))
+                            .and_then(|offset| offset.parse::<usize>().ok())
+                            .unwrap_or(0);
                         let session =
                             self.session_mut(variables[format!("s{n}")].as_str().unwrap())?;
-                        let prompts: Vec<Value> = session
+                        let mut prompts: Vec<Value> = session
                             .activities
                             .iter()
                             .filter(|a| a["type"] == "prompt")
                             .filter(|a| {
-                                a["createdAt"]
-                                    .as_str()
-                                    .unwrap()
-                                    .parse::<jiff::Timestamp>()
-                                    .unwrap()
-                                    > cursor
+                                pending.contains(&a["id"].as_str().unwrap_or("").to_string())
+                                    || a["createdAt"]
+                                        .as_str()
+                                        .unwrap()
+                                        .parse::<jiff::Timestamp>()
+                                        .unwrap()
+                                        >= cursor
                             })
                             .cloned()
                             .collect();
-                        data[format!("s{n}")] = json!({ "activities": { "nodes": prompts } });
+                        prompts.sort_by(|a, b| {
+                            a["createdAt"]
+                                .as_str()
+                                .cmp(&b["createdAt"].as_str())
+                                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+                        });
+                        let end = offset.saturating_add(50).min(prompts.len());
+                        let has_next = end < prompts.len();
+                        let page = prompts.get(offset..end).unwrap_or_default();
+                        let end_cursor = (end > 0).then(|| format!("offset:{end}"));
+                        data[format!("s{n}")] = json!({ "activities": {
+                            "nodes": page,
+                            "pageInfo": { "hasNextPage": has_next, "endCursor": end_cursor }
+                        } });
                         n += 1;
                     }
                     Ok(data)
@@ -1624,6 +1724,7 @@ mod tests {
             issue_id: issue.clone(),
             session_id: session.clone(),
             cursor: "2026-09-24T00:00:00Z".into(),
+            pending_ids: Vec::new(),
         };
         let updates = linear.run_updates(&[query.clone(), query]).await.unwrap();
         assert_eq!(updates.len(), 2);
@@ -1635,12 +1736,11 @@ mod tests {
             issue_id: issue,
             session_id: session,
             cursor: updates[0].prompts[1].created_at.clone(),
+            pending_ids: Vec::new(),
         };
-        assert!(
-            linear.run_updates(&[later]).await.unwrap()[0]
-                .prompts
-                .is_empty()
-        );
+        let boundary = linear.run_updates(&[later]).await.unwrap();
+        assert_eq!(boundary[0].prompts.len(), 1);
+        assert_eq!(boundary[0].prompts[0].id, "prompt-3");
         assert!(linear.run_updates(&[]).await.unwrap().is_empty());
     }
 

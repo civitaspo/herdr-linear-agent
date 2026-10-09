@@ -209,13 +209,16 @@ Run record (`run.json`), every field defaulted when missing:
 | `routing_source` | where the coordinator profile came from: `chosen by the routing agent`, or `the default: <reason>`; records of older builds with `size` and `size_source` read without them |
 | `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory, ignores this field when reading, and drops it on the next write |
 | `coordinator` | the coordinator's agent record |
-| `prompt_cursor` | prompts created after this timestamp are unread |
+| `prompt_cursor` | creation-time watermark for observed prompt activities; never moves backward |
+| `prompt_cursor_ids` | observed IDs at the watermark; absent in old records, which retain strict-greater cursor semantics |
+| `pending_prompt_ids` | observed, unhandled IDs retained across polls and restarts, including queued prompts |
 | `last_activity` | when an activity was last sent |
 | `finished` | `finish` was accepted |
 | `external_urls` | list of `{label, url}` |
 | `timeout_since` | start of the run timeout window |
 | `timeout_asked` | compatibility field for old records; new timeout waits use `awaiting_reply` |
 | `awaiting_reply` | optional `{activity_id, asked_at, reason}` for the one Linear question currently waiting on a person (`coordinator_question`, `run_timeout`, or `coordinator_lost`) |
+| `turn_complete` | optional request ID for the completed coordinator turn; holds background heartbeat, timeout and recovery until new work resumes |
 | `cleared_wait_id` | the last cleared question id; prevents a refused request still awaiting archival from restoring its wait after a crash |
 | `reply_generation` | local counter incremented only for a newly accepted allowed prompt; queued questions carry its value so restart recovery cannot reopen an answered question, without comparing Linear and local clocks |
 | `coordinator_lost` | the coordinator's pane is gone and the resume question was asked |
@@ -487,7 +490,7 @@ The kept modules `src/linear/*` define the operations; the rewrite may make them
 | `create_comment(issue, id, body)` | `HerdrLinearAgentCommentCreate` | `commentCreate` with the caller's UUID as `id` |
 | `comment_exists(id)` | `HerdrLinearAgentCommentFind` | whether `comments(filter: { id })` has one |
 | `add_labels(issue, names)` | `HerdrLinearAgentLabels`, then `HerdrLinearAgentLabelAdd` | reads the issue's labels, its team's `labels(first: 250)` and the workspace's (`issueLabels` with no team), names them `Label` or `Group/Label`, and adds each named one the issue lacks with `issueAddLabel`; an unknown name fails after the others |
-| `run_updates(queries)` | `HerdrLinearAgentRuns` | one request for every active run: per run `i<n>: issue(...) { updatedAt state { type name } delegate { id } }` and `s<n>: agentSession(...) { activities(first: 50, filter: prompt type, createdAt > cursor) }`; only the alias number varies; prompts sorted oldest first; an empty list sends nothing |
+| `run_updates(queries)` | `HerdrLinearAgentRuns` | batched issue and session reads; prompt filter is `createdAt >= cursor` or a pending ID, with `queued` and `sentAt`; follows `pageInfo` past 50 activities, then orders prompts by delivery time (`sentAt`, or `createdAt` for direct prompts); an empty list sends nothing |
 
 Writes fail with `Graphql("<payload> did not succeed")` when `success` is not true. A missing field is `ReadFieldsInvalid`. `src/linear/api.rs:reads_parse_into_typed_records`, `src/linear/api.rs:writes_and_run_updates_round_trip`, `src/linear/api.rs:a_missing_field_is_an_error`
 
@@ -641,7 +644,7 @@ Checkouts and branches are never removed.
 
 ## Relay of Linear prompts
 
-`relay(run, prompts)`, prompts oldest first. Nothing happens for an empty list. For each prompt:
+`relay(run, prompts)` processes prompts in delivery order. Before processing, it records all eligible IDs against one initial cursor under the run lock. This keeps an older-created delayed prompt eligible even when a newer-created direct prompt was sent first. Queued prompts remain pending and do not write a conversation or inbox entry, clear a question, or resume agents. For each sent prompt:
 
 - A user not in the `allowed_user_ids` of the run's team (`workspaces.<workspace>.teams.<team_key>`; nobody when that team is no longer configured): append to `.state/ignored-prompts.md`, log `<KEY>: ignored a reply from <name> (<id>); add the id to allowed_user_ids of team <TEAM> to let it through` and show a Herdr notification `<KEY> ignored a reply` / `From <name> (<id>); add the id to allowed_user_ids of team <TEAM> to let it through.`; nothing else. Stop signals from such users are ignored too. `allowed_delegator_ids` plays no part here. `src/ticker/scenarios.rs:someone_allowed_only_to_delegate_starts_a_run_but_is_not_listened_to`
 - Signal `stop` from an allowed user: set `stopped = true` and a pending interrupt (`interrupt = stop`). The first pass with a snapshot, which may be this one, interrupts the agents, clears it and queues the response `Stopped <n> agent(s) as asked. Their worktrees are kept; reply here to continue.` with the true count. `tests/scenarios:a_stop_while_herdr_is_down_interrupts_once_herdr_is_back`
@@ -651,7 +654,7 @@ Checkouts and branches are never removed.
   3. Set `stopped = false`. When `timeout_asked`, clear it and set `timeout_since = now`.
   4. When `coordinator_lost` and the trimmed body equals `resume` case-insensitively: clear `coordinator_lost`, set the coordinator `pending`, `resume = agent_session non-empty`, `launch_attempts = 0`.
 
-The Linear task may read with the query of an earlier pass, so a prompt created at or before the record's current `prompt_cursor` is dropped. Each prompt, ignored ones included, moves `prompt_cursor` to its `createdAt` in the critical section that records it (the conversation entry and the record fields, the ignored-prompts entry, or the stop and its pending interrupt); a reply's inbox item is written just before. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`, `tests/scenarios:a_prompt_read_again_with_an_old_cursor_is_relayed_once`
+The watermark advances only to the greatest observed creation timestamp. IDs at that boundary distinguish equal timestamps. Pending IDs are fetched even after the watermark passes them and are removed when handled. A sent allowed prompt clears `turn_complete` and the reply wait; ignored or still-queued prompts do neither. Old records without boundary IDs retain their previous strict-greater behavior to avoid replaying the last handled instruction. Conversation headers use `sentAt` when present. `tests/scenarios:a_queued_prompt_is_relayed_once_when_dequeued_after_its_cursor`, `tests/scenarios:prompts_with_the_same_creation_time_are_both_relayed`, `tests/scenarios:sent_time_ordering_does_not_drop_an_unobserved_older_prompt`
 
 Interrupting sends `esc` to the coordinator's pane and to every `open` worker's pane, for each agent found by identity; the count is the number of successful sends. With a coordinator and one worker the count is 2. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
 
@@ -820,7 +823,7 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 
 ## Heartbeat and run timeout
 
-Skipped entirely while the run has no session, is `stopped` or `finished`, or has an outstanding `awaiting_reply`.
+Skipped entirely while the run has no session, is `stopped` or `finished`, has an outstanding `awaiting_reply`, or has a pending `turn_complete` marker.
 
 - Heartbeat: when `last_activity` is at least 10 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 10 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought: `Still on it: no workers.` without `open` workers, else `Still on it. <parts>.` with one part per `open` worker joined by `; `: `<id> (<repo>): <activity>, for <n> min` when it is Working and has a stored `activity` (`<n>` the whole minutes since `activity_since`, at least 1), else `<id> (<repo>): <group label in lower case>` (for example `Still on it. w1 (api): Running tests, for 12 min; w2 (web): waiting on you.`). Linear marks a session `stale` after 30 minutes without an activity.
 - Run timeout: when no question is already open and `timeout_since` is at least `ask_to_continue_after_hours * 3600` s old, queue the elicitation `This run has been going for <h> hours. Reply to let it continue; until then the coordinator gets no prompts.` with option `Continue`=`continue`, record its request id, timestamp and reason as `awaiting_reply`, and show the notification `<KEY> ran <h> hours` with body `Reply in the Linear session to let it continue.`
@@ -833,16 +836,16 @@ The kept module `src/outbox.rs` defines the queue.
 
 ### Requests
 
-- `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, wait_generation?, op...}`, return the id or no id when an activity is suppressed by an inactive, stopped, finished or awaiting-reply run. A question stores its wait slot in the same lock; if the process stops between queueing and updating the record, the next record read repairs the slot from the queued request when its reply generation still matches. Requests are sent in the order written.
-- Ops (`op` tag): `activity {activity, wait_reason?}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`. Only elicitation requests carry a `wait_reason`; terminal responses remain sendable while stopped, finished or awaiting a reply.
+- `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, wait_generation?, op...}`, return the id or no id when an activity is suppressed by an inactive, stopped, finished or awaiting-reply run. A question stores its wait slot in the same lock; if the process stops between queueing and updating the record, the next record read repairs the slot from the queued request when its reply generation still matches. A turn completion stores its request id in `turn_complete` in that same critical section. Requests are sent in the order written.
+- Ops (`op` tag): `turn_complete {body}`, `activity {activity, wait_reason?}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`. Only elicitation requests carry a `wait_reason`; terminal responses remain sendable while stopped, finished or awaiting a reply.
 - `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`. Only the Linear task calls it: it alone moves, rewrites or removes outbox files. The reconciler lists them read-only (`queued`, the requests that parse; `is_empty`, any file). `tests/scenarios:the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task`
 
 ### Send
 
 `send(run, session, issue, review_state)` handles requests in order:
 
-1. When `attempted` is set, check first: an activity is looked up by its id (`activity_exists`) and skipped when found; plan, URL and state requests are not checked (they are idempotent or read before writing).
-2. For a question, recheck its matching wait under the run lock and persist `attempted` before releasing the lock and sending. For other writes, persist `attempted`, then apply. If an attempted question is absent on read-back and its wait was cleared meanwhile, discard it instead of sending a stale question.
+1. When `attempted` is set, check first: an activity or turn completion is looked up by its id (`activity_exists`) and skipped when found; plan, URL and state requests are not checked (they are idempotent or read before writing).
+2. For a question or turn completion, recheck its matching wait/marker under the run lock and persist `attempted` before releasing the lock and sending. For other writes, persist `attempted`, then apply. If an attempted question or completion is absent on read-back and its wait/marker was cleared meanwhile, discard it instead of sending stale content.
 3. Success: remove the file.
 4. A definitive refusal (`Graphql`, `Configuration`, HTTP 400 to 428 or 430 to 499): clear only the matching wait, move the file to `outbox/failed/` and add an inbox notice; then go on. Clearing first ensures a crash before moving the file cannot leave the run blocked, since a later flush discards the stale request. HTTP 429 and `RATELIMITED` are not definitive (see above).
 5. Any other error: stop the queue; the rest waits for the next flush.
@@ -1013,10 +1016,12 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 | `plan set <KEY> --file` | parses the checklist, queues the plan | `the plan is queued for Linear` |
 | `say <KEY> --text-file` | queues a thought with the trimmed text unless progress is suppressed by an open question or stopped/finished run; empty: `the text is empty` | `queued for the Linear session` |
 | `ask <KEY> --text-file [--option label=value]...` | queues an elicitation and opens the one reply wait; options add `select`; empty: `the question is empty` | `the question is queued for the Linear session; end your turn, the answer arrives in your inbox` |
+| `wait <KEY> --text-file` | queues a response that completes the coordinator's current turn while leaving the run active; requires no open reply wait, no unseen inbox items, and all open/failed/pending workers reported and neither working nor waiting; empty: `the summary is empty` | `the coordinator turn is complete; the run remains active` |
 | `finish <KEY> --text-file` | see below; empty: `the summary is empty` | ``the summary is queued; the issue moves to `<review_state>` `` with the run team's review state (`In Review` when the team is no longer configured) |
 
 - `parse_option`: `label=value`, or a bare label used as its own value; both trimmed and non-empty, else ``an option looks like `label=value`; got `<text>` ``. `tests/commands:options_parse_as_label_and_value`
 - `finish`: needs the Herdr view (error `the configured Herdr session is not reachable`). Every worker that is `open`, `failed` or `pending` must be in the Reported group, else `not finished: <id> is <Label>, ... . Every worker must have written a report and be neither working nor waiting` (exactly `not finished: ` + the list joined by `, ` + `. Every worker ...`). Then queue the response and the `review` state, and set `finished`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold` (`w1 is Working`), `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (issue `In Review`, response body).
+- `wait`: requires the Herdr view. It captures one snapshot outside the run lock, then under the lock rechecks the reply generation, unread inbox and current worker records before queueing a `response` activity and its request id as `turn_complete`. This completes only the current Linear turn; it does not finish the run or move the issue. Repeating it while that completion is pending is idempotent. A new allowed reply or explicit new coordinator activity clears the marker; heartbeats and timeout questions do not supersede it. The marker and queued write survive restarts. Unknown write outcomes are read back by activity id before retry, and a stale completion is discarded if resumed work has cleared its marker. `tests/scenarios:wait_completes_only_the_coordinator_turn_and_new_input_resumes_it`.
 - After `finish`, replies still reach the coordinator and `finish` may run again.
 
 ### Digest
@@ -1032,7 +1037,7 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 
 `worker_rows(run, view)`: with a Herdr view, the group is computed live; without one (Herdr unreachable), it comes from `last_group`. `tests/coordinator:the_digest_shows_the_catalog_profiles_workers_and_inbox`, `tests/scenarios:context_shows_the_digest_and_marks_items_seen`
 
-The coordinator sheet and the worker rules are embedded in the binary (`assets/COORDINATOR.md`, `assets/WORKER.md`); nothing is installed as a skill. The sheet contains `` `<bin> worker start <KEY> --repo `` and the other command lines. `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
+The coordinator sheet and the worker rules are embedded in the binary (`assets/COORDINATOR.md`, `assets/WORKER.md`); nothing is installed as a skill. The sheet contains `` `<bin> worker start <KEY> --repo `` and the other command lines. A running coordinator is not automatically re-prompted when the sheet changes; the updated guidance takes effect when it next runs `skill` or starts/resumes with the new binary. `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
 
 ## Progress reports
 

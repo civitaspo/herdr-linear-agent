@@ -671,6 +671,7 @@ impl Reconciler {
                     run_dir: run.dir.clone(),
                     session_id: Some(record.session_id).filter(|s| !s.is_empty()),
                     prompt_cursor: record.prompt_cursor,
+                    pending_prompt_ids: record.pending_prompt_ids,
                     issue_updated_at: (!undecided).then_some(record.issue_updated_at),
                 })
             })
