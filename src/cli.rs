@@ -381,6 +381,17 @@ mod tests {
     #[test]
     fn the_command_line_is_consistent() {
         Cli::command().debug_assert();
+        assert!(
+            Cli::try_parse_from([
+                "herdr-linear-agent",
+                "wait",
+                "DATA-1",
+                "--text-file",
+                "-"
+            ])
+            .is_ok(),
+            "wait ends the coordinator turn without finishing the run"
+        );
         let parsed = Cli::try_parse_from([
             "herdr-linear-agent",
             "ask",
