@@ -25,6 +25,45 @@ fn after_cursor(created: &str, cursor: &str) -> bool {
     }
 }
 
+fn at_cursor(created: &str, cursor: &str) -> bool {
+    match (created.parse::<Timestamp>(), cursor.parse::<Timestamp>()) {
+        (Ok(created), Ok(cursor)) => created == cursor,
+        _ => created == cursor,
+    }
+}
+
+fn prompt_is_new(record: &RunRecord, id: &str, created: &str) -> bool {
+    if record
+        .pending_prompt_ids
+        .iter()
+        .any(|pending| pending == id)
+        || after_cursor(created, &record.prompt_cursor)
+    {
+        return true;
+    }
+    at_cursor(created, &record.prompt_cursor)
+        && record
+            .prompt_cursor_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.iter().any(|seen| seen == id))
+}
+
+fn advance_prompt_cursor(record: &mut RunRecord, created: &str, id: &str) {
+    if after_cursor(created, &record.prompt_cursor) {
+        record.prompt_cursor = created.to_string();
+        record.prompt_cursor_ids = Some(vec![id.to_string()]);
+    } else if at_cursor(created, &record.prompt_cursor)
+        && let Some(ids) = &mut record.prompt_cursor_ids
+        && !ids.iter().any(|seen| seen == id)
+    {
+        ids.push(id.to_string());
+    }
+}
+
+fn remove_pending_prompt(record: &mut RunRecord, id: &str) {
+    record.pending_prompt_ids.retain(|pending| pending != id);
+}
+
 /// What intake does with an issue's latest delegation.
 enum Delegation {
     /// Someone the team allows to delegate delegated it.
@@ -251,9 +290,8 @@ impl Reconciler {
     /// Replies from allowed users reach the coordinator through
     /// `conversation.md` and the inbox; a stop signal interrupts the run's
     /// agents; anyone else's message is only recorded. The Linear task may
-    /// read with an older cursor, so a prompt at or before the record's
-    /// cursor was handled already; each prompt moves the cursor in the
-    /// critical section that records it.
+    /// read with an older cursor. Capture eligible IDs together before
+    /// delivery order advances the creation cursor past an older prompt.
     async fn relay<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
@@ -270,24 +308,68 @@ impl Reconciler {
             .team(&record.workspace, &team)
             .map(|team| team.allowed_user_ids.clone())
             .unwrap_or_default();
+
+        // Delivery order is sentAt, but the cursor is createdAt. Capture all
+        // eligible IDs against one cursor before processing can advance it.
+        let candidates: Vec<_> = prompts
+            .iter()
+            .filter(|prompt| prompt_is_new(&record, &prompt.id, &prompt.created_at))
+            .map(|prompt| (prompt.id.clone(), prompt.created_at.clone()))
+            .collect();
+        if !candidates.is_empty() {
+            self.guarded(run, move |run, lock| {
+                run.update_held(lock, |record| {
+                    let initial = record.clone();
+                    let eligible: Vec<_> = candidates
+                        .iter()
+                        .filter(|(id, created)| prompt_is_new(&initial, id, created))
+                        .collect();
+                    if !eligible.is_empty() {
+                        for (id, created) in eligible {
+                            if !record
+                                .pending_prompt_ids
+                                .iter()
+                                .any(|pending| pending == id)
+                            {
+                                record.pending_prompt_ids.push(id.clone());
+                            }
+                            advance_prompt_cursor(record, created, id);
+                        }
+                    }
+                })?;
+                Ok(((), Vec::new()))
+            })
+            .await?;
+        }
+
         for prompt in prompts {
-            let (created, user, body) = (
+            let (created, id, user, body) = (
                 prompt.created_at.clone(),
+                prompt.id.clone(),
                 prompt.user_id.clone(),
                 prompt.body.clone(),
             );
-            if !after_cursor(&created, &run.record()?.prompt_cursor) {
+            if prompt.queued {
                 continue;
             }
+            if !prompt_is_new(&run.record()?, &id, &created) {
+                continue;
+            }
+            let displayed_at = prompt.sent_at.as_deref().unwrap_or(&created).to_string();
             if !allowed.contains(&prompt.user_id) {
+                let at = displayed_at.clone();
                 let recorded = self
                     .guarded(run, move |run, lock| {
-                        let new = after_cursor(&created, &run.record()?.prompt_cursor);
-                        if new {
-                            run.record_ignored_prompt_held(lock, &created, &user, &body)?;
-                            run.update_held(lock, |r| r.prompt_cursor = created)?;
+                        let mut recorded = false;
+                        if prompt_is_new(&run.record()?, &id, &created) {
+                            run.record_ignored_prompt_held(lock, &at, &user, &body)?;
+                            run.update_held(lock, |record| {
+                                advance_prompt_cursor(record, &created, &id);
+                                remove_pending_prompt(record, &id);
+                            })?;
+                            recorded = true;
                         }
-                        Ok((new, Vec::new()))
+                        Ok((recorded, Vec::new()))
                     })
                     .await?;
                 if recorded {
@@ -311,9 +393,11 @@ impl Reconciler {
                 // The keys and the response follow in the first pass with a
                 // snapshot, which may be this one.
                 update_run(run, move |r| {
-                    if after_cursor(&created, &r.prompt_cursor) {
-                        r.prompt_cursor = created;
+                    if prompt_is_new(r, &id, &created) {
+                        advance_prompt_cursor(r, &created, &id);
+                        remove_pending_prompt(r, &id);
                         r.reply_generation = r.reply_generation.saturating_add(1);
+                        r.turn_complete = None;
                         r.stopped = true;
                         if let Some(wait) = r.awaiting_reply.take() {
                             r.cleared_wait_id = wait.activity_id;
@@ -340,31 +424,33 @@ impl Reconciler {
             let restart_window = now.to_string();
             self.guarded(run, move |run, lock| {
                 let current = run.record()?;
-                if !after_cursor(&created, &current.prompt_cursor) {
+                if !prompt_is_new(&current, &id, &created) {
                     return Ok((false, Vec::new()));
                 }
-                run.append_conversation_held(lock, &created, &user, &body)?;
-                run.update_held(lock, move |r| {
-                    r.prompt_cursor = created;
-                    r.reply_generation = r.reply_generation.saturating_add(1);
-                    r.stopped = false;
-                    r.finished = false;
+                run.append_conversation_held(lock, &displayed_at, &user, &body)?;
+                run.update_held(lock, |record| {
+                    advance_prompt_cursor(record, &created, &id);
+                    remove_pending_prompt(record, &id);
+                    record.reply_generation = record.reply_generation.saturating_add(1);
+                    record.turn_complete = None;
+                    record.stopped = false;
+                    record.finished = false;
                     if resume {
-                        r.coordinator.recovery = crate::run::Recovery::None;
+                        record.coordinator.recovery = crate::run::Recovery::None;
                     }
-                    if let Some(wait) = r.awaiting_reply.take() {
+                    if let Some(wait) = record.awaiting_reply.take() {
                         if wait.reason == WaitReason::RunTimeout {
-                            r.timeout_since = restart_window.clone();
+                            record.timeout_since = restart_window.clone();
                         }
-                        r.cleared_wait_id = wait.activity_id;
+                        record.cleared_wait_id = wait.activity_id;
                     }
-                    if r.timeout_asked {
-                        r.timeout_asked = false;
-                        r.timeout_since = restart_window;
+                    if record.timeout_asked {
+                        record.timeout_asked = false;
+                        record.timeout_since = restart_window.clone();
                     }
-                    if r.coordinator_lost && resume {
-                        r.coordinator_lost = false;
-                        r.coordinator.repend();
+                    if record.coordinator_lost && resume {
+                        record.coordinator_lost = false;
+                        record.coordinator.repend();
                     }
                 })?;
                 Ok((true, Vec::new()))
@@ -674,6 +760,7 @@ impl Reconciler {
             session_id: open_session(issue).unwrap_or_default(),
             created: now.clone(),
             prompt_cursor: now.clone(),
+            prompt_cursor_ids: Some(Vec::new()),
             last_activity: now.clone(),
             timeout_since: now,
             announce_pending: true,

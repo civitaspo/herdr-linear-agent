@@ -1,7 +1,7 @@
 //! A run's outbox: every Linear write the run needs, as one JSON file per
 //! request under `.state/outbox/`, sent by the ticker in the order written.
 //!
-//! Agents never talk to Linear. `say`, `ask`, `plan set` and `finish` write a
+//! Agents never talk to Linear. `say`, `ask`, `wait`, `plan set` and `finish` write a
 //! request here and exit without touching the Keychain. The ticker sends each
 //! request once; when the outcome is unknown it reads Linear before sending
 //! again, and it never resends a write unconditionally.
@@ -32,6 +32,10 @@ pub enum StateTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
+    /// Ends the coordinator's current turn while keeping the run active.
+    TurnComplete {
+        body: String,
+    },
     Activity {
         activity: Activity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -117,16 +121,36 @@ pub fn push(run: &Run, op: Op) -> Result<Option<String>> {
     push_held(run, &lock, op)
 }
 
+/// Marks a yielded coordinator turn as resumed before a non-Linear prompt.
+pub fn clear_turn_complete(run: &Run) -> Result<()> {
+    let lock = run.lock()?;
+    run.update_held(&lock, |record| record.turn_complete = None)?;
+    Ok(())
+}
+
 /// `push` for a caller that holds the run lock, so a request is queued in
 /// the same critical section as the record field that guards it.
 pub fn push_held(run: &Run, lock: &RunLock, op: Op) -> Result<Option<String>> {
     let mut record = run.record()?;
+    let turn_complete = matches!(op, Op::TurnComplete { .. });
+    if turn_complete
+        && (record.status != crate::run::Status::Active
+            || record.stopped
+            || record.finished
+            || record.awaiting_reply.is_some()
+            || record.turn_complete.is_some())
+    {
+        return Ok(None);
+    }
     let wait_reason = match &op {
         Op::Activity {
             activity,
             wait_reason,
         } => {
             let terminal = matches!(activity.content, Content::Response { .. });
+            if record.turn_complete.is_some() && activity.ephemeral {
+                return Ok(None);
+            }
             if !terminal
                 && (record.status != crate::run::Status::Active
                     || record.stopped
@@ -153,13 +177,25 @@ pub fn push_held(run: &Run, lock: &RunLock, op: Op) -> Result<Option<String>> {
         op,
     };
     files::write_json(&outbox_dir(run).join(format!("{n:010}.json")), &request)?;
-    if let Some(reason) = wait_reason {
-        record.awaiting_reply = Some(AwaitingReply {
-            activity_id: request.id.clone(),
-            asked_at: request.created.clone(),
-            reason,
-        });
-        record.timeout_asked = false;
+    let mut record_changed = false;
+    if turn_complete {
+        record.turn_complete = Some(request.id.clone());
+        record_changed = true;
+    } else {
+        if matches!(request.op, Op::Activity { .. }) {
+            record_changed = record.turn_complete.take().is_some();
+        }
+        if let Some(reason) = wait_reason {
+            record.awaiting_reply = Some(AwaitingReply {
+                activity_id: request.id.clone(),
+                asked_at: request.created.clone(),
+                reason,
+            });
+            record.timeout_asked = false;
+            record_changed = true;
+        }
+    }
+    if record_changed {
         run.update_held(lock, |current| *current = record)?;
     }
     Ok(Some(request.id))
@@ -261,8 +297,8 @@ pub async fn send(
             Ok(activity_confirmed) => {
                 let _ = std::fs::remove_file(&path);
                 sent.count += 1;
-                sent.activity_sent |=
-                    activity_confirmed && matches!(request.op, Op::Activity { .. });
+                sent.activity_sent |= activity_confirmed
+                    && matches!(request.op, Op::Activity { .. } | Op::TurnComplete { .. });
             }
             Err(error) if definitive(&error) => {
                 let is_wait = matches!(
@@ -272,6 +308,7 @@ pub async fn send(
                         ..
                     }
                 );
+                let is_turn_complete = matches!(request.op, Op::TurnComplete { .. });
                 let refused_wait = if is_wait {
                     match clear_refused_wait(run, &request.id) {
                         Ok(cleared) => cleared,
@@ -283,6 +320,15 @@ pub async fn send(
                 } else {
                     false
                 };
+                if is_turn_complete {
+                    match clear_refused_turn_complete(run, &request.id) {
+                        Ok(_) => {}
+                        Err(failure) => {
+                            sent.blocked = Some(failure);
+                            break;
+                        }
+                    }
+                }
                 set_aside(&path);
                 if refused_wait {
                     let _ = crate::inbox::write(
@@ -319,8 +365,9 @@ async fn send_one(
             ..
         }
     );
+    let is_turn_complete = matches!(&request.op, Op::TurnComplete { .. });
     let checked = match &request.op {
-        Op::Activity { .. } if request.attempted => {
+        Op::Activity { .. } | Op::TurnComplete { .. } if request.attempted => {
             linear.activity_exists(session_id, &request.id).await?
         }
         Op::Comment { .. } if request.attempted => linear.comment_exists(&request.id).await?,
@@ -335,11 +382,21 @@ async fn send_one(
         if !mark_wait_attempt_if_current(path, request, run)? {
             return Ok(false);
         }
+    } else if is_turn_complete {
+        if !mark_turn_complete_attempt_if_current(path, request, run)? {
+            return Ok(false);
+        }
     } else {
         request.attempted = true;
         files::write_json(path, request).map_err(|_| ApiError::Configuration)?;
     }
     let outcome = match &request.op {
+        Op::TurnComplete { body } => {
+            let activity = Activity::new(Content::Response { body: body.clone() });
+            linear
+                .create_activity(session_id, &request.id, &activity)
+                .await
+        }
         Op::Activity { activity, .. } => {
             linear
                 .create_activity(session_id, &request.id, activity)
@@ -363,6 +420,45 @@ async fn send_one(
         }
     };
     outcome?;
+    Ok(true)
+}
+
+fn mark_turn_complete_attempt_if_current(
+    path: &Path,
+    request: &mut Request,
+    run: &Run,
+) -> Result<bool, ApiError> {
+    let _lock = run.lock().map_err(|_| ApiError::Configuration)?;
+    let record = run.record().map_err(|_| ApiError::Configuration)?;
+    if record.status != crate::run::Status::Active
+        || record.stopped
+        || record.finished
+        || record.awaiting_reply.is_some()
+        || record.turn_complete.as_deref() != Some(&request.id)
+    {
+        return Ok(false);
+    }
+    request.attempted = true;
+    files::write_json(path, request).map_err(|_| ApiError::Configuration)?;
+    Ok(true)
+}
+
+fn clear_refused_turn_complete(run: &Run, activity_id: &str) -> Result<bool, ApiError> {
+    let lock = run.lock().map_err(|_| ApiError::Configuration)?;
+    let record = run.record().map_err(|_| ApiError::Configuration)?;
+    if record.turn_complete.as_deref() != Some(activity_id) {
+        return Ok(false);
+    }
+    run.update_held(&lock, |record| record.turn_complete = None)
+        .map_err(|_| ApiError::Configuration)?;
+    crate::inbox::write_held(
+        run,
+        &lock,
+        "linear",
+        "wait",
+        "Linear refused the coordinator turn completion. The run remains active; see the ticker log for the error.",
+    )
+    .map_err(|_| ApiError::Configuration)?;
     Ok(true)
 }
 
@@ -589,6 +685,96 @@ mod tests {
         assert_eq!(fake.sessions[0].sent("elicitation").len(), 1);
         assert_eq!(fake.count("HerdrLinearAgentActivityFind"), 1);
         assert_ne!(id, "");
+    }
+
+    #[tokio::test]
+    async fn a_cleared_turn_completion_with_an_unknown_write_is_read_back_but_never_resent() {
+        let (_dir, run, linear, session, issue) = setup();
+        push(
+            &run,
+            Op::TurnComplete {
+                body: "The investigation is queued.".into(),
+            },
+        )
+        .unwrap();
+        linear.lock().unwrap().fail_next = Some(ApiError::RequestFailed);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
+        assert!(run.record().unwrap().turn_complete.is_some());
+
+        // New work resumes the run before retry; the old completion must not
+        // be sent after its failed read-back.
+        push(&run, thought("Continuing the investigation.")).unwrap();
+        assert!(run.record().unwrap().turn_complete.is_none());
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.count, 2, "stale response is removed, new thought sent");
+        assert!(pending(&run).is_empty());
+        let fake = linear.lock().unwrap();
+        assert!(fake.sessions[0].sent("response").is_empty());
+        assert_eq!(fake.sessions[0].sent("thought").len(), 1);
+        assert_eq!(fake.count("HerdrLinearAgentActivityFind"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_turn_completion_response_is_confirmed_once_by_activity_id() {
+        let (_dir, run, linear, session, issue) = setup();
+        let id = push(
+            &run,
+            Op::TurnComplete {
+                body: "The investigation is queued.".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        linear.lock().unwrap().lose_next_response = true;
+
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
+        assert_eq!(
+            run.record().unwrap().turn_complete.as_deref(),
+            Some(id.as_str())
+        );
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+
+        assert_eq!(sent.count, 1);
+        assert!(sent.activity_sent);
+        assert!(pending(&run).is_empty());
+        let fake = linear.lock().unwrap();
+        let responses = fake.sessions[0].sent("response");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]["content"]["body"],
+            "The investigation is queued."
+        );
+        assert_eq!(fake.count("HerdrLinearAgentActivityFind"), 1);
+        assert_eq!(
+            run.record().unwrap().turn_complete.as_deref(),
+            Some(id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definitive_turn_completion_refusal_clears_marker_and_writes_inbox_notice() {
+        let (_dir, run, linear, session, issue) = setup();
+        push(
+            &run,
+            Op::TurnComplete {
+                body: "The investigation is queued.".into(),
+            },
+        )
+        .unwrap();
+        linear.lock().unwrap().fail_next = Some(ApiError::Graphql("invalid activity".into()));
+
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+
+        assert_eq!(sent.refused.len(), 1);
+        assert!(run.record().unwrap().turn_complete.is_none());
+        assert!(pending(&run).is_empty());
+        assert!(crate::inbox::unhandled(&run).iter().any(|item| {
+            item.kind == "linear"
+                && item.subject == "wait"
+                && item.summary.contains("turn completion")
+        }));
     }
 
     #[test]
