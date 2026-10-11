@@ -69,6 +69,27 @@ const SESSION_CREATE: &str = r#"mutation HerdrLinearAgentSessionCreate($issueId:
   agentSessionCreateOnIssue(input: { issueId: $issueId }) { success agentSession { id } }
 }"#;
 
+const SESSION_CREATE_ON_COMMENT: &str = r#"mutation HerdrLinearAgentResumeSession($commentId: String!) {
+  agentSessionCreateOnComment(input: { commentId: $commentId }) { success agentSession { id } }
+}"#;
+
+const ISSUE_DELEGATE: &str = r#"mutation HerdrLinearAgentRestoreDelegate($id: String!, $delegateId: String!) {
+  issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
+}"#;
+
+const RESUME_CONTEXT: &str = r#"query HerdrLinearAgentResumeContext($issueId: String!, $commentId: ID!, $commands: [String!]!) {
+  viewer { id app isMe }
+  issue(id: $issueId) {
+    id archivedAt team { key } state { type } delegate { id }
+    comments(first: 50, filter: { body: { in: $commands } }) {
+      nodes { id body user { id app } }
+    }
+  }
+  comments(filter: { id: { eq: $commentId } }) {
+    nodes { id issue { id } user { id } agentSession { id archivedAt dismissedAt appUser { id } } }
+  }
+}"#;
+
 const ACTIVITY_CREATE: &str = r#"mutation HerdrLinearAgentActivityCreate($input: AgentActivityCreateInput!) {
   agentActivityCreate(input: $input) { success agentActivity { id } }
 }"#;
@@ -113,7 +134,9 @@ const LABEL_ADD: &str = r#"mutation HerdrLinearAgentLabelAdd($id: String!, $labe
 /// One run's part of `HerdrLinearAgentRuns`; `@` is replaced by the run's index. The text
 /// is fixed: only the alias number varies.
 const RUN_PART: &str = r#"  i@: issue(id: $i@) { updatedAt state { type name } delegate { id } }
-  s@: agentSession(id: $s@) {
+"#;
+const RUN_SESSION_PART: &str = r#"  s@: agentSession(id: $s@) {
+    id archivedAt dismissedAt
     activities(first: 50, after: $a@, orderBy: createdAt, filter: { type: { eq: "prompt" }, or: [{ createdAt: { gte: $c@ } }, { id: { in: $p@ } }] }) {
       nodes { id createdAt sentAt queued signal user { id name } content { ... on AgentActivityPromptContent { body } } }
       pageInfo { endCursor hasNextPage }
@@ -334,6 +357,9 @@ pub struct Prompt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunUpdate {
     pub issue: IssueStatus,
+    pub session_id: Option<String>,
+    pub session_hidden: bool,
+    pub consent: Option<(String, Vec<ConsentComment>)>,
     /// Oldest first.
     pub prompts: Vec<Prompt>,
 }
@@ -352,15 +378,19 @@ async fn run_updates_page<A: LinearApi + ?Sized>(
     let mut body = String::from("  viewer { id app isMe }\n");
     let mut variables = serde_json::Map::new();
     for (n, run) in runs.iter().enumerate() {
-        declarations.push(format!(
-            "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!, $p{n}: [ID!]!, $a{n}: String"
-        ));
+        declarations.push(format!("$i{n}: String!"));
         body.push_str(&RUN_PART.replace('@', &n.to_string()));
         variables.insert(format!("i{n}"), json!(run.issue_id));
-        variables.insert(format!("s{n}"), json!(run.session_id));
-        variables.insert(format!("c{n}"), json!(run.cursor));
-        variables.insert(format!("p{n}"), json!(run.pending_ids));
-        variables.insert(format!("a{n}"), json!(after[n]));
+        if !run.session_id.is_empty() {
+            declarations.push(format!(
+                "$s{n}: String!, $c{n}: DateTimeOrDuration!, $p{n}: [ID!]!, $a{n}: String"
+            ));
+            body.push_str(&RUN_SESSION_PART.replace('@', &n.to_string()));
+            variables.insert(format!("s{n}"), json!(run.session_id));
+            variables.insert(format!("c{n}"), json!(run.cursor));
+            variables.insert(format!("p{n}"), json!(run.pending_ids));
+            variables.insert(format!("a{n}"), json!(after[n]));
+        }
     }
     let query = format!(
         "query HerdrLinearAgentRuns({}) {{\n{body}}}",
@@ -377,7 +407,11 @@ async fn run_updates_page<A: LinearApi + ?Sized>(
     (0..runs.len())
         .map(|n| {
             let issue = field(&data, &format!("i{n}"))?;
-            let session = field(&data, &format!("s{n}"))?;
+            let session = if runs[n].session_id.is_empty() {
+                &Value::Null
+            } else {
+                field(&data, &format!("s{n}"))?
+            };
             let connection = &session["activities"];
             let prompts = nodes(connection)
                 .map(|a| {
@@ -394,9 +428,10 @@ async fn run_updates_page<A: LinearApi + ?Sized>(
                 })
                 .collect::<Result<Vec<_>, ApiError>>()?;
             let page_info = &connection["pageInfo"];
-            let next = if page_info["hasNextPage"]
-                .as_bool()
-                .ok_or(ApiError::ReadFieldsInvalid)?
+            let next = if !runs[n].session_id.is_empty()
+                && page_info["hasNextPage"]
+                    .as_bool()
+                    .ok_or(ApiError::ReadFieldsInvalid)?
             {
                 Some(text(page_info, "endCursor")?)
             } else {
@@ -404,6 +439,10 @@ async fn run_updates_page<A: LinearApi + ?Sized>(
             };
             Ok(RunUpdatePage {
                 update: RunUpdate {
+                    session_id: session["id"].as_str().map(str::to_string),
+                    session_hidden: !session["archivedAt"].is_null()
+                        || !session["dismissedAt"].is_null(),
+                    consent: None,
                     issue: IssueStatus {
                         updated_at: text(issue, "updatedAt")?,
                         state_type: text(field(issue, "state")?, "type")?,
@@ -416,6 +455,25 @@ async fn run_updates_page<A: LinearApi + ?Sized>(
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsentComment {
+    pub id: String,
+    pub body: String,
+    pub user_id: String,
+    pub app: bool,
+}
+
+pub struct ResumeContext {
+    pub app_user: String,
+    pub team: String,
+    pub terminal: bool,
+    pub delegate_id: Option<String>,
+    pub question_exists: bool,
+    pub session_id: Option<String>,
+    pub comments: Vec<ConsentComment>,
+    pub session_hidden: bool,
 }
 
 /// The Linear operations the ticker needs. An implementation supplies
@@ -548,6 +606,99 @@ pub trait LinearApi: Sync {
                     SESSION_CREATE,
                     json!({ "issueId": issue_id }),
                     "agentSessionCreateOnIssue",
+                )
+                .await?;
+            text(field(&payload, "agentSession")?, "id")
+        }
+    }
+
+    /// Reads fresh consent and the session attached to this incident's root
+    /// comment. This public relation also verifies an uncertain creation.
+    fn resume_context(
+        &self,
+        issue_id: &str,
+        comment_id: &str,
+        token: &str,
+    ) -> impl Future<Output = Result<ResumeContext, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute(
+                    "HerdrLinearAgentResumeContext",
+                    RESUME_CONTEXT,
+                    json!({"issueId": issue_id, "commentId": comment_id,
+                    "commands": [format!("resume {token}"), format!("stop {token}")]}),
+                    false,
+                )
+                .await?;
+            let issue = field(&data, "issue")?;
+            let app_user = text(field(&data, "viewer")?, "id")?;
+            let question = nodes(&data["comments"]).find(|c| {
+                c["id"] == comment_id && c["issue"]["id"] == issue_id && c["user"]["id"] == app_user
+            });
+            let session_id = question.and_then(|c| {
+                let session = &c["agentSession"];
+                (session["appUser"]["id"] == app_user
+                    && session["archivedAt"].is_null()
+                    && session["dismissedAt"].is_null())
+                .then(|| session["id"].as_str().map(str::to_string))
+                .flatten()
+            });
+            Ok(ResumeContext {
+                app_user,
+                team: text(field(issue, "team")?, "key")?,
+                terminal: !issue["archivedAt"].is_null()
+                    || matches!(
+                        issue["state"]["type"].as_str(),
+                        Some("completed" | "canceled")
+                    ),
+                delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
+                question_exists: question.is_some(),
+                session_hidden: question.is_some_and(|c| {
+                    !c["agentSession"]["id"].is_null()
+                        && (!c["agentSession"]["archivedAt"].is_null()
+                            || !c["agentSession"]["dismissedAt"].is_null())
+                }),
+                session_id,
+                comments: nodes(&issue["comments"])
+                    .map(|c| ConsentComment {
+                        id: c["id"].as_str().unwrap_or("").into(),
+                        body: c["body"].as_str().unwrap_or("").into(),
+                        user_id: c["user"]["id"].as_str().unwrap_or("").into(),
+                        app: c["user"]["app"].as_bool().unwrap_or(true),
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    fn restore_delegate(
+        &self,
+        issue_id: &str,
+        app_user: &str,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            self.mutate(
+                "HerdrLinearAgentRestoreDelegate",
+                ISSUE_DELEGATE,
+                json!({"id": issue_id, "delegateId": app_user}),
+                "issueUpdate",
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn create_session_on_comment(
+        &self,
+        comment_id: &str,
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
+        async move {
+            let payload = self
+                .mutate(
+                    "HerdrLinearAgentResumeSession",
+                    SESSION_CREATE_ON_COMMENT,
+                    json!({"commentId": comment_id}),
+                    "agentSessionCreateOnComment",
                 )
                 .await?;
             text(field(&payload, "agentSession")?, "id")
@@ -996,6 +1147,9 @@ pub mod fake {
         pub issue_id: String,
         /// `pending` when created; tests set other states.
         pub status: String,
+        pub archived_at: Option<String>,
+        pub dismissed_at: Option<String>,
+        pub comment_id: String,
         pub created_at: String,
         /// `{ id, name }` of the person who delegated, or null.
         pub creator: Value,
@@ -1231,6 +1385,23 @@ pub mod fake {
             self.new_session(issue_id)
         }
 
+        pub fn consent_comment(
+            &mut self,
+            identifier: &str,
+            user: &str,
+            body: &str,
+            app: bool,
+        ) -> String {
+            let issue_id = self.issue(identifier)["id"].as_str().unwrap().to_string();
+            let id = format!("consent-{}", self.clock);
+            self.comment(
+                &issue_id,
+                json!({ "id": id, "body": body, "parentId": null,
+                "user": { "id": user, "name": user, "isMe": app, "app": app } }),
+            );
+            id
+        }
+
         /// `user` delegates the issue again: Linear records it in the history
         /// and keeps the session it has.
         pub fn redelegate_by(&mut self, identifier: &str, user: &str) {
@@ -1365,6 +1536,53 @@ pub mod fake {
                     let id = self.new_session(issue_id);
                     Ok(
                         json!({ "agentSessionCreateOnIssue": { "success": true, "agentSession": { "id": id } } }),
+                    )
+                }
+                "HerdrLinearAgentResumeContext" => {
+                    let issue = self.issue(variables["issueId"].as_str().unwrap()).clone();
+                    let commands = variables["commands"].as_array().unwrap();
+                    let replies: Vec<Value> = nodes(&issue["comments"])
+                        .filter(|c| commands.contains(&c["body"]))
+                        .cloned()
+                        .collect();
+                    let questions: Vec<Value> = issue["posted"].as_array().into_iter().flatten()
+                        .filter(|c| c["id"] == variables["commentId"]).map(|c| {
+                            let session = self.sessions.iter().find(|s| s.comment_id == c["id"].as_str().unwrap());
+                            json!({"id": c["id"], "issue": {"id": issue["id"]}, "user": {"id": APP_USER},
+                                "agentSession": session.map(|s| json!({"id": s.id, "appUser": {"id": APP_USER},
+                                    "archivedAt": s.archived_at, "dismissedAt": s.dismissed_at}))})
+                        }).collect();
+                    Ok(
+                        json!({"viewer": viewer(), "issue": {"id": issue["id"], "team": issue["team"],
+                        "archivedAt": issue["archivedAt"], "state": issue["state"], "delegate": issue["delegate"],
+                        "comments": {"nodes": replies}}, "comments": {"nodes": questions}}),
+                    )
+                }
+                "HerdrLinearAgentRestoreDelegate" => {
+                    self.issue_mut(variables["id"].as_str().unwrap())["delegate"] =
+                        json!({"id": variables["delegateId"]});
+                    Ok(json!({"issueUpdate": {"success": true}}))
+                }
+                "HerdrLinearAgentResumeSession" => {
+                    let comment = variables["commentId"].as_str().unwrap();
+                    let issue = self
+                        .issues
+                        .iter()
+                        .find(|i| {
+                            i["posted"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .any(|c| c["id"] == comment)
+                        })
+                        .unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let id = self.new_session(issue);
+                    self.session_mut(&id)?.comment_id = comment.to_string();
+                    Ok(
+                        json!({"agentSessionCreateOnComment": {"success": true, "agentSession": {"id": id}}}),
                     )
                 }
                 "HerdrLinearAgentActivityCreate" => {
@@ -1506,6 +1724,10 @@ pub mod fake {
                     {
                         let issue = self.issue(issue_id).clone();
                         data[format!("i{n}")] = json!({ "updatedAt": issue["updatedAt"], "state": { "type": issue["state"]["type"], "name": issue["state"]["name"] }, "delegate": issue["delegate"] });
+                        if variables.get(format!("s{n}")).is_none() {
+                            n += 1;
+                            continue;
+                        }
                         let cursor: jiff::Timestamp = variables[format!("c{n}")]
                             .as_str()
                             .unwrap()
@@ -1550,7 +1772,7 @@ pub mod fake {
                         let has_next = end < prompts.len();
                         let page = prompts.get(offset..end).unwrap_or_default();
                         let end_cursor = (end > 0).then(|| format!("offset:{end}"));
-                        data[format!("s{n}")] = json!({ "activities": {
+                        data[format!("s{n}")] = json!({ "id": session.id, "archivedAt": session.archived_at, "dismissedAt": session.dismissed_at, "activities": {
                             "nodes": page,
                             "pageInfo": { "hasNextPage": has_next, "endCursor": end_cursor }
                         } });

@@ -15,12 +15,12 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{Notify, mpsc, watch};
 
 use super::ApiError;
-use super::api::{self, Activity, Content, IssueDetail, IssueRef, IssueStatus, RunUpdate};
+use super::api::{self, Activity, Content, IssueDetail, IssueRef, RunUpdate};
 use super::client::LinearApi;
 use super::transport::RateHeaders;
 use crate::config;
 use crate::outbox;
-use crate::run::Run;
+use crate::run::{ResumeDecision, Run, Status};
 
 /// Runs per batch of the run read until a batch has measured one run's cost.
 const FIRST_BATCH: usize = 10;
@@ -478,6 +478,16 @@ impl LinearTask {
     }
 
     fn session_of(&self, query: &RunQuery) -> Option<String> {
+        let run = Run {
+            key: query.key.clone(),
+            dir: query.run_dir.clone(),
+        };
+        if run
+            .record()
+            .is_ok_and(|r| r.status != Status::Active || r.resume_request.is_some())
+        {
+            return query.session_id.clone();
+        }
         query
             .session_id
             .clone()
@@ -491,11 +501,11 @@ impl LinearTask {
         now: Timestamp,
         events: &mpsc::Sender<LinearEvent>,
     ) {
-        let (with_session, without): (Vec<_>, Vec<_>) = queries
+        let runs_with_sessions: Vec<_> = queries
             .iter()
             .map(|query| (query, self.session_of(query)))
-            .partition(|(_, session)| session.is_some());
-        let batch: Vec<api::RunQuery> = with_session
+            .collect();
+        let batch: Vec<api::RunQuery> = runs_with_sessions
             .iter()
             .map(|(query, session)| api::RunQuery {
                 issue_id: query.issue_id.clone(),
@@ -527,10 +537,39 @@ impl LinearTask {
             }
             updates.extend(results);
         }
-        for ((query, _), update) in with_session.iter().zip(updates) {
-            let update = match update {
+        for ((query, source_session), update) in runs_with_sessions.iter().zip(updates) {
+            let mut update = match update {
                 Ok(update) => update,
                 Err(ApiError::RateLimited) => continue,
+                Err(error @ (ApiError::Graphql(_) | ApiError::ReadFieldsInvalid))
+                    if source_session.is_some() && !self.limited =>
+                {
+                    self.log.push(format!(
+                        "{}: session read failed; reading the issue independently: {error}",
+                        query.key
+                    ));
+                    let fallback = api::RunQuery {
+                        issue_id: query.issue_id.clone(),
+                        session_id: String::new(),
+                        cursor: query.prompt_cursor.clone(),
+                        pending_ids: Vec::new(),
+                    };
+                    let result = client.run_updates(&[fallback]).await;
+                    spent.extend(self.observe(client));
+                    match result {
+                        Ok(mut one) => {
+                            let mut update = one.remove(0);
+                            update.session_id = source_session.clone();
+                            update.session_hidden = true;
+                            update
+                        }
+                        Err(error) => {
+                            self.hit(&error);
+                            self.log.push(format!("{}: {error}", query.key));
+                            continue;
+                        }
+                    }
+                }
                 Err(error) => {
                     self.log.push(format!("{}: {error}", query.key));
                     continue;
@@ -547,6 +586,8 @@ impl LinearTask {
             } else {
                 None
             };
+            self.read_consent(client, query, &mut update).await;
+            spent.extend(self.observe(client));
             let _ = events
                 .send(LinearEvent::RunRead {
                     issue_id: query.issue_id.clone(),
@@ -556,37 +597,38 @@ impl LinearTask {
                 })
                 .await;
         }
-        // A fresh claim without a session still needs the detail for
-        // `issue.md` and routing; its state comes from the detail.
-        for (query, _) in without {
-            if self.limited || !query.issue_updated_at.as_deref().unwrap_or("").is_empty() {
-                continue;
-            }
-            let detail = self.detail(client, query).await;
-            spent.extend(self.observe(client));
-            let Some(detail) = detail else {
-                continue;
-            };
-            let update = RunUpdate {
-                issue: IssueStatus {
-                    updated_at: detail.updated_at.clone(),
-                    state_type: detail.state.r#type.clone(),
-                    state_name: detail.state.name.clone(),
-                    delegate_id: detail.delegate_id.clone(),
-                },
-                prompts: Vec::new(),
-            };
-            let _ = events
-                .send(LinearEvent::RunRead {
-                    issue_id: query.issue_id.clone(),
-                    read_started_at: now,
-                    update,
-                    detail: Some(detail),
-                })
-                .await;
-        }
         if !self.limited {
             self.read_cost = Cost::of(&spent).unwrap_or(self.read_cost);
+        }
+    }
+
+    async fn read_consent(
+        &mut self,
+        client: &impl LinearApi,
+        query: &RunQuery,
+        update: &mut RunUpdate,
+    ) {
+        let run = Run {
+            key: query.key.clone(),
+            dir: query.run_dir.clone(),
+        };
+        let Some(request) = run.record().ok().and_then(|r| r.resume_request) else {
+            return;
+        };
+        self.sessions.remove(&query.issue_id);
+        if self.limited || matches!(request.decision, ResumeDecision::Denied) {
+            return;
+        }
+        match client
+            .resume_context(&query.issue_id, &request.comment_id, &request.token)
+            .await
+        {
+            Ok(context) => update.consent = Some((request.token, context.comments)),
+            Err(error) => {
+                self.hit(&error);
+                self.log
+                    .push(format!("{}: consent read: {error}", query.key));
+            }
         }
     }
 
@@ -627,7 +669,17 @@ impl LinearTask {
             let pending = !outbox::pending(&run).is_empty();
             let blocked = if !pending {
                 false
-            } else if let Some(session) = self.session_for_flush(client, query, events).await {
+            } else if let Some(session) =
+                if run.record().is_ok_and(|r| {
+                    r.resume_request.is_some()
+                        || (r.status == Status::Closed && r.session_id.is_empty())
+                }) || !outbox::queued(&run).iter().any(|r| r.op.needs_session())
+                {
+                    Some(String::new())
+                } else {
+                    self.session_for_flush(client, query, events).await
+                }
+            {
                 let sent =
                     outbox::send(&run, &session, &query.issue_id, &query.review_state, client)
                         .await;

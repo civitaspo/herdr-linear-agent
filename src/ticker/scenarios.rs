@@ -1366,8 +1366,14 @@ async fn a_removed_delegation_detaches_the_run_and_keeps_its_workspaces() {
     world.settle().await;
     assert_eq!(
         world.record(KEY).status,
+        Status::Detached,
+        "a pending consent request cannot be bypassed"
+    );
+    approve_resume(&mut world).await;
+    assert_eq!(
+        world.record(KEY).status,
         Status::Active,
-        "the run continues"
+        "the approved run continues"
     );
 }
 
@@ -1870,6 +1876,7 @@ async fn delegating_again_and_reopening_settle_without_a_loop() {
     world.set_delegate(KEY, json!({ "id": APP_USER }));
     world.later(5);
     world.settle().await;
+    approve_resume(&mut world).await;
     assert_eq!(world.record(KEY).status, Status::Active);
 
     // A read made before the delegation came back must not detach it again.
@@ -1884,6 +1891,9 @@ async fn delegating_again_and_reopening_settle_without_a_loop() {
                 delegate_id: None,
             },
             prompts: Vec::new(),
+            session_id: Some(world.record(KEY).session_id),
+            session_hidden: false,
+            consent: None,
         },
         detail: None,
     });
@@ -1907,8 +1917,8 @@ async fn delegating_again_and_reopening_settle_without_a_loop() {
     let again = "The issue was delegated again; the run continues.";
     assert_eq!(
         count(&world.bodies(KEY, "thought"), again),
-        2,
-        "once per return"
+        1,
+        "the reopen is announced once; the earlier comment-approved resume has its own acknowledgment"
     );
     let log = world.log_text();
     assert_eq!(
@@ -2056,6 +2066,9 @@ async fn a_list_read_with_the_detaching_read_does_not_bring_the_run_back() {
                 delegate_id: None,
             },
             prompts: Vec::new(),
+            session_id: Some(world.record(KEY).session_id),
+            session_hidden: false,
+            consent: None,
         },
         detail: None,
     });
@@ -3243,4 +3256,370 @@ async fn wait_refuses_to_end_with_unseen_inbox_items_or_an_open_question() {
     assert!(world.bodies(KEY, "response").is_empty());
     assert_eq!(world.record(KEY).awaiting_reply, Some(wait));
     assert!(world.record(KEY).turn_complete.is_none());
+}
+
+async fn approve_resume(world: &mut World) {
+    let request = world.record(KEY).resume_request.unwrap();
+    world.fake().consent_comment(
+        "DATA-1",
+        "user-1",
+        &format!("resume {}", request.token),
+        false,
+    );
+    world.later(5);
+    world.settle().await;
+}
+
+#[tokio::test]
+async fn comment_consent_restores_delegation_and_keeps_the_native_agents_and_worktrees() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    let before = world.record(KEY);
+    let worker = world.worker(KEY, "w1");
+    let starts = world.herdr.starts().len();
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    assert_eq!(posted(&world).len(), 1);
+    assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 0);
+    world.restart_ticker();
+    world.later(5);
+    world.settle().await;
+    assert_eq!(
+        posted(&world).len(),
+        1,
+        "the question survives restart without duplication"
+    );
+    approve_resume(&mut world).await;
+    let resumed = world.record(KEY);
+    assert_eq!(resumed.status, Status::Active);
+    assert!(resumed.resume_request.is_none());
+    assert_ne!(resumed.session_id, before.session_id);
+    assert_eq!(
+        resumed.coordinator.agent_session,
+        before.coordinator.agent_session
+    );
+    assert_eq!(resumed.coordinator.pane_id, before.coordinator.pane_id);
+    assert_eq!(world.worker(KEY, "w1").agent.cwd, worker.agent.cwd);
+    assert_eq!(
+        world.herdr.starts().len(),
+        starts,
+        "live native sessions are continued"
+    );
+    assert_eq!(world.fake().issue("DATA-1")["delegate"]["id"], APP_USER);
+    assert_eq!(world.fake().count("HerdrLinearAgentRestoreDelegate"), 1);
+    assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 1);
+    assert!(world.herdr.closed().is_empty());
+}
+
+#[tokio::test]
+async fn hidden_sessions_pause_even_with_a_delegate_and_ignore_untrusted_or_stale_consent() {
+    for dismissed in [false, true] {
+        let mut world = World::sample();
+        world.running_issue().await;
+        let old = world.record(KEY).session_id;
+        {
+            let mut fake = world.fake();
+            let session = fake.sessions.iter_mut().find(|s| s.id == old).unwrap();
+            if dismissed {
+                session.dismissed_at = Some("2026-10-09T05:30:14Z".into());
+            } else {
+                session.archived_at = Some("2026-10-09T05:30:14Z".into());
+            }
+        }
+        world.later(5);
+        world.settle().await;
+        let token = world.record(KEY).resume_request.unwrap().token;
+        let command = format!("resume {token}");
+        world
+            .fake()
+            .consent_comment("DATA-1", "user-2", &command, false);
+        world
+            .fake()
+            .consent_comment("DATA-1", "user-1", &command, true);
+        world
+            .fake()
+            .consent_comment("DATA-1", "user-1", "resume an-old-token", false);
+        world.later(5);
+        world.settle().await;
+        assert_eq!(world.record(KEY).status, Status::Detached);
+        assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 0);
+        approve_resume(&mut world).await;
+        assert_eq!(world.record(KEY).status, Status::Active);
+        assert_eq!(
+            world.fake().count("HerdrLinearAgentRestoreDelegate"),
+            0,
+            "ownership was already correct"
+        );
+        world.set_delegate(KEY, Value::Null);
+        world.later(5);
+        world.settle().await;
+        assert_ne!(world.record(KEY).resume_request.unwrap().token, token);
+        world.restart_ticker();
+        world.later(5);
+        world.settle().await;
+        assert_eq!(
+            world.record(KEY).status,
+            Status::Detached,
+            "previous approval is never reused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn consent_requires_both_team_policies_and_a_refusal_wins() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world
+        .config
+        .workspaces
+        .get_mut("acme")
+        .unwrap()
+        .teams
+        .get_mut("DATA")
+        .unwrap()
+        .allowed_delegator_ids = Some(vec!["user-2".into()]);
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    approve_resume(&mut world).await;
+    assert_eq!(
+        world.record(KEY).status,
+        Status::Detached,
+        "an allowed reply alone cannot restore delegation"
+    );
+    world
+        .config
+        .workspaces
+        .get_mut("acme")
+        .unwrap()
+        .teams
+        .get_mut("DATA")
+        .unwrap()
+        .allowed_user_ids
+        .push("user-2".into());
+    let token = world.record(KEY).resume_request.unwrap().token;
+    world
+        .fake()
+        .consent_comment("DATA-1", "user-2", &format!("resume {token}"), false);
+    world
+        .fake()
+        .consent_comment("DATA-1", "user-2", &format!("stop {token}"), false);
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    assert!(matches!(
+        world.record(KEY).resume_request.unwrap().decision,
+        crate::run::ResumeDecision::Denied
+    ));
+    world.restart_ticker();
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.fake().count("HerdrLinearAgentRestoreDelegate"), 0);
+}
+
+#[tokio::test]
+async fn detached_runs_still_close_and_get_a_final_postmortem_without_a_linear_session() {
+    let mut world = World::sample();
+    postmortem_method(
+        &mut world,
+        "review",
+        r#"{"summary":"Cleanup completed.","labels":[]}"#,
+    );
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    world.fake().sessions.clear();
+    world.restart_ticker();
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    assert_eq!(world.herdr.closed().len(), 2);
+    assert_eq!(
+        posted(&world)
+            .iter()
+            .filter(|c| c.starts_with("**Postmortem (final)**"))
+            .count(),
+        1
+    );
+    assert!(world.record(KEY).resume_request.is_none());
+    world.later(10);
+    world.settle().await;
+    assert_eq!(world.herdr.closed().len(), 2, "cleanup is not repeated");
+    assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 0);
+    assert_eq!(
+        world.fake().count("HerdrLinearAgentSessionCreate"),
+        0,
+        "comments need no new session"
+    );
+}
+
+#[tokio::test]
+async fn approved_resume_never_overwrites_another_agents_delegation() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.set_delegate(KEY, json!({"id": "another-agent"}));
+    world.later(5);
+    world.settle().await;
+    let old = world.record(KEY).resume_request.unwrap().token;
+    approve_resume(&mut world).await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    assert_ne!(
+        world.record(KEY).resume_request.unwrap().token,
+        old,
+        "a failed restoration needs fresh consent"
+    );
+    assert_eq!(
+        world.fake().issue("DATA-1")["delegate"]["id"],
+        "another-agent"
+    );
+    assert_eq!(world.fake().count("HerdrLinearAgentRestoreDelegate"), 0);
+    assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 0);
+}
+
+#[tokio::test]
+async fn a_missing_linear_session_cannot_hide_issue_completion_or_silently_resume_work() {
+    for terminal in [false, true] {
+        let mut world = World::sample();
+        world.running_issue().await;
+        world.fake().sessions.clear();
+        if terminal {
+            world.move_issue(KEY, "Canceled");
+        }
+        world.later(5);
+        world.settle().await;
+        assert_eq!(
+            world.record(KEY).status,
+            if terminal {
+                Status::Closed
+            } else {
+                Status::Detached
+            }
+        );
+        assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 0);
+        assert_eq!(world.fake().count("HerdrLinearAgentSessionCreate"), 0);
+        if !terminal {
+            assert_eq!(posted(&world).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delayed_read_of_the_old_session_cannot_detach_a_verified_replacement() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let old = world.record(KEY).session_id;
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    approve_resume(&mut world).await;
+    for source in [None, Some(old)] {
+        world.inject(LinearEvent::RunRead {
+            issue_id: world.record(KEY).issue_id,
+            read_started_at: world.now(),
+            update: RunUpdate {
+                issue: IssueStatus {
+                    updated_at: "2026-09-25T00:00:00Z".into(),
+                    state_type: "started".into(),
+                    state_name: "In Review".into(),
+                    delegate_id: None,
+                },
+                session_id: source,
+                session_hidden: true,
+                consent: None,
+                prompts: Vec::new(),
+            },
+            detail: None,
+        });
+        world.settle().await;
+        assert_eq!(world.record(KEY).status, Status::Active);
+        assert!(world.record(KEY).resume_request.is_none());
+    }
+}
+
+#[tokio::test]
+async fn persisted_consent_recovers_a_crash_before_its_restore_request_was_queued() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    let request = world.record(KEY).resume_request.unwrap();
+    let comment_id = world.fake().consent_comment(
+        "DATA-1",
+        "user-1",
+        &format!("resume {}", request.token),
+        false,
+    );
+    world
+        .run(KEY)
+        .update(|r| {
+            r.resume_request.as_mut().unwrap().decision = crate::run::ResumeDecision::Approved {
+                comment_id,
+                user_id: "user-1".into(),
+            };
+        })
+        .unwrap();
+    world.restart_ticker();
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Active);
+    assert_eq!(world.fake().count("HerdrLinearAgentRestoreDelegate"), 1);
+    assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 1);
+}
+
+#[tokio::test]
+async fn replacing_a_session_clears_old_queued_prompts_and_completed_turn() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Old queued follow-up.", None);
+    world
+        .fake()
+        .sessions
+        .last_mut()
+        .unwrap()
+        .activities
+        .last_mut()
+        .unwrap()["queued"] = json!(true);
+    world.settle().await;
+    assert_eq!(world.record(KEY).pending_prompt_ids.len(), 1);
+    commands::wait(
+        &world.ctx(),
+        &world.session(),
+        KEY,
+        "Waiting for the next turn.",
+    )
+    .await
+    .unwrap();
+    world.settle().await;
+    assert!(world.record(KEY).turn_complete.is_some());
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    approve_resume(&mut world).await;
+    let resumed = world.record(KEY);
+    assert_eq!(resumed.status, Status::Active);
+    assert!(resumed.turn_complete.is_none());
+    assert!(resumed.pending_prompt_ids.is_empty());
+    assert_eq!(resumed.prompt_cursor_ids, Some(Vec::new()));
+    assert!(
+        !world
+            .text(KEY, "conversation.md")
+            .contains("Old queued follow-up.")
+    );
+    world.message(KEY, "user-1", "Continue in the new session.", None);
+    world.later(5);
+    world.settle().await;
+    assert!(
+        world
+            .text(KEY, "conversation.md")
+            .contains("Continue in the new session.")
+    );
 }

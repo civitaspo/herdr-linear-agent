@@ -217,6 +217,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `external_urls` | list of `{label, url}` |
 | `timeout_since` | start of the run timeout window |
 | `timeout_asked` | compatibility field for old records; new timeout waits use `awaiting_reply` |
+| `resume_request` | optional incident consent record: unique token, request comment UUID, waiting/denied/approved decision (including approving comment and user IDs), verified replacement session ID, restoration error, and durable delegate/session attempt markers |
 | `awaiting_reply` | optional `{activity_id, asked_at, reason}` for the one Linear question currently waiting on a person (`coordinator_question`, `run_timeout`, or `coordinator_lost`) |
 | `turn_complete` | optional request ID for the completed coordinator turn; holds background heartbeat, timeout and recovery until new work resumes |
 | `cleared_wait_id` | the last cleared question id; prevents a refused request still awaiting archival from restoring its wait after a crash |
@@ -486,11 +487,14 @@ The kept modules `src/linear/*` define the operations; the rewrite may make them
 | `activity_exists(session, id)` | `HerdrLinearAgentActivityFind` | whether an activity with that id exists |
 | `set_plan(session, plan)` | `HerdrLinearAgentSessionUpdate` | replaces the plan |
 | `set_external_urls(session, urls)` | `HerdrLinearAgentSessionUpdate` | replaces the whole URL list |
+| `resume_context(issue, comment, token)` | `HerdrLinearAgentResumeContext` | issue ownership/state/team, exact approval/refusal comments and their human authors, and the public request comment's `agentSession` relation |
+| `restore_delegate(issue, app_user)` | `HerdrLinearAgentRestoreDelegate` | `issueUpdate` with `delegateId` only, after fresh consent and ownership checks |
+| `create_session_on_comment(comment)` | `HerdrLinearAgentResumeSession` | public `agentSessionCreateOnComment`; recovery verifies the attached session before retrying an uncertain result |
 | `set_issue_state(issue, state)` | `HerdrLinearAgentIssueState` | `issueUpdate` with `stateId` only |
 | `create_comment(issue, id, body)` | `HerdrLinearAgentCommentCreate` | `commentCreate` with the caller's UUID as `id` |
 | `comment_exists(id)` | `HerdrLinearAgentCommentFind` | whether `comments(filter: { id })` has one |
 | `add_labels(issue, names)` | `HerdrLinearAgentLabels`, then `HerdrLinearAgentLabelAdd` | reads the issue's labels, its team's `labels(first: 250)` and the workspace's (`issueLabels` with no team), names them `Label` or `Group/Label`, and adds each named one the issue lacks with `issueAddLabel`; an unknown name fails after the others |
-| `run_updates(queries)` | `HerdrLinearAgentRuns` | batched issue and session reads; prompt filter is `createdAt >= cursor` or a pending ID, with `queued` and `sentAt`; follows `pageInfo` past 50 activities, then orders prompts by delivery time (`sentAt`, or `createdAt` for direct prompts); an empty list sends nothing |
+| `run_updates(queries)` | `HerdrLinearAgentRuns` | batched issue reads for active and detached runs, with optional session reads including `id`, `archivedAt` and `dismissedAt`; prompt filter is `createdAt >= cursor` or a pending ID, with `queued` and `sentAt`; follows `pageInfo` past 50 activities, then orders prompts by delivery time (`sentAt`, or `createdAt` for direct prompts); an empty list sends nothing |
 
 Writes fail with `Graphql("<payload> did not succeed")` when `success` is not true. A missing field is `ReadFieldsInvalid`. `src/linear/api.rs:reads_parse_into_typed_records`, `src/linear/api.rs:writes_and_run_updates_round_trip`, `src/linear/api.rs:a_missing_field_is_an_error`
 
@@ -505,7 +509,7 @@ Operations of the Linear task:
 | Operation | Interval | Behavior |
 | --- | --- | --- |
 | intake poll | `workspaces.<name>.intake_interval_seconds` (default 5) | `delegated_issues`, published for the reconciler's intake |
-| run read | `workspaces.<name>.run_read_interval_seconds` (default 5) | `run_updates` for every active run with a session, then per-run handling |
+| run read | `workspaces.<name>.run_read_interval_seconds` (default 5) | `run_updates` for active and detached runs (issue-only when there is no usable session), then per-run handling and consent reads |
 | viewer | once, cached | the app user id; retried until known; run reads wait for it |
 | flush | after new outbox requests and after each read | see [Outbox and flush](#outbox-and-flush) |
 
@@ -540,7 +544,7 @@ Rules:
 
 Per workspace, from a delegated list of that workspace the reconciler has not used yet (the read time of the last one used is kept per workspace), for each delegated issue in the order returned; its key is `<workspace>/<ISSUE>`:
 
-Before anything else, an issue without an active run must pass [Who delegated](#who-delegated). A declined one is skipped here, before the pause and the limits.
+Runs with a pending `resume_request` bypass ordinary intake, including delegations written by the restoration itself. Before anything else, any other issue without an active run must pass [Who delegated](#who-delegated). A declined one is skipped here, before the pause and the limits.
 
 1. A run exists for the key:
    - Active, with no coordinator profile decided and no routing job (a claim cut short, or an older build): read the issue and run `finish_claim`. Log errors as `<KEY>: <error>`.
@@ -620,12 +624,13 @@ A team's routing (`teams.<KEY>.routing`, a table `[routing.<name>]`) picks the r
 
 ## Reading runs: close, detach, issue edits
 
-For every active run with a session, per update, in this order. A read that started before the run's last status change (a re-delegation, a reopen, a close or a detach) is ignored, so a read made with an old query cannot undo a newer state:
+For every active or detached run, per update, in this order. Detached runs remain in the query list even with an empty outbox. Their issue-only reads do not depend on the suspended session. If an active run's session read fails with a GraphQL/field error but an independent issue read succeeds, suspend it as unavailable; a network/rate-limit error alone does not establish that fact. A read that started before the run's last status change (a re-delegation, a reopen, a close or a detach) is ignored, so a read made with an old query cannot undo a newer state:
 
 1. State type `completed` or `canceled`: close the run.
-2. Delegate is not the app user of the run's workspace: detach the run.
-3. `updatedAt` differs from `issue_updated_at`: refresh the issue.
-4. Relay the prompts.
+2. A pending consent request: handle approval/refusal or verify the replacement session before reactivating.
+3. Delegate is not the app user of the run's workspace, or its session has `archivedAt`/`dismissedAt`: detach and request consent. `complete` session status alone is not a suspension.
+4. `updatedAt` differs from `issue_updated_at`: refresh the issue.
+5. Relay the prompts.
 
 `refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no item. The hash also leaves out the comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
 
@@ -638,9 +643,22 @@ For every active run with a session, per update, in this order. A read that star
 5. Set the run `closed` and the coordinator `stopped` and, when the run has a session, queue the response ``The issue is <state name>; this run is closed.`` in the same critical section, since Linear shows a session as working until a response ends it (the flush covers closed runs). Log the close line.
 6. A closed run is left alone: nothing is started for it. Reopened and still delegated, it becomes active with the coordinator resumed from its session (`--resume sess-...`). `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it` (two workspaces closed, worker `stopped`).
 
-`detach_run`: set the run `detached` with a pending interrupt (`interrupt = detach`, cleared when the run becomes active again), log; the first pass with a snapshot interrupts the agents and posts nothing. Workspaces stay. `tests/scenarios:a_detach_while_herdr_is_down_interrupts_once_herdr_is_back` Delegated again, the run is active again. `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it`
+`detach_run`: under the run lock, queue one ordinary issue comment with a UUID approval code and persist `resume_request`, set `detached` and `interrupt = detach`, and clear any session-native wait. The first pass with a snapshot interrupts the agents; workspaces and native agent sessions stay. The consent record survives ticker restarts. Existing detached records without a request acquire one on their next read. Old queued session activities/plans/URLs and issue-state moves are discarded while consent is pending; ordinary comments and postmortem labels can still be delivered without opening a session.
+
+Comment consent:
+
+- Read comments whose bodies exactly equal `resume <token>` or `stop <token>`. Issue descriptions and loose natural-language replies do not authorize restoration. Only a human (`user.app = false`) in both this team's `allowed_user_ids` and `delegators()` can answer. A team removed from the config cannot authorize recovery.
+- A refusal wins over approvals in the same read, persists `denied`, acknowledges the refusal once and keeps the run paused. An approval records its comment/user IDs and queues a token-bound restore operation in the same run lock. Reconciliation restores a missing queue entry after a crash between those file writes. Changing the delegate in the UI cannot bypass this request.
+- Only the Linear task performs restoration. Before every recovery write it rechecks the approving comment and question, issue team/state/archive status and current ownership. It never deliberately overwrites an existing other delegate. It sets `delegateId` only when absent, then uses the public `agentSessionCreateOnComment` API to create a new session on the request comment. This replaces the plugin's session connection; it does not unarchive or un-dismiss the original conversation.
+- The attempt markers are persisted before mutations. A lost response is verified through current delegation and `comment.agentSession` before another write. An unobservable or removed result, hidden replacement session, changed approval or definitive refusal requires a new incident code; it is not recreated repeatedly using old consent.
+- The writer stores only the verified replacement session ID. A later reconciler read must confirm that same session is visible and delegation belongs to this app before setting `active`, clearing the request, resetting the prompt/timeout cursors and telling the coordinator through its inbox. Existing worktrees and native sessions continue. Old session reads cannot invalidate the replacement.
+- Completion/cancellation wins over consent: close workspaces and queue the final postmortem even without a session or approval. Closing clears pending consent and its unusable session ID and cancels undelivered consent comments; it does not recreate a hidden session to deliver the final comment.
+
+Regression evidence uses `World`/`FakeLinear`, including restart, hidden sessions, removed sessions, policy enforcement, old codes, declined requests, other-agent ownership, lost write responses and completion while detached. These are fake integration scenarios, not a check against a real Linear workspace. See `src/ticker/scenarios.rs:comment_consent_restores_delegation_and_keeps_the_native_agents_and_worktrees`, `hidden_sessions_pause_even_with_a_delegate_and_ignore_untrusted_or_stale_consent`, `detached_runs_still_close_and_get_a_final_postmortem_without_a_linear_session` and `src/outbox.rs:a_lost_recovery_response_is_verified_before_retrying_either_write`.
 
 Checkouts and branches are never removed.
+
+When comment-authorized recovery switches to a new Linear session, it resets the prompt cursor boundary IDs, clears queued prompt IDs from the old session, and clears the old coordinator-turn completion marker. New-session replies and coordinator recovery use the existing run and native agent history. Turn-completion responses require a usable session and are discarded with other session writes while recovery is pending.
 
 ## Relay of Linear prompts
 

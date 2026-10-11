@@ -121,6 +121,34 @@ pub struct AwaitingReply {
     pub reason: WaitReason,
 }
 
+/// One consent request, rooted in an ordinary issue comment. Its UUID is
+/// also the approval code, so an answer cannot authorize a later incident.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeRequest {
+    pub token: String,
+    pub comment_id: String,
+    pub decision: ResumeDecision,
+    /// Written by the Linear task after both external writes are verified.
+    #[serde(default)]
+    pub restored_session_id: String,
+    #[serde(default)]
+    pub restore_error: String,
+    /// An uncertain write is verified, never repeated after its result was
+    /// removed or cannot be observed. A new attempt then needs fresh consent.
+    #[serde(default)]
+    pub delegate_attempted: bool,
+    #[serde(default)]
+    pub session_attempted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ResumeDecision {
+    Waiting,
+    Denied,
+    Approved { comment_id: String, user_id: String },
+}
+
 /// Where an agent (coordinator or worker) is in its life.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -292,6 +320,8 @@ pub struct RunRecord {
     /// The id of the current coordinator-turn completion response.
     #[serde(default)]
     pub turn_complete: Option<String>,
+    /// Consent to restore delegation and replace a hidden Linear session.
+    pub resume_request: Option<ResumeRequest>,
     /// Prevents a cleared, still-queued question from being restored after a
     /// restart while its unknown Linear write is being reconciled.
     #[serde(default)]

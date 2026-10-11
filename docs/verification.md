@@ -423,3 +423,37 @@ The first recovery build marked the missing coordinator stale with zero attempts
 After Keychain access was allowed, [CIV-13](https://linear.app/civitaspo/issue/CIV-13/verify-native-session-crash-recovery-with-resolved-opencode-path) verified the final build in the same isolated environment. Its coordinator resumed in `wM:p1` after the 30-second confirmation and 15-second delay, retaining native session `ses_f03686629ffeyilC0V1Lxqlz0P`. Actual foreground process arguments included `mini --model openai/gpt-6-luna#max --session` with that session ID.
 
 The single testing worker was killed and automatically resumed three times in `wN:p1`, retaining its worktree and native session `ses_f03673cf1ffe6M48inUuQi5JWl`. Persisted retry deadlines were 15, 30, and 60 seconds after confirmation. Restarting the isolated ticker between the second crash and its resume preserved the cumulative budget. The third resume completed at 12:36:55 UTC. A fourth SIGTERM at 12:37:11 produced `stale` with `attempts = 3` after confirmation; no fourth automatic start occurred. One recovery-stopped inbox item requested manual restart, `reported` became true, and the Linear outbox drained. A separate earlier idle-without-report inbox item was unrelated to recovery exhaustion. No repository files were edited or pushed.
+
+## Comment-authorized Linear recovery (2026-10-11)
+
+A signed build of `aa62aef` was checked against Personal Linear (`civitaspo`)
+[CIV-14](https://linear.app/civitaspo/issue/CIV-14/verify-comment-authorized-delegate-and-session-recovery-for-pr-138),
+Herdr 0.9.3 in the isolated `hla-test` session, and actual OpenCode 2.0.24
+coordinator and worker processes using `openai/gpt-6-luna#low`. Dedicated config
+and state folders limited intake to CIV, which the installed ticker does not
+poll. Test wrappers removed those temporary XDG variables when invoking Herdr
+and OpenCode, matching the agents' normal environment. The worker read the
+testing repository's README and reported its title without editing files.
+
+All times below are UTC. Human approval comments were submitted through the
+Personal Linear connector as the configured allowed user; the plugin performed
+the delegation and session writes through its own Linear task.
+
+| Scenario | Observed result |
+| --- | --- |
+| Delegate removal at 11:55:29 | The run became Detached and posted one ordinary consent comment. It remained paused until fresh approval at 11:58:09. Delegation was restored and replacement session `74e32ef2-17c0-4037-8d62-483f1fd5979d` replaced original session `6761f123-9f03-4f2a-a10e-7251f077fd81`. The human assignee remained unchanged. |
+| Session-only Archive at 11:58:59 | The Linear UI archived the replacement session while delegation remained. The run became Detached with a new token and consent comment. |
+| Restart and stale approval | Restarting only the isolated ticker preserved the pending token and comment. A new comment replaying the previous incident's token did not resume the run or attempt a restore. Fresh approval at 11:59:37 created session `e64a577e-8da3-4c34-8793-c97349eb034e` and returned the run to Active without another delegation write. |
+| Existing work continues | Both recoveries kept coordinator pane `w4:p1` and native session `ses_ed52ff117ffesuued2Lsrvctsb`, worker pane `w5:p1` and native session `ses_ed52f8c63ffefFQGpZu76HF53L`, and the worker's report, branch and worktree. Actual coordinator replies referred to the retained README result. Old turn-completion markers cleared on recovery; the coordinator subsequently called `wait` again. |
+| Terminal cleanup while Detached | Delegation was removed again at 12:00:04, without approval. Done at 12:00:19 closed the run at 12:00:29 and removed both run workspaces. The unrelated scratch workspace remained, as did the clean worker checkout and branch. |
+| Final postmortem | Actual OpenCode generated the final postmortem at 12:00:40. Its ordinary issue comment appeared at 12:00:43, `postmortem_due` cleared, and the outbox drained. |
+
+The postmortem correctly identified the run as Done, but assessed the README
+task rather than the external driver's full verification: the driver's
+observations had not been placed in the run conversation before generation.
+Those observations were subsequently recorded in an ordinary CIV-14 comment.
+This check establishes postmortem generation and delivery, not independent
+assessment of external test evidence. Unknown write outcomes, unauthorized
+authors, vetoes and reordered reads remain regression-suite checks rather than
+live fault injection. The isolated ticker was stopped afterwards; the installed
+ticker and LayerX issues were not changed.
