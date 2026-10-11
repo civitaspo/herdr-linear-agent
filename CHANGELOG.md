@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update Securefix caller workflows to v0.2.12 (#137)
 - update Securefix caller workflows to v0.2.11 (#135)
 - update Securefix caller workflows to v0.2.10 (#134)
 - update rust crate serde_json to v1.0.152 (#130)
