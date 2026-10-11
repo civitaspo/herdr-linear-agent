@@ -22,6 +22,30 @@ The first integration test ran on 2026-09-26 and 2026-09-27 with Herdr 0.9.1 and
 | 12 | Does Linear report the granted scope with commas or spaces? | **Checked.** Spaces: `"app:assignable read write"`. |
 | 13 | Does the Secret Service store work on a Linux desktop and in a headless session (for example over SSH, where no keyring runs)? | Not checked yet. |
 
+## Queued prompts and turn completion (2026-10-09)
+
+The Linear desktop app showed DATA-1077's follow-up still queued, with a
+`Send immediately (steer)` control, while the local coordinator transcript
+already contained and acted on that instruction. The session remained
+`Working...` after both agents were done, and later received a heartbeat saying
+the worker had reported. This confirmed the original symptoms against the real
+workspace before the fix.
+
+The regression suite now covers withholding queued prompts, delayed delivery
+after a ticker restart, equal creation timestamps, delivery order, pagination
+past 50 activities, and stale queued observations. Turn-completion checks cover
+active-worker and unseen-input rejection, response readback after a lost
+acknowledgement, definitive refusal, and suppression of background activity and
+coordinator recovery. These are fake Linear and Herdr checks, not live evidence.
+
+A signed release binary was built for a live read against an isolated copy of
+the run state. Its intake filter used an unused team key, its coordinator was
+stopped, and its outbox was empty. No prompt read was observed before the probe
+was stopped. Inspection of Keychain Access was rejected by automatic approval
+review because it could expose unrelated credentials. Post-fix queue delivery
+and the completion indicator in the real Linear UI remain unverified. The
+production ticker and issue were not changed by this check.
+
 ## Local macOS signing checked on 2026-10-03
 
 An Apple Development identity initially appeared under matching identities but

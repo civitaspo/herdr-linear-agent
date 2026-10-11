@@ -506,6 +506,7 @@ impl Reconciler {
                     || record.stopped
                     || record.finished
                     || record.awaiting_reply.is_some()
+                    || (reserve_key.worker.is_none() && record.turn_complete.is_some())
                 {
                     return Ok((false, Vec::new()));
                 }
@@ -595,6 +596,7 @@ impl Reconciler {
                     || record.stopped
                     || record.finished
                     || record.awaiting_reply.is_some()
+                    || (worker_id.is_none() && record.turn_complete.is_some())
                 {
                     return Ok((false, Vec::new()));
                 }

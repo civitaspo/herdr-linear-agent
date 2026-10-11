@@ -384,6 +384,7 @@ mod tests {
             issue_id: issue_id.into(),
             session_id: session_id.into(),
             cursor: "2026-09-24T00:00:00Z".into(),
+            pending_ids: Vec::new(),
         };
         let updates = linear
             .read_runs(&[query(&one, &session), query(&two, "session-missing")])

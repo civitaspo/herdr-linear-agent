@@ -183,6 +183,110 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
     Ok(())
 }
 
+/// Ends the coordinator's current turn without finishing the Linear run.
+pub async fn wait<H: Herdr>(
+    ctx: &Ctx<'_>,
+    session: &Session<H>,
+    key: &str,
+    text: &str,
+) -> Result<()> {
+    non_empty(text, "summary")?;
+    let (_, run, initial) = load_active(ctx, key).await?;
+    if initial.turn_complete.is_some() {
+        println!("the coordinator turn is already complete; the run remains active");
+        return Ok(());
+    }
+    let snapshot = session.herdr.snapshot().await.context(UNREACHABLE)?;
+    let blocked = blocked_workers(
+        &run,
+        &snapshot,
+        jiff::Timestamp::now(),
+        &ctx.state_dir(),
+        &session.socket,
+    );
+    if !blocked.is_empty() {
+        bail!(
+            "not waiting: {}. Every worker must have written a report and be neither working nor waiting",
+            blocked.join(", ")
+        );
+    }
+
+    let lock = run.lock()?;
+    let current = run.record()?;
+    if current.status != Status::Active
+        || current.stopped
+        || current.finished
+        || current.awaiting_reply.is_some()
+    {
+        bail!("run {key} cannot wait while stopped, finished or awaiting a reply");
+    }
+    if current.reply_generation != initial.reply_generation {
+        bail!("new Linear input arrived while checking workers; read context before waiting");
+    }
+    if current.turn_complete.is_some() {
+        println!("the coordinator turn is already complete; the run remains active");
+        return Ok(());
+    }
+    let seen = inbox::seen(&run);
+    if inbox::unhandled(&run)
+        .iter()
+        .any(|item| !seen.contains(&item.id))
+    {
+        bail!("run {key} has new inbox items; read context before waiting");
+    }
+    let blocked = blocked_workers(
+        &run,
+        &snapshot,
+        jiff::Timestamp::now(),
+        &ctx.state_dir(),
+        &session.socket,
+    );
+    if !blocked.is_empty() {
+        bail!(
+            "not waiting: {}. Every worker must have written a report and be neither working nor waiting",
+            blocked.join(", ")
+        );
+    }
+    if outbox::push_held(
+        &run,
+        &lock,
+        Op::TurnComplete {
+            body: text.trim().to_string(),
+        },
+    )?
+    .is_none()
+    {
+        bail!("run {key} cannot wait while stopped, finished or awaiting a reply");
+    }
+    ticker::poke(&ctx.state_dir());
+    println!("the coordinator turn is complete; the run remains active");
+    Ok(())
+}
+
+fn blocked_workers(
+    run: &Run,
+    snapshot: &herdr::Snapshot,
+    now: jiff::Timestamp,
+    state_dir: &Path,
+    socket: &str,
+) -> Vec<String> {
+    worker::list(run)
+        .into_iter()
+        .filter(|w| {
+            matches!(
+                w.agent.status,
+                AgentStatus::Open | AgentStatus::Failed | AgentStatus::Pending
+            )
+        })
+        .map(|w| {
+            let live = worker::live_state(&w.agent, snapshot, now, state_dir, socket);
+            (worker::group(&w, &live), w)
+        })
+        .filter(|(group, _)| *group != Group::Reported)
+        .map(|(group, w)| format!("{} is {}", w.id, group.label()))
+        .collect()
+}
+
 /// Posts the final summary and moves the issue to review, once every worker
 /// has reported and none is working or waiting.
 pub async fn finish<H: Herdr>(
@@ -196,21 +300,7 @@ pub async fn finish<H: Herdr>(
     let snapshot = session.herdr.snapshot().await.context(UNREACHABLE)?;
     let now = jiff::Timestamp::now();
     let state_dir = ctx.state_dir();
-    let blocking: Vec<String> = worker::list(&run)
-        .into_iter()
-        .filter(|w| {
-            matches!(
-                w.agent.status,
-                AgentStatus::Open | AgentStatus::Failed | AgentStatus::Pending
-            )
-        })
-        .map(|w| {
-            let live = worker::live_state(&w.agent, &snapshot, now, &state_dir, &session.socket);
-            (worker::group(&w, &live), w)
-        })
-        .filter(|(group, _)| *group != Group::Reported)
-        .map(|(group, w)| format!("{} is {}", w.id, group.label()))
-        .collect();
+    let blocking = blocked_workers(&run, &snapshot, now, &state_dir, &session.socket);
     if !blocking.is_empty() {
         bail!(
             "not finished: {}. Every worker must have written a report and be neither working nor waiting",
@@ -237,6 +327,7 @@ pub async fn finish<H: Herdr>(
             r.cleared_wait_id = wait.activity_id;
         }
         r.finished = true;
+        r.turn_complete = None;
         r.postmortem_due
             .get_or_insert(crate::postmortem::Stage::Interim);
     })?;
@@ -413,6 +504,7 @@ pub async fn worker_start<H: Herdr>(
             w.agent.agent_name = names::agent_name(key, &record.issue_id, &w.id);
         },
     )?;
+    outbox::clear_turn_complete(&run)?;
     let task_path = worker::task_path(&run, &worker.id);
     if let Err(error) =
         files::write_atomic(&task_path, format!("{}\n", args.task.trim()).as_bytes())
@@ -575,6 +667,7 @@ pub async fn worker_prompt<H: Herdr>(
             agent.pane
         );
     }
+    outbox::clear_turn_complete(&run)?;
     worker::append_follow_up(&run, id, text)?;
     session
         .herdr
@@ -690,6 +783,7 @@ pub async fn worker_restart<H: Herdr>(
     for line in failures {
         eprintln!("{line}");
     }
+    outbox::clear_turn_complete(&run)?;
     // Before the old workspace closes, so a pass woken by the close finds
     // a worker the watcher leaves alone rather than one whose pane is gone.
     worker::update(&run, id, |w| {

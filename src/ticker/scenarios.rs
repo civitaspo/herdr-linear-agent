@@ -2129,6 +2129,341 @@ async fn a_prompt_read_again_with_an_old_cursor_is_relayed_once() {
 }
 
 #[tokio::test]
+async fn a_queued_prompt_is_not_relayed_before_linear_sends_it() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Wait until the current turn ends.", None);
+    world
+        .fake_for(KEY)
+        .sessions
+        .last_mut()
+        .unwrap()
+        .activities
+        .last_mut()
+        .unwrap()["queued"] = json!(true);
+
+    world.settle().await;
+
+    assert!(
+        !world
+            .text(KEY, "conversation.md")
+            .contains("Wait until the current turn ends.")
+    );
+    assert!(
+        !world
+            .inbox(KEY)
+            .iter()
+            .any(|item| item.contains("A new reply"))
+    );
+}
+
+#[tokio::test]
+async fn a_new_direct_prompt_passes_an_older_queued_prompt() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Queued follow-up.", None);
+    world
+        .fake_for(KEY)
+        .sessions
+        .last_mut()
+        .unwrap()
+        .activities
+        .last_mut()
+        .unwrap()["queued"] = json!(true);
+    world.message(KEY, "user-1", "Send this one now.", None);
+
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(
+        conversation.contains("Send this one now."),
+        "{conversation}"
+    );
+    assert!(
+        !conversation.contains("Queued follow-up."),
+        "{conversation}"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_prompt_is_relayed_once_when_dequeued_after_its_cursor() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Deliver after the current turn.", None);
+    let queued = world
+        .fake_for(KEY)
+        .sessions
+        .last()
+        .unwrap()
+        .activities
+        .last()
+        .unwrap()
+        .clone();
+    let queued_at = queued["createdAt"].as_str().unwrap().to_string();
+    let queued_id = queued["id"].as_str().unwrap().to_string();
+    world
+        .fake_for(KEY)
+        .sessions
+        .last_mut()
+        .unwrap()
+        .activities
+        .last_mut()
+        .unwrap()["queued"] = json!(true);
+
+    world.settle().await;
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(
+        !conversation.contains("Deliver after the current turn."),
+        "{conversation}"
+    );
+    let pending = world.record(KEY).pending_prompt_ids;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending.first().map(String::as_str),
+        Some(queued_id.as_str())
+    );
+
+    world.restart_ticker();
+
+    world.later(60);
+    let sent_at = world.now().to_string();
+    {
+        let mut linear = world.fake_for(KEY);
+        let activity = linear
+            .sessions
+            .last_mut()
+            .unwrap()
+            .activities
+            .iter_mut()
+            .find(|activity| activity["id"] == queued_id)
+            .unwrap();
+        activity["queued"] = json!(false);
+        activity["sentAt"] = json!(sent_at);
+        activity["createdAt"] = json!(queued_at);
+    }
+    world.settle().await;
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert_eq!(
+        conversation
+            .matches("Deliver after the current turn.")
+            .count(),
+        1,
+        "{conversation}"
+    );
+    assert!(world.record(KEY).pending_prompt_ids.is_empty());
+}
+
+#[tokio::test]
+async fn stale_queued_snapshot_does_not_requeue_an_accepted_prompt() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Already delivered.", None);
+    let id = world
+        .fake_for(KEY)
+        .sessions
+        .last()
+        .unwrap()
+        .activities
+        .last()
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    world.settle().await;
+    assert_eq!(
+        world
+            .text(KEY, "conversation.md")
+            .matches("Already delivered.")
+            .count(),
+        1
+    );
+
+    world
+        .fake_for(KEY)
+        .sessions
+        .last_mut()
+        .unwrap()
+        .activities
+        .iter_mut()
+        .find(|activity| activity["id"] == id)
+        .unwrap()["queued"] = json!(true);
+    world.settle().await;
+    assert!(
+        world
+            .run(KEY)
+            .record()
+            .unwrap()
+            .pending_prompt_ids
+            .is_empty()
+    );
+
+    world.later(60);
+    let sent_at = world.now().to_string();
+    {
+        let mut linear = world.fake_for(KEY);
+        let activity = linear
+            .sessions
+            .last_mut()
+            .unwrap()
+            .activities
+            .iter_mut()
+            .find(|activity| activity["id"] == id)
+            .unwrap();
+        activity["queued"] = json!(false);
+        activity["sentAt"] = json!(sent_at);
+    }
+    world.settle().await;
+    assert_eq!(
+        world
+            .text(KEY, "conversation.md")
+            .matches("Already delivered.")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn prompts_with_the_same_creation_time_are_both_relayed() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "First at the same time.", None);
+    world.message(KEY, "user-1", "Second at the same time.", None);
+    {
+        let mut linear = world.fake_for(KEY);
+        let activities = &mut linear.sessions.last_mut().unwrap().activities;
+        let created_at = activities[activities.len() - 2]["createdAt"].clone();
+        activities.last_mut().unwrap()["createdAt"] = created_at;
+    }
+
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(
+        conversation.contains("First at the same time."),
+        "{conversation}"
+    );
+    assert!(
+        conversation.contains("Second at the same time."),
+        "{conversation}"
+    );
+}
+
+#[tokio::test]
+async fn delayed_prompts_are_ordered_by_when_linear_sent_them() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Queued first, sent last.", None);
+    let queued = world
+        .fake_for(KEY)
+        .sessions
+        .last()
+        .unwrap()
+        .activities
+        .last()
+        .unwrap()
+        .clone();
+    let queued_at = queued["createdAt"].as_str().unwrap().to_string();
+    let queued_id = queued["id"].as_str().unwrap().to_string();
+    world
+        .fake_for(KEY)
+        .sessions
+        .last_mut()
+        .unwrap()
+        .activities
+        .last_mut()
+        .unwrap()["queued"] = json!(true);
+    world.settle().await;
+
+    world.later(60);
+    world.message(KEY, "user-1", "Direct prompt sent first.", None);
+    let sent_at = (world.now() + jiff::SignedDuration::from_secs(60)).to_string();
+    {
+        let mut linear = world.fake_for(KEY);
+        let queued = linear
+            .sessions
+            .last_mut()
+            .unwrap()
+            .activities
+            .iter_mut()
+            .find(|activity| activity["id"] == queued_id)
+            .unwrap();
+        queued["queued"] = json!(false);
+        queued["sentAt"] = json!(sent_at);
+        queued["createdAt"] = json!(queued_at);
+    }
+
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(
+        conversation.find("Direct prompt sent first.").unwrap()
+            < conversation.find("Queued first, sent last.").unwrap(),
+        "{conversation}"
+    );
+}
+
+#[tokio::test]
+async fn sent_time_ordering_does_not_drop_an_unobserved_older_prompt() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Establish cursor.", None);
+    world.settle().await;
+
+    world.later(10);
+    world.message(KEY, "user-1", "Older created, sent later.", None);
+    world.later(10);
+    world.message(KEY, "user-1", "Newer created, sent first.", None);
+    let created = world.now();
+    let direct_sent_at = (created - jiff::SignedDuration::from_secs(5)).to_string();
+    let older_sent_at = (created + jiff::SignedDuration::from_secs(5)).to_string();
+    {
+        let mut linear = world.fake_for(KEY);
+        let activities = &mut linear.sessions.last_mut().unwrap().activities;
+        let older = activities.len() - 2;
+        activities[older]["sentAt"] = json!(older_sent_at);
+        activities.last_mut().unwrap()["sentAt"] = json!(direct_sent_at);
+    }
+
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    assert!(
+        conversation.contains("Older created, sent later."),
+        "{conversation}"
+    );
+    assert!(
+        conversation.contains("Newer created, sent first."),
+        "{conversation}"
+    );
+    assert!(
+        conversation.find("Newer created, sent first.").unwrap()
+            < conversation.find("Older created, sent later.").unwrap(),
+        "{conversation}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_reads_paginate_past_fifty_activities() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    for index in 0..51 {
+        world.message(KEY, "user-1", &format!("Prompt {index:02}."), None);
+    }
+
+    world.settle().await;
+
+    let conversation = world.text(KEY, "conversation.md");
+    for index in 0..51 {
+        assert!(
+            conversation.contains(&format!("Prompt {index:02}.")),
+            "missing prompt {index:02}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails() {
     use std::os::unix::fs::PermissionsExt;
     let mut world = World::sample();
@@ -2787,4 +3122,125 @@ async fn only_a_person_editing_the_issue_writes_an_issue_item() {
     world.later(5);
     world.settle().await;
     assert_eq!(issue_items(&world), 2, "an edited description is");
+}
+
+#[tokio::test]
+async fn wait_completes_only_the_coordinator_turn_and_new_input_resumes_it() {
+    let mut world = World::with(limit("ask_to_continue_after_hours", 1));
+    world.running_issue().await;
+
+    commands::wait(
+        &world.ctx(),
+        &world.session(),
+        KEY,
+        "The investigation is queued.",
+    )
+    .await
+    .unwrap();
+    world.settle().await;
+
+    assert_eq!(
+        world.bodies(KEY, "response"),
+        ["The investigation is queued."]
+    );
+    assert_eq!(world.record(KEY).status, Status::Active);
+    assert!(!world.record(KEY).finished);
+    assert!(world.record(KEY).turn_complete.is_some());
+
+    // A repeated command is safe and cannot create a second response.
+    commands::wait(&world.ctx(), &world.session(), KEY, "duplicate")
+        .await
+        .unwrap();
+    world.later(3 * 3600);
+    world.settle().await;
+    assert_eq!(world.bodies(KEY, "response").len(), 1);
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 0);
+
+    world.message(KEY, "user-1", "Continue with the results.", None);
+    world.later(120);
+    world.settle().await;
+    assert!(world.record(KEY).turn_complete.is_none());
+    assert!(
+        world
+            .text(KEY, "conversation.md")
+            .contains("Continue with the results")
+    );
+    assert!(
+        world
+            .inbox(KEY)
+            .iter()
+            .any(|item| item.contains("new reply"))
+    );
+}
+
+#[tokio::test]
+async fn a_completed_turn_does_not_start_recovery_when_its_pane_disappears() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::wait(
+        &world.ctx(),
+        &world.session(),
+        KEY,
+        "Waiting for the deployment.",
+    )
+    .await
+    .unwrap();
+    world.settle().await;
+    let workspace = world.record(KEY).coordinator.workspace_id.clone();
+
+    world.herdr.remove_workspace(&workspace);
+    world.later(120);
+    world.settle().await;
+
+    let run = world.record(KEY);
+    assert!(run.turn_complete.is_some());
+    assert!(run.awaiting_reply.is_none());
+    assert!(!run.coordinator_lost);
+    assert_eq!(run.coordinator.recovery, Recovery::None);
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+}
+
+#[tokio::test]
+async fn wait_refuses_to_end_while_a_worker_is_still_active() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+
+    let error = commands::wait(&world.ctx(), &world.session(), KEY, "Waiting for api.")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("w1 is Working"));
+    assert!(world.bodies(KEY, "response").is_empty());
+    assert!(world.record(KEY).turn_complete.is_none());
+}
+
+#[tokio::test]
+async fn wait_refuses_to_end_with_unseen_inbox_items_or_an_open_question() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    inbox::write(&world.run(KEY), "worker", "w1", "Worker report arrived.").unwrap();
+
+    let error = commands::wait(&world.ctx(), &world.session(), KEY, "Waiting for review.")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("new inbox items"));
+    assert!(world.bodies(KEY, "response").is_empty());
+    assert!(world.record(KEY).turn_complete.is_none());
+
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "May I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    let wait = world.record(KEY).awaiting_reply.clone().unwrap();
+
+    let error = commands::wait(&world.ctx(), &world.session(), KEY, "The work is ready.")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("awaiting a reply"));
+    assert!(world.bodies(KEY, "response").is_empty());
+    assert_eq!(world.record(KEY).awaiting_reply, Some(wait));
+    assert!(world.record(KEY).turn_complete.is_none());
 }
