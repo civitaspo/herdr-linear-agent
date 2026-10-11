@@ -644,7 +644,7 @@ impl Reconciler {
         }
     }
 
-    /// Active runs, and runs of any status with queued requests (the flush
+    /// Active and detached runs, and closed runs with queued requests (the flush
     /// covers detached and closed runs too). A run whose coordinator is not
     /// decided and whose routing does not run asks for the issue detail.
     fn compute_queries<H>(&self, d: &Deps<'_, H>) -> Vec<RunQuery> {
@@ -653,7 +653,7 @@ impl Reconciler {
             .filter_map(|run| {
                 let record = run.record().ok()?;
                 let active = record.status == Status::Active;
-                if !active && outbox::is_empty(&run) {
+                if record.status == Status::Closed && outbox::is_empty(&run) {
                     return None;
                 }
                 let undecided = active
@@ -669,7 +669,11 @@ impl Reconciler {
                     review_state,
                     issue_id: record.issue_id,
                     run_dir: run.dir.clone(),
-                    session_id: Some(record.session_id).filter(|s| !s.is_empty()),
+                    session_id: if let Some(request) = &record.resume_request {
+                        Some(request.restored_session_id.clone()).filter(|s| !s.is_empty())
+                    } else {
+                        Some(record.session_id).filter(|s| !s.is_empty())
+                    },
                     prompt_cursor: record.prompt_cursor,
                     pending_prompt_ids: record.pending_prompt_ids,
                     issue_updated_at: (!undecided).then_some(record.issue_updated_at),

@@ -13,7 +13,10 @@ use crate::herdr::{Herdr, Snapshot, WorkspaceId};
 use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUpdate};
 use crate::linear::task::{Decline, Levels, LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
-use crate::run::{AgentRecord, AgentStatus, Interrupt, Run, RunRecord, Status, WaitReason};
+use crate::run::{
+    AgentRecord, AgentStatus, Interrupt, ResumeDecision, ResumeRequest, Run, RunRecord, Status,
+    WaitReason,
+};
 use crate::{coordinator, files, routing, worker};
 
 /// Whether a prompt created at `created` is newer than the cursor. Both are
@@ -193,7 +196,7 @@ impl Reconciler {
                     .changed_at
                     .get(&issue_id)
                     .is_some_and(|at| read_started_at < *at);
-                if record.status != Status::Active || stale {
+                if record.status == Status::Closed || stale {
                     return;
                 }
                 let level = levels.get(&record.workspace).cloned().unwrap_or_default();
@@ -239,9 +242,80 @@ impl Reconciler {
             self.changed_at.insert(record.issue_id.clone(), read_at);
             return self.close_run(d, snap, run, &issue.state_name, now).await;
         }
+        if let Some(request) = &record.resume_request {
+            if let Some(ref detail) = detail {
+                self.refresh_issue(run, record, detail).await?;
+            }
+            if matches!(request.decision, ResumeDecision::Denied) {
+                return Ok(());
+            }
+            if let Some((token, comments)) = &update.consent
+                && token == &request.token
+                && d.config
+                    .team(&record.workspace, &record.team_key)
+                    .is_ok_and(|team| {
+                        comments.iter().any(|c| {
+                            !c.app
+                                && team.allowed_user_ids.contains(&c.user_id)
+                                && team.delegators().contains(&c.user_id)
+                                && c.body == format!("stop {token}")
+                        })
+                    })
+            {
+                let token = token.clone();
+                self.update_and_push(run, move |r| {
+                    if let Some(request) = &mut r.resume_request && request.token == token {
+                        request.decision = ResumeDecision::Denied;
+                        request.restored_session_id.clear();
+                        return vec![Op::Comment { body: "Resume was declined. The run remains paused; its worktrees and history are kept.".into() }];
+                    }
+                    Vec::new()
+                }).await?;
+                return Ok(());
+            }
+            if !request.restore_error.is_empty() {
+                update_run(run, |r| r.resume_request = None).await?;
+                return self.detach_run(d, run, "Linear refused the previous restoration. Correct the issue ownership or permissions before approving a new attempt.").await;
+            }
+            if !request.restored_session_id.is_empty() {
+                // Older in-flight reads cannot confirm or invalidate the new session.
+                if update.session_id.as_deref() != Some(&request.restored_session_id) {
+                    return Ok(());
+                }
+                if !update.session_hidden
+                    && level.app_user.is_some()
+                    && issue.delegate_id == level.app_user
+                {
+                    return self.resume_approved(run, request, read_at, now).await;
+                }
+                update_run(run, |r| r.resume_request = None).await?;
+                return self
+                    .detach_run(
+                        d,
+                        run,
+                        "The restored delegation or session was removed again.",
+                    )
+                    .await;
+            }
+            return self.accept_consent(d, run, record, &update).await;
+        }
+        if record.status == Status::Active
+            && !record.session_id.is_empty()
+            && update.session_id.as_deref() != Some(&record.session_id)
+        {
+            return Ok(());
+        }
         if level.app_user.is_some() && issue.delegate_id != level.app_user {
             self.changed_at.insert(record.issue_id.clone(), read_at);
-            return self.detach_run(d, run).await;
+            return self
+                .detach_run(d, run, "Linear removed this agent's delegation.")
+                .await;
+        }
+        if update.session_hidden || record.status == Status::Detached {
+            self.changed_at.insert(record.issue_id.clone(), read_at);
+            return self
+                .detach_run(d, run, "The Linear session was archived or dismissed.")
+                .await;
         }
         if let Some(detail) = detail {
             self.refresh_issue(run, record, &detail).await?;
@@ -579,6 +653,10 @@ impl Reconciler {
             if let Some(wait) = r.awaiting_reply.take() {
                 r.cleared_wait_id = wait.activity_id;
             }
+            if r.resume_request.take().is_some() {
+                r.session_id.clear();
+                return Vec::new();
+            }
             if r.session_id.is_empty() {
                 return Vec::new();
             }
@@ -593,16 +671,180 @@ impl Reconciler {
 
     /// The delegation was removed: stop the agents, keep the workspaces.
     /// The keys go out in the first pass with a snapshot.
-    async fn detach_run<H: Herdr>(&mut self, d: &Deps<'_, H>, run: &Run) -> Result<()> {
-        update_run(run, |r| {
-            r.status = Status::Detached;
-            r.interrupt.get_or_insert(Interrupt::Detach);
-        })
-        .await?;
+    async fn detach_run<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        run: &Run,
+        reason: &str,
+    ) -> Result<()> {
+        let reason = reason.to_string();
+        let requested = self.guarded(run, move |run, lock| {
+            if run.record()?.resume_request.is_some() { return Ok((false, Vec::new())); }
+            let token = uuid::Uuid::new_v4().to_string();
+            let body = format!("{reason} Work is paused and the existing worktrees and history are kept.\n\nTo authorize restoring this agent as delegate and continuing this run in a new Linear session, add an issue comment containing exactly:\n\n`resume {token}`\n\nTo keep the run paused, comment `stop {token}`. Approval requires a human in both this team's allowed_user_ids and allowed_delegator_ids. Old approvals never authorize a later incident. Completed or canceled issues still receive cleanup and a final postmortem.");
+            let comment_id = outbox::push_held(run, lock, Op::ResumeQuestion { token: token.clone(), body })?
+                .context("resume comment was not queued")?;
+            run.update_held(lock, |r| {
+                r.status = Status::Detached;
+                r.interrupt.get_or_insert(Interrupt::Detach);
+                if let Some(wait) = r.awaiting_reply.take() { r.cleared_wait_id = wait.activity_id; }
+                r.resume_request = Some(ResumeRequest { token, comment_id, decision: ResumeDecision::Waiting,
+                    restored_session_id: String::new(), restore_error: String::new(), delegate_attempted: false, session_attempted: false });
+            })?;
+            Ok((true, Vec::new()))
+        }).await?;
+        self.queued |= requested;
         d.log
             .line(&format!("{}: detached (no longer delegated)", run.key));
         self.keep_transcripts(d, run);
         Ok(())
+    }
+
+    async fn accept_consent<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        run: &Run,
+        record: &RunRecord,
+        update: &RunUpdate,
+    ) -> Result<()> {
+        let Some(request) = &record.resume_request else {
+            return Ok(());
+        };
+        let Some((token, comments)) = &update.consent else {
+            return Ok(());
+        };
+        if token != &request.token {
+            return Ok(());
+        }
+        let Ok(team) = d.config.team(&record.workspace, &record.team_key) else {
+            return Ok(());
+        };
+        if let ResumeDecision::Approved { user_id, .. } = &request.decision {
+            if !team.allowed_user_ids.contains(user_id) || !team.delegators().contains(user_id) {
+                return Ok(());
+            }
+            let token = token.clone();
+            let allowed_users = team
+                .allowed_user_ids
+                .iter()
+                .filter(|id| team.delegators().contains(id))
+                .cloned()
+                .collect();
+            // Recover a crash between persisting consent and queuing its
+            // write. External attempt markers still prevent blind retries.
+            self.guarded(run, move |run, _lock| {
+                let current = run.record()?;
+                let ready = current.status == Status::Detached
+                    && current.resume_request.is_some_and(|r| {
+                        r.token == token
+                            && r.restored_session_id.is_empty()
+                            && r.restore_error.is_empty()
+                            && matches!(r.decision, ResumeDecision::Approved { .. })
+                    });
+                let queued = outbox::queued(run).iter().any(|r| {
+                    matches!(&r.op,
+                    Op::RestoreSession { token: queued, .. } if queued == &token)
+                });
+                Ok((
+                    (),
+                    if ready && !queued {
+                        vec![Op::RestoreSession {
+                            token,
+                            allowed_users,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                ))
+            })
+            .await?;
+            return Ok(());
+        }
+        if !matches!(request.decision, ResumeDecision::Waiting) {
+            return Ok(());
+        }
+        let allowed = |c: &&crate::linear::api::ConsentComment| {
+            !c.app
+                && team.allowed_user_ids.contains(&c.user_id)
+                && team.delegators().contains(&c.user_id)
+        };
+        // Refusals have already won in apply_read, before restoration.
+        let Some(answer) = comments
+            .iter()
+            .filter(allowed)
+            .find(|c| c.body == format!("resume {token}"))
+        else {
+            return Ok(());
+        };
+        let decision = ResumeDecision::Approved {
+            comment_id: answer.id.clone(),
+            user_id: answer.user_id.clone(),
+        };
+        let token = token.clone();
+        let allowed_users = team
+            .allowed_user_ids
+            .iter()
+            .filter(|id| team.delegators().contains(id))
+            .cloned()
+            .collect();
+        self.update_and_push(run, move |r| {
+            let Some(request) = &mut r.resume_request else {
+                return Vec::new();
+            };
+            if request.token != token || !matches!(request.decision, ResumeDecision::Waiting) {
+                return Vec::new();
+            }
+            request.decision = decision;
+            vec![Op::RestoreSession {
+                token,
+                allowed_users,
+            }]
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn resume_approved(
+        &mut self,
+        run: &Run,
+        request: &ResumeRequest,
+        read_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<()> {
+        let token = request.token.clone();
+        let session = request.restored_session_id.clone();
+        let now = now.to_string();
+        let record = self.update_and_push(run, move |r| {
+            if !r.resume_request.as_ref().is_some_and(|q| q.token == token && q.restored_session_id == session) {
+                return Vec::new();
+            }
+            r.session_id = session;
+            r.status = Status::Active;
+            r.resume_request = None;
+            r.prompt_cursor = now.clone();
+            r.prompt_cursor_ids = Some(Vec::new());
+            r.pending_prompt_ids.clear();
+            r.turn_complete = None;
+            r.timeout_since = now;
+            r.stopped = false;
+            r.coordinator_lost = false;
+            if r.interrupt == Some(Interrupt::Detach) { r.interrupt = None; }
+            if r.coordinator.status == AgentStatus::Stopped { r.coordinator.repend(); }
+            if !r.finished && r.coordinator.status == AgentStatus::Open {
+                r.coordinator.resume = !r.coordinator.agent_session.is_empty();
+                r.coordinator.prompt_pending = true;
+            }
+            let acknowledgement = if r.finished {
+                Op::activity(Activity::new(Content::Response { body: "Resume was approved; delegation and the new Linear session are verified. The existing work is finished; this run is waiting for issue completion or cancellation.".into() }))
+            } else {
+                thought("Resume was approved in an issue comment; delegation and the new Linear session are verified. The existing run continues.")
+            };
+            let mut ops = vec![acknowledgement];
+            if !r.external_urls.is_empty() { ops.push(Op::ExternalUrls { urls: r.external_urls.clone() }); }
+            ops
+        }).await?;
+        self.changed_at.insert(record.issue_id, read_at);
+        inbox_item(run, "issue", "issue", "Resume was approved in Linear. Continue the existing task from its current worktrees and history.".into()).await
     }
 
     /// Picks up delegated issues from a delegated list this pass has not
@@ -643,6 +885,14 @@ impl Reconciler {
         for issue in &delegated.issues {
             let key = crate::run::run_key(workspace, &issue.identifier);
             let run = Run::load(&runs_dir, &key).ok();
+            // The app's own restoration is an automation, not a human
+            // delegation. Only the approved, verified path may resume it.
+            if run
+                .as_ref()
+                .is_some_and(|run| run.record().is_ok_and(|r| r.resume_request.is_some()))
+            {
+                continue;
+            }
             let active = run
                 .as_ref()
                 .and_then(|run| run.record().ok())

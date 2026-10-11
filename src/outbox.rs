@@ -16,7 +16,7 @@ use crate::files;
 use crate::linear::ApiError;
 use crate::linear::api::{Activity, Content, ExternalUrl, IssueDetail};
 use crate::linear::client::LinearApi;
-use crate::run::{AwaitingReply, Run, RunLock, WaitReason};
+use crate::run::{AwaitingReply, ResumeDecision, Run, RunLock, Status, WaitReason};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -54,13 +54,32 @@ pub enum Op {
     Comment {
         body: String,
     },
+    /// A consent comment becomes obsolete when its incident ends.
+    ResumeQuestion {
+        token: String,
+        body: String,
+    },
     /// Labels added to the issue, `Label` or `Group/Label`.
     Labels {
         names: Vec<String>,
     },
+    /// Restore only the currently approved incident, never an old approval.
+    RestoreSession {
+        token: String,
+        allowed_users: Vec<String>,
+    },
 }
 
 impl Op {
+    pub fn needs_session(&self) -> bool {
+        matches!(
+            self,
+            Self::Activity { .. }
+                | Self::TurnComplete { .. }
+                | Self::Plan { .. }
+                | Self::ExternalUrls { .. }
+        )
+    }
     /// A question; with options, Linear shows them as a select.
     pub fn elicitation(body: impl Into<String>, options: &[(&str, &str)]) -> Op {
         Self::awaiting_reply(body, options, WaitReason::CoordinatorQuestion)
@@ -283,6 +302,16 @@ pub async fn send(
         activity_sent: false,
     };
     for (path, mut request) in pending(run) {
+        // A dismissed session must not receive stale work or have its
+        // questions resurrected. Ordinary comments and recovery still flow.
+        let suspended = run.record().is_ok_and(|r| {
+            r.resume_request.is_some() || (r.status == Status::Closed && r.session_id.is_empty())
+        });
+        if suspended && (request.op.needs_session() || matches!(request.op, Op::IssueState { .. }))
+        {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
         let outcome = send_one(
             &path,
             &mut request,
@@ -301,6 +330,25 @@ pub async fn send(
                     && matches!(request.op, Op::Activity { .. } | Op::TurnComplete { .. });
             }
             Err(error) if definitive(&error) => {
+                if let Op::RestoreSession { token, .. } = &request.op {
+                    let run = run.clone();
+                    let token = token.clone();
+                    let failure = error.to_string();
+                    let saved = tokio::task::spawn_blocking(move || {
+                        run.update(|r| {
+                            if let Some(request) = &mut r.resume_request
+                                && request.token == token
+                            {
+                                request.restore_error = failure;
+                            }
+                        })
+                    })
+                    .await;
+                    if !matches!(saved, Ok(Ok(_))) {
+                        sent.blocked = Some(ApiError::Configuration);
+                        break;
+                    }
+                }
                 let is_wait = matches!(
                     request.op,
                     Op::Activity {
@@ -358,6 +406,28 @@ async fn send_one(
     review_state: &str,
     linear: &impl LinearApi,
 ) -> Result<bool, ApiError> {
+    if let Op::ResumeQuestion { token, .. } = &request.op {
+        let run = run.clone();
+        let token = token.clone();
+        let id = request.id.clone();
+        let current = tokio::task::spawn_blocking(move || {
+            let _lock = run.lock().map_err(|_| ApiError::Configuration)?;
+            let record = run.record().map_err(|_| ApiError::Configuration)?;
+            Ok::<_, ApiError>(
+                record.status == Status::Detached
+                    && record.resume_request.is_some_and(|r| {
+                        r.token == token
+                            && r.comment_id == id
+                            && !matches!(r.decision, ResumeDecision::Denied)
+                    }),
+            )
+        })
+        .await
+        .map_err(|_| ApiError::Configuration)??;
+        if !current {
+            return Ok(false);
+        }
+    }
     let is_wait = matches!(
         &request.op,
         Op::Activity {
@@ -370,7 +440,9 @@ async fn send_one(
         Op::Activity { .. } | Op::TurnComplete { .. } if request.attempted => {
             linear.activity_exists(session_id, &request.id).await?
         }
-        Op::Comment { .. } if request.attempted => linear.comment_exists(&request.id).await?,
+        Op::Comment { .. } | Op::ResumeQuestion { .. } if request.attempted => {
+            linear.comment_exists(&request.id).await?
+        }
         // Replacing the plan or the URL list and adding labels are
         // idempotent, and a state move reads the issue before it writes.
         _ => false,
@@ -404,8 +476,14 @@ async fn send_one(
         }
         Op::Plan { plan } => linear.set_plan(session_id, plan).await,
         Op::ExternalUrls { urls } => linear.set_external_urls(session_id, urls).await,
-        Op::Comment { body } => linear.create_comment(issue_id, &request.id, body).await,
+        Op::Comment { body } | Op::ResumeQuestion { body, .. } => {
+            linear.create_comment(issue_id, &request.id, body).await
+        }
         Op::Labels { names } => linear.add_labels(issue_id, names).await,
+        Op::RestoreSession {
+            token,
+            allowed_users,
+        } => restore_session(run, issue_id, token, allowed_users, linear).await,
         Op::IssueState { target } => {
             let issue = linear.issue(issue_id).await?;
             let Some(state_id) = target_state(&issue, *target, review_state)? else {
@@ -460,6 +538,140 @@ fn clear_refused_turn_complete(run: &Run, activity_id: &str) -> Result<bool, Api
     )
     .map_err(|_| ApiError::Configuration)?;
     Ok(true)
+}
+
+async fn restore_session(
+    run: &Run,
+    issue_id: &str,
+    token: &str,
+    allowed_users: &[String],
+    linear: &impl LinearApi,
+) -> Result<(), ApiError> {
+    let record = run.record().map_err(|_| ApiError::Configuration)?;
+    let Some(request) = record.resume_request.as_ref().filter(|r| r.token == token) else {
+        return Ok(());
+    };
+    let ResumeDecision::Approved {
+        comment_id,
+        user_id,
+    } = &request.decision
+    else {
+        return Ok(());
+    };
+    if record.status != Status::Detached {
+        return Ok(());
+    }
+    let read = || linear.resume_context(issue_id, &request.comment_id, token);
+    let check = |context: &crate::linear::api::ResumeContext| {
+        if context.terminal
+            || context.session_hidden
+            || context.team != record.team_key
+            || !context.question_exists
+            || context
+                .delegate_id
+                .as_ref()
+                .is_some_and(|id| id != &context.app_user)
+            || !context.comments.iter().any(|c| {
+                !c.app
+                    && c.id == *comment_id
+                    && c.user_id == *user_id
+                    && c.body == format!("resume {token}")
+            })
+            || context.comments.iter().any(|c| {
+                !c.app && allowed_users.contains(&c.user_id) && c.body == format!("stop {token}")
+            })
+        {
+            return Err(ApiError::Graphql(
+                "Resume consent or issue ownership changed; no automatic retry is allowed.".into(),
+            ));
+        }
+        Ok(())
+    };
+    let context = read().await?;
+    check(&context)?;
+    // Delegation is idempotent. A lost response is verified by this same
+    // read on retry before another mutation is attempted.
+    if context.delegate_id.as_ref() != Some(&context.app_user) {
+        if request.delegate_attempted {
+            return Err(ApiError::Graphql(
+                "The previous delegate restoration cannot be verified; fresh consent is required."
+                    .into(),
+            ));
+        }
+        mark_restore_attempt(run, token, false).await?;
+        linear.restore_delegate(issue_id, &context.app_user).await?;
+    }
+    let context = read().await?;
+    check(&context)?;
+    if context.delegate_id.as_ref() != Some(&context.app_user) {
+        return Err(ApiError::RequestFailed);
+    }
+    if context.session_id.is_none() {
+        if request.session_attempted {
+            return Err(ApiError::Graphql(
+                "The previous session creation cannot be verified; fresh consent is required."
+                    .into(),
+            ));
+        }
+        mark_restore_attempt(run, token, true).await?;
+        linear
+            .create_session_on_comment(&request.comment_id)
+            .await?;
+    }
+    // The public comment.agentSession relation verifies unknown creations,
+    // avoiding another session when a successful response was lost.
+    let context = read().await?;
+    check(&context)?;
+    if context.delegate_id.as_ref() != Some(&context.app_user) {
+        return Err(ApiError::RequestFailed);
+    }
+    let session = context.session_id.ok_or(ApiError::RequestFailed)?;
+    let run = run.clone();
+    let token = token.to_string();
+    tokio::task::spawn_blocking(move || {
+        run.update(|r| {
+            if r.status == Status::Detached
+                && let Some(request) = &mut r.resume_request
+                && request.token == token
+                && matches!(request.decision, ResumeDecision::Approved { .. })
+            {
+                request.restored_session_id = session;
+            }
+        })
+    })
+    .await
+    .map_err(|_| ApiError::Configuration)?
+    .map_err(|_| ApiError::Configuration)?;
+    Ok(())
+}
+
+async fn mark_restore_attempt(run: &Run, token: &str, session: bool) -> Result<(), ApiError> {
+    let run = run.clone();
+    let token = token.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = run.lock().map_err(|_| ApiError::Configuration)?;
+        let current = run.record().map_err(|_| ApiError::Configuration)?;
+        if current.status != Status::Detached
+            || !current.resume_request.as_ref().is_some_and(|r| {
+                r.token == token && matches!(r.decision, ResumeDecision::Approved { .. })
+            })
+        {
+            return Err(ApiError::RequestFailed);
+        }
+        run.update_held(&lock, |r| {
+            if let Some(request) = &mut r.resume_request {
+                if session {
+                    request.session_attempted = true;
+                } else {
+                    request.delegate_attempted = true;
+                }
+            }
+        })
+        .map_err(|_| ApiError::Configuration)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| ApiError::Configuration)?
 }
 
 fn mark_wait_attempt_if_current(
@@ -609,6 +821,33 @@ mod tests {
         let issue = fake.add_issue("DATA-1", "DATA", "First");
         let session = fake.delegate_session("DATA-1");
         (dir, run, Mutex::new(fake), session, issue)
+    }
+
+    #[tokio::test]
+    async fn a_queued_turn_completion_is_discarded_after_closing_without_a_session() {
+        let (_dir, run, linear, _session, issue) = setup();
+        push(
+            &run,
+            Op::TurnComplete {
+                body: "Done for now.".into(),
+            },
+        )
+        .unwrap();
+        run.update(|record| {
+            record.status = Status::Closed;
+            record.session_id.clear();
+        })
+        .unwrap();
+        let sent = send(&run, "", &issue, "In Review", &linear).await;
+        assert!(sent.blocked.is_none());
+        assert!(pending(&run).is_empty());
+        assert_eq!(
+            linear
+                .lock()
+                .unwrap()
+                .count("HerdrLinearAgentActivityCreate"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -956,5 +1195,232 @@ mod tests {
         for bad in ["", "Read the code", "- [?] x", "- [ ]   ", "- [xx] y"] {
             assert!(parse_plan(bad).is_err(), "{bad}");
         }
+    }
+
+    async fn approved_recovery() -> (tempfile::TempDir, Run, Mutex<FakeLinear>, String, String) {
+        let (dir, run, linear, session, issue) = setup();
+        let token = uuid::Uuid::new_v4().to_string();
+        let question = uuid::Uuid::new_v4().to_string();
+        linear
+            .create_comment(&issue, &question, "Request consent")
+            .await
+            .unwrap();
+        let approval = linear.lock().unwrap().consent_comment(
+            "DATA-1",
+            "user-1",
+            &format!("resume {token}"),
+            false,
+        );
+        run.update(|r| {
+            r.issue_id = issue.clone();
+            r.team_key = "DATA".into();
+            r.status = Status::Detached;
+            r.session_id = session.clone();
+            r.resume_request = Some(crate::run::ResumeRequest {
+                token: token.clone(),
+                comment_id: question,
+                decision: ResumeDecision::Approved {
+                    comment_id: approval,
+                    user_id: "user-1".into(),
+                },
+                restored_session_id: String::new(),
+                restore_error: String::new(),
+                delegate_attempted: false,
+                session_attempted: false,
+            });
+        })
+        .unwrap();
+        push(
+            &run,
+            Op::RestoreSession {
+                token,
+                allowed_users: vec!["user-1".into()],
+            },
+        )
+        .unwrap();
+        (dir, run, linear, session, issue)
+    }
+
+    #[tokio::test]
+    async fn a_lost_recovery_response_is_verified_before_retrying_either_write() {
+        for delegation_missing in [false, true] {
+            let (_dir, run, linear, _session, issue) = approved_recovery().await;
+            {
+                let mut fake = linear.lock().unwrap();
+                if delegation_missing {
+                    fake.issue_mut("DATA-1")["delegate"] = Value::Null;
+                }
+                fake.lose_next_response = true;
+            }
+            let first = send(&run, "", &issue, "In Review", &linear).await;
+            assert_eq!(first.blocked, Some(ApiError::RequestFailed));
+            let second = send(&run, "", &issue, "In Review", &linear).await;
+            assert!(second.blocked.is_none());
+            assert!(second.refused.is_empty());
+            assert_eq!(
+                linear
+                    .lock()
+                    .unwrap()
+                    .count("HerdrLinearAgentResumeSession"),
+                1
+            );
+            assert_eq!(
+                linear
+                    .lock()
+                    .unwrap()
+                    .count("HerdrLinearAgentRestoreDelegate"),
+                usize::from(delegation_missing)
+            );
+            assert!(
+                !run.record()
+                    .unwrap()
+                    .resume_request
+                    .unwrap()
+                    .restored_session_id
+                    .is_empty()
+            );
+            assert!(pending(&run).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn edited_consent_and_terminal_issues_are_rechecked_before_recovery_writes() {
+        for terminal in [false, true] {
+            let (_dir, run, linear, _session, issue) = approved_recovery().await;
+            {
+                let mut fake = linear.lock().unwrap();
+                fake.issue_mut("DATA-1")["delegate"] = Value::Null;
+                if terminal {
+                    fake.set_state("DATA-1", "Done");
+                } else {
+                    let comments = fake.issue_mut("DATA-1")["comments"]["nodes"]
+                        .as_array_mut()
+                        .unwrap();
+                    let approval = comments
+                        .iter_mut()
+                        .find(|c| c["body"].as_str().is_some_and(|b| b.starts_with("resume ")))
+                        .unwrap();
+                    approval["body"] = json!("I withdraw my approval.");
+                }
+            }
+            let sent = send(&run, "", &issue, "In Review", &linear).await;
+            assert_eq!(sent.refused.len(), 1);
+            assert_eq!(
+                linear
+                    .lock()
+                    .unwrap()
+                    .count("HerdrLinearAgentRestoreDelegate"),
+                0
+            );
+            assert_eq!(
+                linear
+                    .lock()
+                    .unwrap()
+                    .count("HerdrLinearAgentResumeSession"),
+                0
+            );
+            assert!(
+                !run.record()
+                    .unwrap()
+                    .resume_request
+                    .unwrap()
+                    .restore_error
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removed_uncertain_recovery_result_requires_new_consent_instead_of_recreation() {
+        for delegation_missing in [false, true] {
+            let (_dir, run, linear, _session, issue) = approved_recovery().await;
+            {
+                let mut fake = linear.lock().unwrap();
+                if delegation_missing {
+                    fake.issue_mut("DATA-1")["delegate"] = Value::Null;
+                }
+                fake.lose_next_response = true;
+            }
+            assert_eq!(
+                send(&run, "", &issue, "In Review", &linear).await.blocked,
+                Some(ApiError::RequestFailed)
+            );
+            {
+                let mut fake = linear.lock().unwrap();
+                if delegation_missing {
+                    fake.issue_mut("DATA-1")["delegate"] = Value::Null;
+                } else {
+                    fake.sessions.last_mut().unwrap().dismissed_at =
+                        Some("2026-10-09T05:30:14Z".into());
+                }
+            }
+            let sent = send(&run, "", &issue, "In Review", &linear).await;
+            assert_eq!(sent.refused.len(), 1);
+            assert_eq!(
+                linear
+                    .lock()
+                    .unwrap()
+                    .count("HerdrLinearAgentRestoreDelegate"),
+                usize::from(delegation_missing)
+            );
+            assert_eq!(
+                linear
+                    .lock()
+                    .unwrap()
+                    .count("HerdrLinearAgentResumeSession"),
+                usize::from(!delegation_missing)
+            );
+            assert!(
+                !run.record()
+                    .unwrap()
+                    .resume_request
+                    .unwrap()
+                    .restore_error
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_consent_question_is_discarded_after_its_run_closes() {
+        let (_dir, run, linear, _session, issue) = setup();
+        let token = uuid::Uuid::new_v4().to_string();
+        let id = push(
+            &run,
+            Op::ResumeQuestion {
+                token: token.clone(),
+                body: "Request consent".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        run.update(|r| {
+            r.status = Status::Detached;
+            r.resume_request = Some(crate::run::ResumeRequest {
+                token,
+                comment_id: id,
+                decision: ResumeDecision::Waiting,
+                restored_session_id: String::new(),
+                restore_error: String::new(),
+                delegate_attempted: false,
+                session_attempted: false,
+            });
+        })
+        .unwrap();
+        run.update(|r| {
+            r.status = Status::Closed;
+            r.resume_request = None;
+        })
+        .unwrap();
+        let sent = send(&run, "", &issue, "In Review", &linear).await;
+        assert!(sent.blocked.is_none() && sent.refused.is_empty());
+        assert_eq!(
+            linear
+                .lock()
+                .unwrap()
+                .count("HerdrLinearAgentCommentCreate"),
+            0
+        );
+        assert!(pending(&run).is_empty());
     }
 }
