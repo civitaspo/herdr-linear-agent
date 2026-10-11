@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.2] - 2026-10-08
+## [0.7.2] - 2026-10-11
 
 
 ### Bug Fixes
@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update Securefix caller workflows to v0.2.8 (#132)
+- update rust crate toml to v1.1.8 (#116)
+- update Securefix caller workflows to v0.2.7 (#129)
+- update Securefix caller workflows to v0.2.6 (#128)
+- update Securefix caller workflows (#127)
+- update Securefix caller workflows (#126)
+- update dependency jdx/mise to v2026.10.7 (#114)
+- update rust crate uuid to v1.28.0 (#124)
+- update Securefix caller workflows (#125)
+- update Securefix caller workflows (#123)
+- update Securefix caller workflows (#122)
+- update Securefix caller workflows (#121)
+- update Securefix caller workflows (#118)
 - update rust crate toml to v1.1.7 (#112)
 - route human merge requests through Securefix (#110)
 - update dependency jdx/mise to v2026.10.4 (#111)
