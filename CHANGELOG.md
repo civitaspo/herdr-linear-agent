@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- respect queued prompts and complete coordinator turns (#115)
 - restore the pull request number for workspace labels (#109)
 - identify tickets in agent workspace labels (#108)
 
