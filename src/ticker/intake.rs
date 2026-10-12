@@ -14,10 +14,10 @@ use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUp
 use crate::linear::task::{Decline, Levels, LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
 use crate::run::{
-    AgentRecord, AgentStatus, Interrupt, ResumeDecision, ResumeRequest, Run, RunRecord, Status,
-    WaitReason,
+    AgentRecord, AgentStatus, Interrupt, IssueStateCursor, ResumeDecision, ResumeRequest, Run,
+    RunRecord, Status, WaitReason,
 };
-use crate::{coordinator, files, routing, worker};
+use crate::{coordinator, files, inbox, routing, worker};
 
 /// Whether a prompt created at `created` is newer than the cursor. Both are
 /// RFC 3339; text that does not parse is compared as text.
@@ -318,10 +318,10 @@ impl Reconciler {
                 .await;
         }
         if let Some(detail) = detail {
-            self.refresh_issue(run, record, &detail).await?;
             if record.coordinator.profile.is_empty() && !self.routing.contains(&run.key) {
                 self.finish_claim(d, run, &detail).await?;
             }
+            self.refresh_issue(run, record, &detail).await?;
         }
         self.relay(d, run, &update.prompts, now).await
     }
@@ -334,21 +334,76 @@ impl Reconciler {
         record: &RunRecord,
         detail: &IssueDetail,
     ) -> Result<()> {
-        files::write_atomic(
-            &run.issue_md(),
-            crate::run::issue_markdown(detail).as_bytes(),
-        )?;
         let hash = crate::run::issue_hash(detail);
         let (updated_at, title) = (detail.updated_at.clone(), detail.title.clone());
         let labels: Vec<String> = detail.labels.iter().map(|l| l.name.clone()).collect();
         let stored = hash.clone();
-        update_run(run, move |r| {
-            r.issue_updated_at = updated_at;
-            r.issue_hash = stored;
-            r.title = title;
-            r.labels = labels;
+        let cursor_updated_at = detail.updated_at.clone();
+        let state_name = detail.state.name.clone();
+        let state_type = detail.state.r#type.clone();
+        let accepted = blocking({
+            let run = run.clone();
+            let state_summary = format!("The issue moved to {} ({}).", state_name, state_type);
+            move || {
+                let lock = run.lock()?;
+                let current = run.record()?;
+                let observed = IssueStateCursor {
+                    name: state_name,
+                    state_type,
+                    updated_at: cursor_updated_at,
+                    pickup_state: String::new(),
+                };
+                if current.issue_state.as_ref().is_some_and(|cursor| {
+                    !cursor.updated_at.is_empty() && observed.updated_at < cursor.updated_at
+                }) {
+                    return Ok(false);
+                }
+                let pickup = current.issue_state.as_ref().is_some_and(|cursor| {
+                    !cursor.pickup_state.is_empty() && cursor.pickup_state == observed.name
+                });
+                if current.status == Status::Active
+                    && current
+                        .issue_state
+                        .as_ref()
+                        .is_some_and(|cursor| !pickup && cursor.name != observed.name)
+                {
+                    inbox::write_held(&run, &lock, "issue", "state", &state_summary)?;
+                }
+                run.update_held(&lock, move |r| {
+                    r.issue_updated_at = updated_at;
+                    r.issue_hash = stored;
+                    r.title = title;
+                    r.labels = labels;
+                    let next = match &r.issue_state {
+                        Some(cursor)
+                            if pickup
+                                || cursor.pickup_state.is_empty()
+                                || observed.state_type == "started" =>
+                        {
+                            IssueStateCursor {
+                                pickup_state: String::new(),
+                                ..observed
+                            }
+                        }
+                        Some(cursor) => IssueStateCursor {
+                            pickup_state: cursor.pickup_state.clone(),
+                            ..observed
+                        },
+                        None => observed,
+                    };
+                    r.issue_state = Some(next);
+                })?;
+                Ok(true)
+            }
         })
         .await?;
+        if !accepted {
+            return Ok(());
+        }
+        files::write_atomic(
+            &run.issue_md(),
+            crate::run::issue_markdown(detail).as_bytes(),
+        )?;
         if !record.issue_hash.is_empty() && hash != record.issue_hash {
             inbox_item(
                 run,
@@ -1021,8 +1076,19 @@ impl Reconciler {
         self.changed_at.insert(issue.id.clone(), read_at);
         d.log.line(&format!("{}: picked up", run.key));
         let key = issue.identifier.clone();
+        let (state_name, state_type, state_updated_at) = (
+            issue.state.name.clone(),
+            issue.state.r#type.clone(),
+            issue.updated_at.clone(),
+        );
         self.update_and_push(&run, move |r| {
             r.announce_pending = false;
+            r.issue_state = Some(IssueStateCursor {
+                name: state_name,
+                state_type,
+                updated_at: state_updated_at,
+                pickup_state: String::new(),
+            });
             vec![
                 thought(format!("Picked up {key}.")),
                 Op::IssueState {
@@ -1050,6 +1116,14 @@ impl Reconciler {
         let queued = outbox::queued(run)
             .iter()
             .any(|request| matches!(request.op, Op::IssueState { .. }));
+        let expected_started = detail
+            .team
+            .states
+            .iter()
+            .filter(|state| state.r#type == "started")
+            .min_by(|a, b| a.position.total_cmp(&b.position))
+            .map(|state| state.name.clone())
+            .unwrap_or_default();
         let key = crate::run::split_key(&run.key).1.to_string();
         self.update_and_push(run, move |r| {
             let mut ops = Vec::new();
@@ -1060,6 +1134,9 @@ impl Reconciler {
                 ops.push(Op::IssueState {
                     target: StateTarget::Started,
                 });
+            }
+            if !moved && let Some(cursor) = &mut r.issue_state {
+                cursor.pickup_state = expected_started;
             }
             ops
         })

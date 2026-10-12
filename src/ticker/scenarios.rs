@@ -95,6 +95,10 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
     ];
     assert_eq!(world.bodies(KEY, "thought"), expected);
     assert_eq!(world.issue_state(KEY), "In Progress");
+    assert!(
+        !mentions(&world.inbox(KEY), "moved to"),
+        "pickup is not a state notice"
+    );
     let canonical = run.canonical_dir().to_string_lossy().into_owned();
     let cwds: Vec<Option<String>> = world.herdr.panes().into_iter().map(|p| p.cwd).collect();
     assert_eq!(cwds, [Some(canonical)]);
@@ -140,6 +144,94 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
         (world.herdr.starts().len(), world.sessions()),
         (1, 1),
         "claimed once"
+    );
+}
+
+#[tokio::test]
+async fn workflow_state_changes_reach_the_coordinator_once_including_same_type_changes() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+
+    world.move_issue(KEY, "In Review");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Review"))
+            .count(),
+        1,
+        "cursor {:?}",
+        world.record(KEY).issue_state
+    );
+
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Review"))
+            .count(),
+        1,
+        "{:?}",
+        world.inbox(KEY)
+    );
+
+    world.move_issue(KEY, "In Progress");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-13T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(world.record(KEY).issue_state.unwrap().name, "In Review");
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Progress"))
+            .count(),
+        0,
+        "stale issue details are ignored"
+    );
+
+    world.move_issue(KEY, "In Progress");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Progress"))
+            .count(),
+        1,
+        "{:?}",
+        world.inbox(KEY)
+    );
+
+    world.later(120);
+    world.settle().await;
+    let coordinator = world.record(KEY).coordinator.pane_id;
+    assert_eq!(count(&to(&world, &coordinator), NUDGE_INBOX), 1);
+}
+
+#[tokio::test]
+async fn pickup_in_another_started_state_does_not_suppress_a_later_started_transition() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.move_issue(KEY, "In Review");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.settle().await;
+    assert!(!mentions(&world.inbox(KEY), "moved to"));
+
+    world.move_issue(KEY, "In Progress");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|summary| summary.contains("moved to In Progress"))
+            .count(),
+        1
     );
 }
 

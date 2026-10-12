@@ -295,6 +295,9 @@ pub struct RunRecord {
     pub issue_updated_at: String,
     /// A hash of the snapshot parts a person edits (not the state).
     pub issue_hash: String,
+    /// Last workflow state read for this run. A blank name marks the
+    /// Started-state pickup cursor before its target name is known.
+    pub issue_state: Option<IssueStateCursor>,
     /// Where the coordinator profile came from: the routing agent or the
     /// default, with the reason.
     pub routing_source: String,
@@ -344,6 +347,15 @@ pub struct RunRecord {
     pub postmortem_due: Option<crate::postmortem::Stage>,
     /// The workflow state the issue was in when the run closed.
     pub closed_state: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueStateCursor {
+    pub name: String,
+    pub state_type: String,
+    pub updated_at: String,
+    /// Exact state selected by the first Started-state pickup write.
+    pub pickup_state: String,
 }
 
 #[derive(Debug, Clone)]

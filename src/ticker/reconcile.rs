@@ -927,7 +927,10 @@ mod tests {
                         title: "Loop".into(),
                         url: format!("https://linear.app/acme/issue/{key}"),
                         updated_at: T0.into(),
-                        state: "unstarted".into(),
+                        state: crate::linear::api::IssueState {
+                            name: "Todo".into(),
+                            r#type: "unstarted".into(),
+                        },
                         team: "DATA".into(),
                         delegator: Some(crate::linear::api::Delegator {
                             user: Some(crate::linear::api::User {
