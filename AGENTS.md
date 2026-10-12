@@ -8,7 +8,7 @@ herdr-linear-agent is a Herdr plugin written in Rust. It polls Linear for issues
 
 - Read [README.md](README.md) for configuration, profiles, supported agent kinds, and user-visible behavior.
 - For lifecycle, persistence, or reconciliation changes, read the relevant section of [docs/behavior.md](docs/behavior.md). Check the current implementation before relying on entries marked as open questions or rewrite notes.
-- Before real integration checks, follow [docs/integration-testing.md](docs/integration-testing.md) for environment setup, workflow assertions, troubleshooting, and cleanup. Record evidence in [docs/verification.md](docs/verification.md), keeping fake-test results distinct from checks against a real Linear workspace or agent CLI.
+- For real integration checks, read [docs/verification.md](docs/verification.md). Keep fake-test results distinct from checks against a real Linear workspace or agent CLI.
 - This file guides development of the plugin. [assets/COORDINATOR.md](assets/COORDINATOR.md) and [assets/WORKER.md](assets/WORKER.md) are the instructions the plugin gives its agents.
 
 ## Where to make changes
@@ -85,7 +85,6 @@ For local macOS builds that access real Linear credentials, follow [docs/develop
 - Reuse `World`, `FakeHerdr`, `FakeLinear`, `FakeRunner`, and `Env::for_test` to control external behavior, paths, and time. Do not make ordinary tests depend on a running Herdr session, real credentials, or installed agent CLIs.
 - For retry and recovery changes, check observable Herdr requests, Linear writes, and persisted records. Exercise repeated reconciliation and relevant delayed or reordered events with the existing `World` controls.
 - The ignored `routing_live` test calls real agent CLIs and needs their logins. Run it only when the task calls for live routing verification. Use a scratch Linear team and scratch Herdr session for real lifecycle checks described in `docs/verification.md`.
-- For live workflow tests, keep the ticker, Herdr server, and agent service on the same test environment. Check Linear's PR-merge automation before delegation, require an updated worker report after deployment, and restore any intake pause and temporary Git settings during cleanup. Follow existing user authorization rather than repeatedly asking for the same test operations.
 - When changing config or profiles, update validation tests and the shared sample in `src/config.rs` as needed. Update the README examples for user-facing changes.
 - When changing agent-facing commands, keep `assets/COORDINATOR.md`, `assets/WORKER.md`, and the generated priming and command allow-lists in `src/coordinator.rs` consistent.
 - When changing lifecycle or persistence behavior, update the relevant section of `docs/behavior.md`. Record new real integration evidence in `docs/verification.md` with its limits.

@@ -175,19 +175,7 @@ impl Reconciler {
                     run.key,
                     stage.word()
                 ));
-                update_run(run, move |r| {
-                    clear(r);
-                })
-                .await?;
-                crate::inbox::write(
-                    run,
-                    "postmortem",
-                    "failure",
-                    &format!(
-                        "The {} postmortem failed: {error:#}. The issue remains in its postmortem state.",
-                        stage.word()
-                    ),
-                )?;
+                update_run(run, clear).await?;
                 return Ok(());
             }
         };
@@ -195,23 +183,13 @@ impl Reconciler {
         let told = format!("with the `{}` profile ({picked})", method.name);
         self.guarded(run, move |run, lock| {
             postmortem::keep(run, stage, &method, &picked, &outcome, &at)?;
-            run.update_held(lock, |r| {
-                clear(r);
-                if stage == Stage::Workflow {
-                    r.workflow.postmortem_succeeded = true;
-                }
-            })?;
+            run.update_held(lock, clear)?;
             let mut ops = vec![Op::Comment {
                 body: postmortem::comment(stage, &method, &outcome.summary),
             }];
             if !outcome.labels.is_empty() {
                 ops.push(Op::Labels {
                     names: outcome.labels.clone(),
-                });
-            }
-            if stage == Stage::Workflow {
-                ops.push(Op::IssueState {
-                    target: crate::outbox::StateTarget::Workflow(crate::run::WorkflowStage::Done),
                 });
             }
             Ok(((), ops))
