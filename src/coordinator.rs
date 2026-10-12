@@ -279,6 +279,15 @@ pub fn digest(
         }
         text.push('\n');
     }
+    text.push_str("\n## Merge authorization\n\n");
+    let merge_enabled = config
+        .team(&record.workspace, &record.team_key)
+        .is_ok_and(|team| team.merge_on_authorization);
+    let _ = writeln!(
+        text,
+        "Worker PR squash merge is {} for this team.",
+        if merge_enabled { "enabled" } else { "disabled" }
+    );
     text.push_str("\n## Workers\n\n");
     if rows.is_empty() {
         let _ = writeln!(
@@ -569,6 +578,8 @@ mod tests {
                 "## Worker profiles",
                 "- standard: claude sonnet, effort high \u{2014} scoped features and fixes",
                 "- deep: codex gpt-6-sol, effort xhigh \u{2014} cross-module changes",
+                "## Merge authorization",
+                "Worker PR squash merge is disabled for this team.",
                 "## Workers",
                 "- w1 [Reported] Change API",
                 "PR https://github.com/acme/api/pull/7",
@@ -582,6 +593,18 @@ mod tests {
             assert!(!text.contains(coordinator_profile), "{coordinator_profile}");
         }
         assert_eq!(shown, [item]);
+
+        let mut config = sample_config();
+        config
+            .workspaces
+            .get_mut("acme")
+            .unwrap()
+            .teams
+            .get_mut("DATA")
+            .unwrap()
+            .merge_on_authorization = true;
+        let (text, _) = digest(&f.run, &config, "/bin/herdr-linear-agent", &rows).unwrap();
+        assert!(text.contains("Worker PR squash merge is enabled for this team."));
 
         inbox::mark_seen(&f.run, &shown).unwrap();
         inbox::done(&f.run, &[], true).unwrap();

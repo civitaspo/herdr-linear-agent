@@ -991,6 +991,123 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
 }
 
 #[tokio::test]
+async fn a_merge_needs_an_exact_allowed_reply_and_the_plugin_consumes_it_once() {
+    let mut world = World::with(|config| {
+        config.replacen(
+            "routing = \"default\"",
+            "merge_on_authorization = true\nrouting = \"default\"",
+            1,
+        )
+    });
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.report(&worker, &format!("PR: {PR}\n## Report\nReady to review.\n"));
+    world.settle().await;
+
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.settle().await;
+    let prompt = world
+        .bodies(KEY, "thought")
+        .into_iter()
+        .find(|body| body.contains("reply exactly `merge "))
+        .expect("merge request was sent to Linear");
+    let token = prompt
+        .split("reply exactly `merge ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(uuid::Uuid::parse_str(&token).is_ok());
+
+    world.message(KEY, "user-2", &format!("merge {token}"), None);
+    world.settle().await;
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Pending { .. })
+    ));
+    assert!(!world.text(KEY, "conversation.md").contains(&token));
+    assert!(mentions(
+        &world.inbox(KEY),
+        "reply for worker w1 was ignored"
+    ));
+
+    world.later(1);
+    let wrong = uuid::Uuid::new_v4().to_string();
+    world.message(KEY, "user-1", &format!("merge {wrong}"), None);
+    world.settle().await;
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Pending { .. })
+    ));
+    assert!(!world.text(KEY, "conversation.md").contains(&wrong));
+
+    world.later(1);
+    world.message(KEY, "user-1", "merge the PR", None);
+    world.settle().await;
+    assert!(world.text(KEY, "conversation.md").contains("merge the PR"));
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Pending { .. })
+    ));
+
+    world.later(1);
+    world.message(KEY, "user-1", &format!("merge {token}"), None);
+    world.settle().await;
+    assert_eq!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Authorized {
+            token: token.clone(),
+            pr_url: PR.into(),
+            by: "user-1".into(),
+        })
+    );
+    assert!(!world.text(KEY, "conversation.md").contains(&token));
+    assert!(mentions(
+        &world.inbox(KEY),
+        "An allowed user authorized worker w1's pull request merge."
+    ));
+
+    world.runner.on("gh pr merge", crate::process::fake::ok(""));
+    commands::worker_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+    assert_eq!(
+        worker::load(&world.run(KEY), "w1").unwrap().merge_attempt,
+        Some(worker::MergeAttempt::Merged { pr_url: PR.into() })
+    );
+    assert!(
+        commands::worker_merge(&world.ctx(), KEY, "w1")
+            .await
+            .is_err()
+    );
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+
+    let current = worker::load(&world.run(KEY), "w1").unwrap();
+    world.report(
+        &current,
+        "PR: https://github.com/acme/api/pull/8\n## Report\nMoved the work.\n",
+    );
+    world.settle().await;
+    let updated = worker::load(&world.run(KEY), "w1").unwrap();
+    assert_eq!(updated.pr_url, "https://github.com/acme/api/pull/8");
+    assert!(updated.merge_authorization.is_none());
+    assert!(updated.merge_attempt.is_none());
+}
+
+#[tokio::test]
 async fn finish_and_worker_start_hold_their_limits() {
     let mut world = World::with(limit("max_workers_per_run", 1));
     world.running_issue().await;

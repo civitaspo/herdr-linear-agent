@@ -166,6 +166,10 @@ enum WorkerCommand {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Request one-time Linear authorization to merge this worker's PR.
+    RequestMerge { key: String, id: String },
+    /// Squash-merge an authorized worker PR.
+    Merge { key: String, id: String },
 }
 
 #[derive(Args)]
@@ -268,7 +272,6 @@ pub async fn run() -> Result<()> {
 }
 
 async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
-    let session = Session::configured(ctx).await?;
     match command {
         WorkerCommand::Start {
             key,
@@ -277,6 +280,7 @@ async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
             title,
             task_file,
         } => {
+            let session = Session::configured(ctx).await?;
             let args = WorkerStart {
                 repo,
                 profile,
@@ -288,14 +292,20 @@ async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
                 .map(|_| ())
         }
         WorkerCommand::Prompt { key, id, text_file } => {
+            let session = Session::configured(ctx).await?;
             let text = read_text_arg(&text_file)?;
             commands::worker_prompt(ctx, &session, &key, &id, &text).await
         }
         WorkerCommand::Restart { key, id, profile } => {
+            let session = Session::configured(ctx).await?;
             commands::worker_restart(ctx, &session, &key, &id, profile.as_deref())
                 .await
                 .map(|_| ())
         }
+        WorkerCommand::RequestMerge { key, id } => {
+            commands::worker_request_merge(ctx, &key, &id).await
+        }
+        WorkerCommand::Merge { key, id } => commands::worker_merge(ctx, &key, &id).await,
     }
 }
 

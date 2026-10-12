@@ -92,6 +92,7 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `workspaces.<name>.teams.<key>.routing` | name | required | a table under `routing`: ``workspaces.<name>.teams.<key>.routing: there is no routing.<routing>``; see [Routing](#routing) |
 | `workspaces.<name>.teams.<key>.allowed_delegator_ids` | list | `allowed_user_ids` | whose delegations of that team's issues the ticker takes (see [Intake and claim](#intake-and-claim)) |
 | `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank: `workspaces.<name>.teams.<key>.review_state is empty`; where `finish` moves that team's issues |
+| `workspaces.<name>.teams.<key>.merge_on_authorization` | bool | `false` | permit a one-time worker PR squash merge after an allowed user authorizes it in Linear |
 | `herdr.session` | string | unset: Herdr's default session | |
 | `limits.max_runs` | u32 | `2` | the three limits must satisfy `max_runs >= 1`, `max_workers_per_run >= 1`, `max_agents >= 2`: `limits must allow one run with one worker` |
 | `limits.max_workers_per_run` | u32 | `4` | |
@@ -206,6 +207,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `created` | claim time |
 | `issue_updated_at` | the issue's `updatedAt` when `issue.md` was last written |
 | `issue_hash` | hash of the parts a person edits |
+| `issue_state` | optional `{name, state_type, updated_at, pickup_state}` cursor for workflow state notices; absent in older records, whose first detail seeds it quietly |
 | `routing_source` | where the coordinator profile came from: `chosen by the routing agent`, or `the default: <reason>`; records of older builds with `size` and `size_source` read without them |
 | `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory, ignores this field when reading, and drops it on the next write |
 | `coordinator` | the coordinator's agent record |
@@ -632,7 +634,7 @@ For every active or detached run, per update, in this order. Detached runs remai
 4. `updatedAt` differs from `issue_updated_at`: refresh the issue.
 5. Relay the prompts.
 
-`refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no edit item. Workflow state names have a separate persisted cursor: an active run writes an `issue`/`state` inbox item when the state name changes, including transitions between states of the same type. The first Started-state target selected for pickup seeds that cursor atomically with the outbox request, so the pickup itself is silent; repeated and older issue reads do not move the cursor backward. Older run records without a cursor initialize from their first issue detail without a notice. The hash leaves out state as well as comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
+`refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no edit item. Workflow state names have a separate persisted cursor: an active run writes an `issue`/`state` inbox item when the state name changes, including transitions between states of the same type. The first Started-state target selected for pickup seeds that cursor atomically with the outbox request, so the pickup itself is silent; repeated and older issue reads do not move the cursor backward. Older run records without a cursor initialize from their first issue detail without a notice. The hash leaves out state as well as comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:workflow_state_changes_reach_the_coordinator_once_including_same_type_changes`, `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
 
 `close_run`:
 
@@ -924,7 +926,7 @@ After the runs, the task answers each decline it has not answered yet with a `re
 | `finish` | response and issue state `review` |
 | postmortem written | comment `**Postmortem (<interim or final>)**, method `<name>` version `<version>`` and the summary; the labels, when any |
 
-The plugin never merges, force-pushes, or moves an issue to Done. The only comments it writes are postmortems.
+The plugin never force-pushes or moves an issue to Done. A team may opt into one-time worker PR squash merges with `merge_on_authorization`; it defaults off. When any team enables it, `gh` must be on the ticker's `PATH`. A worker's `request-merge` stores its exact recorded PR and asks for `merge <token>`. Only a reply from `allowed_user_ids` that exactly matches a current pending token authorizes it. UUID-token merge replies are consumed without copying their raw text to the coordinator conversation or inbox; ordinary text such as `merge the PR` remains a normal reply. The coordinator must invoke `worker merge`; that command consumes authorization before calling `gh pr merge <recorded-url> --squash`, then reads the PR state after an ambiguous failure. A changed PR invalidates authorization and attempt state. Attempts are never automatically retried.
 
 ## The inbox
 
@@ -954,13 +956,13 @@ Items for the coordinator in `runs/<KEY>/inbox/`.
 - An id containing `/`, `..`, starting with `.`, or empty is refused before anything moves: `` `<id>` is not an inbox item id ``. `src/inbox.rs:ids_that_could_leave_the_folder_are_refused`
 - **Changed on purpose (THLA-7):** `inbox done --all` moves only the items the coordinator has been shown, so an item written while it worked is never handled unseen. The command prints `<n> item(s) handled`, followed by `; <m> new item(s) since your last context, run context` when unseen items remain. Named ids still move as named. `src/inbox.rs:done_all_moves_only_the_items_context_showed`, `src/commands.rs:done_all_leaves_the_items_written_after_the_last_context`
 
-Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `worker`/`<id>`.
+Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `worker`/`<id>`, `merge`/`<worker id>` for a token matching a pending request or `merge`/`authorization` for an unmatched token.
 
 ## Worker commands
 
 ### Worker record (`workers/<id>.toml`)
 
-Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
+Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, optional `merge_authorization` and `merge_attempt`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
 
 | Operation | Behavior |
 | --- | --- |
@@ -977,6 +979,10 @@ Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `
 | `pr_line(report)` | the URL from the first line `PR: https://github.com/<owner>/<repo>/pull/<digits>`; any other host, path or trailing text gives none |
 
 `tests/worker:ids_branches_briefs_and_pr_lines`, `tests/worker:allocation_follow_ups_and_report_copies`
+
+`worker request-merge <KEY> <id>` requires the team's `merge_on_authorization`, a valid recorded PR URL, and a current worker record. It stores a random one-use token and the PR URL under the run lock while queueing a Linear thought that requests an exact `merge <token>` reply. The ticker accepts that exact reply only from `allowed_user_ids`, binds it to the still-current PR, records `Authorized`, and writes a sanitized inbox item naming the worker. Other UUID-token merge replies are sanitized and ignored. A PR URL change clears both merge fields.
+
+`worker merge <KEY> <id>` atomically consumes `Authorized` into `Attempting`, releases the lock, then runs `gh pr merge <recorded-url> --squash` once. On failure or unknown command outcome it reads `gh pr view <recorded-url> --json state,mergedAt`; state becomes `Merged`, `Unmerged` or `Unknown`. After a process interruption, the next `worker merge` reads back an `Attempting` or `Unknown` result without retrying the merge; a new authorization request is refused until that readback completes. The authorization is never restored for a retry, and a result is saved only if the worker still records the same PR and attempt.
 
 A worker counts against `max_agents` when its status is `pending` or `open`.
 
@@ -1050,6 +1056,7 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 - `conversation.md`;
 - the repository catalog, one line per repository: `- <name>: <path> (base <base>) <U+2014> <description>`;
 - the worker profiles only (never coordinator profiles), one line each starting `- <name>: <kind> <model>, effort <effort>`, with the description;
+- the team setting for worker PR squash merge authorization, enabled or disabled;
 - the workers, one line each starting `- <id> [<group label>] <title>`;
 - the unhandled inbox items, each containing `[<kind>] <subject>: <summary>` and its id.
 
@@ -1221,7 +1228,7 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 1. `last_group` stores `waiting_on_you`, `working`, `reported` or `idle`. An unknown stored value reads as none, so the next group is always a transition.
 2. **Kept:** the stop file is `ticker.stop` and the log is `ticker.log`, capped at 1 MB. When a write would pass the cap, the older half of the file is dropped at a line boundary. A running ticker is described as `ticker <version> running since <started> (pid <pid>)`.
 3. Progress records use the metadata `source` `herdr-linear-agent`. **Kept:** a record is `state/progress/<pane>-<hash>.json` and sets the pane token `herdr_linear_agent_activity` with a 300 s TTL. The record holds `pane`, `terminal`, `percent` (or null for `--unknown`), `activity` and `at`. The percent is not sent as a token.
-4. **Kept:** an inbox item is `inbox/<id>.md`: TOML front matter between `+++` lines with the keys `id`, `kind`, `subject`, `created` and `summary`, in that order, and no body. Ids are `<UTC time>-<kind>-<subject>-<n>`, `n` from a counter kept under the run lock (see [The inbox](#the-inbox)). `inbox done` moves an item to `inbox/done/`. **Kept:** done items older than 30 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
+4. **Kept:** an inbox item is `inbox/<id>.md`: TOML front matter between `+++` lines with the keys `id`, `kind`, `subject`, `created` and `summary`, in that order, and no body. Ids are `<UTC time>-<kind>-<subject>-<n>`, `n` from a counter kept under the run lock (see [The inbox](#the-inbox)). `inbox done` moves an item to `inbox/done/`. **Kept:** done items older than 30 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Merge authorization`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
 5. The `Start worker` action is queued when a worker's launch prompt is delivered, not when `worker start` returns. Its parameter is `<id> <repo>: <title>`.
 6. A launch attempt is one failed placement or one failed `agent.start`, including `agent_not_ready`; `NotSent` and `OutcomeUnknown` are not attempts. After 3 attempts the agent is `Failed` with the last error. The ticker then posts the error activity `Could not start the <role> agent: <error>`, where the role is `coordinator` or `worker <id>`. `agent.start` gets `timeout_ms` 30000.
 7. `worker prompt` sends the given text itself with `agent.prompt`. It fails with `worker <id> is not running` when the worker is not `open` or has no pane. It is refused while the worker waits on a dialog, as the tests pin.

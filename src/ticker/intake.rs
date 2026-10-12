@@ -244,7 +244,7 @@ impl Reconciler {
         }
         if let Some(request) = &record.resume_request {
             if let Some(ref detail) = detail {
-                self.refresh_issue(run, record, detail).await?;
+                self.refresh_issue(run, detail).await?;
             }
             if matches!(request.decision, ResumeDecision::Denied) {
                 return Ok(());
@@ -321,28 +321,24 @@ impl Reconciler {
             if record.coordinator.profile.is_empty() && !self.routing.contains(&run.key) {
                 self.finish_claim(d, run, &detail).await?;
             }
-            self.refresh_issue(run, record, &detail).await?;
+            self.refresh_issue(run, &detail).await?;
         }
         self.relay(d, run, &update.prompts, now).await
     }
 
     /// Rewrites `issue.md` and tells the coordinator when a person edited
     /// the issue. The first write, at the claim, is not an edit.
-    async fn refresh_issue(
-        &mut self,
-        run: &Run,
-        record: &RunRecord,
-        detail: &IssueDetail,
-    ) -> Result<()> {
+    async fn refresh_issue(&mut self, run: &Run, detail: &IssueDetail) -> Result<()> {
         let hash = crate::run::issue_hash(detail);
         let (updated_at, title) = (detail.updated_at.clone(), detail.title.clone());
         let labels: Vec<String> = detail.labels.iter().map(|l| l.name.clone()).collect();
-        let stored = hash.clone();
+        let snapshot = crate::run::issue_markdown(detail);
         let cursor_updated_at = detail.updated_at.clone();
         let state_name = detail.state.name.clone();
         let state_type = detail.state.r#type.clone();
-        let accepted = blocking({
+        blocking({
             let run = run.clone();
+            let hash = hash.clone();
             let state_summary = format!("The issue moved to {} ({}).", state_name, state_type);
             move || {
                 let lock = run.lock()?;
@@ -369,9 +365,19 @@ impl Reconciler {
                 {
                     inbox::write_held(&run, &lock, "issue", "state", &state_summary)?;
                 }
+                if !current.issue_hash.is_empty() && current.issue_hash != hash {
+                    inbox::write_held(
+                        &run,
+                        &lock,
+                        "issue",
+                        "issue",
+                        "The issue was edited in Linear; issue.md is updated.",
+                    )?;
+                }
+                files::write_atomic(&run.issue_md(), snapshot.as_bytes())?;
                 run.update_held(&lock, move |r| {
                     r.issue_updated_at = updated_at;
-                    r.issue_hash = stored;
+                    r.issue_hash = hash;
                     r.title = title;
                     r.labels = labels;
                     let next = match &r.issue_state {
@@ -397,22 +403,6 @@ impl Reconciler {
             }
         })
         .await?;
-        if !accepted {
-            return Ok(());
-        }
-        files::write_atomic(
-            &run.issue_md(),
-            crate::run::issue_markdown(detail).as_bytes(),
-        )?;
-        if !record.issue_hash.is_empty() && hash != record.issue_hash {
-            inbox_item(
-                run,
-                "issue",
-                "issue",
-                "The issue was edited in Linear; issue.md is updated.".into(),
-            )
-            .await?;
-        }
         Ok(())
     }
 
@@ -437,6 +427,10 @@ impl Reconciler {
             .team(&record.workspace, &team)
             .map(|team| team.allowed_user_ids.clone())
             .unwrap_or_default();
+        let merge_enabled = d
+            .config
+            .team(&record.workspace, &team)
+            .is_ok_and(|team| team.merge_on_authorization);
 
         // Delivery order is sentAt, but the cursor is createdAt. Capture all
         // eligible IDs against one cursor before processing can advance it.
@@ -485,6 +479,92 @@ impl Reconciler {
                 continue;
             }
             let displayed_at = prompt.sent_at.as_deref().unwrap_or(&created).to_string();
+            if let Some(token) = worker::merge_token(&body).map(str::to_string) {
+                let authorized_user = allowed.contains(&user);
+                let merge_id = id.clone();
+                let merge_created = created.clone();
+                let merge_user = user.clone();
+                let handled = self
+                    .guarded(run, move |run, lock| {
+                        let current = run.record()?;
+                        if !prompt_is_new(&current, &merge_id, &merge_created) {
+                            return Ok((false, Vec::new()));
+                        }
+                        let pending = worker::list(run).into_iter().find_map(|w| {
+                            let Some(worker::MergeAuthorization::Pending {
+                                token: expected,
+                                pr_url,
+                            }) = w.merge_authorization
+                            else {
+                                return None;
+                            };
+                            (expected == token && w.pr_url == pr_url)
+                                .then_some((w.id, expected, pr_url))
+                        });
+                        let mut authorized_worker = None;
+                        let accepted = match pending {
+                            Some((worker_id, expected, pr_url))
+                                if authorized_user && merge_enabled =>
+                            {
+                                worker::update_held(run, lock, &worker_id, |current| {
+                                    current.merge_authorization =
+                                        Some(worker::MergeAuthorization::Authorized {
+                                            token: expected,
+                                            pr_url,
+                                            by: merge_user.clone(),
+                                        });
+                                })?;
+                                authorized_worker = Some(worker_id);
+                                true
+                            }
+                            Some((worker_id, _, _)) => {
+                                authorized_worker = Some(worker_id);
+                                false
+                            }
+                            _ => false,
+                        };
+                        let (subject, summary) = match (accepted, authorized_worker.as_deref()) {
+                            (true, Some(worker_id)) => (
+                                worker_id,
+                                format!(
+                                    "An allowed user authorized worker {worker_id}'s pull request merge."
+                                ),
+                            ),
+                            (false, Some(worker_id)) => (
+                                worker_id,
+                                format!(
+                                    "A merge authorization reply for worker {worker_id} was ignored."
+                                ),
+                            ),
+                            (_, None) => (
+                                "authorization",
+                                "A merge authorization reply was ignored.".to_string(),
+                            ),
+                        };
+                        inbox::write_held(
+                            run,
+                            lock,
+                            "merge",
+                            subject,
+                            &summary,
+                        )?;
+                        run.update_held(lock, |r| {
+                            advance_prompt_cursor(r, &merge_created, &merge_id);
+                            remove_pending_prompt(r, &merge_id);
+                        })?;
+                        Ok((true, Vec::new()))
+                    })
+                    .await?;
+                if handled {
+                    if authorized_user && merge_enabled {
+                        d.log.line(&format!(
+                            "{}: processed a merge authorization reply",
+                            run.key
+                        ));
+                    }
+                    continue;
+                }
+            }
             if !allowed.contains(&prompt.user_id) {
                 let at = displayed_at.clone();
                 let recorded = self

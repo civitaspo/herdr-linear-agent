@@ -75,6 +75,9 @@ pub struct Team {
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
+    /// Let an allowed Linear reply authorize a worker PR merge.
+    #[serde(default)]
+    pub merge_on_authorization: bool,
     /// The routing of this team's issues: a table under `routing`.
     pub routing: String,
 }
@@ -1186,6 +1189,18 @@ workers = ["standard", "deep"]
     #[test]
     fn delegators_default_to_the_users_whose_replies_count() {
         let config = load_with(SAMPLE, &[]).unwrap();
+        assert!(!config.team("acme", "DATA").unwrap().merge_on_authorization);
+        let opted_in = SAMPLE.replace(
+            "routing = \"default\"",
+            "merge_on_authorization = true\nrouting = \"default\"",
+        );
+        assert!(
+            load_with(&opted_in, &[])
+                .unwrap()
+                .team("acme", "DATA")
+                .unwrap()
+                .merge_on_authorization
+        );
         assert_eq!(
             config.team("acme", "DATA").unwrap().delegators(),
             ["user-1"]

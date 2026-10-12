@@ -16,13 +16,14 @@ Workspace labels put the ticket first. A coordinator is labeled `acme/DATA-1 · 
 - **One writer.** Only the plugin's background ticker writes to Linear. Agents call plugin subcommands that queue requests; they never hold a Linear token.
 - **Profiles, not flags.** Agent kind, model, effort and permission flags live in profiles you write in the config. Agents choose a profile by name and nothing else.
 - **Limits enforced by the binary.** Concurrent runs, workers per run and total agents are capped by the plugin, not by the agents.
-- **Nothing is merged for you.** No merge, no force push, and no issue moved to Done. The plugin moves an issue to a started state when it picks it up and to your review state when the coordinator finishes.
+- **Merging is opt-in and requires an allowed Linear reply.** A team can enable one-time squash-merge authorization with `merge_on_authorization = true`; without it, the plugin never merges. A worker must request authorization for its recorded PR, and a user in that team's `allowed_user_ids` must reply with the exact token shown in Linear. The coordinator then asks the plugin to make one `gh pr merge --squash` attempt. It never force-pushes or moves an issue to Done.
 
 ## Requirements
 
 - macOS or Linux, and Herdr 0.9.1 or later
 - On Linux: a Secret Service provider (GNOME Keyring, KWallet) for the token, and `xdg-open`
 - The agent CLIs your profiles use (`claude`, `codex`, `cursor-agent`, ...) and `git`
+- `gh` on the ticker's `PATH` when any team enables `merge_on_authorization`
 - One or more Linear workspaces where you can install an OAuth application (workspace admin)
 
 ## Set up
@@ -55,6 +56,7 @@ client_id = "your-oauth-client-id"       # the OAuth application of this workspa
 allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
 # allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
 review_state = "In Review"               # where `finish` moves the issue (default)
+# merge_on_authorization = false          # allow one-time worker PR squash merges after an allowed Linear reply
 routing = "default"                      # the routing of this team's issues, a table under [routing] (required)
 
 [workspaces.acme.teams.OPS]              # each team has its own allowed users, review state and routing

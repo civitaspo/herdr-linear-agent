@@ -464,6 +464,14 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
             .values()
             .map(|p| executable(&p.kind))
             .collect();
+        if config
+            .workspaces
+            .values()
+            .flat_map(|workspace| workspace.teams.values())
+            .any(|team| team.merge_on_authorization)
+        {
+            kinds.push("gh");
+        }
         kinds.sort_unstable();
         kinds.dedup();
         for program in kinds.into_iter().chain(["git"]) {
