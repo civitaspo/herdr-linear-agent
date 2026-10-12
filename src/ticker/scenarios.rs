@@ -214,6 +214,31 @@ async fn workflow_state_changes_reach_the_coordinator_once_including_same_type_c
 }
 
 #[tokio::test]
+async fn pickup_state_already_started_before_the_first_detail_is_silent() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.once().await;
+
+    assert_eq!(
+        world.runs(),
+        1,
+        "claim is created before the first run read"
+    );
+    assert!(world.record(KEY).coordinator.profile.is_empty());
+    assert_eq!(world.issue_state(KEY), "Todo");
+
+    // Linear can move an issue to its started state when it opens the agent
+    // session, before the ticker's first detailed read.
+    world.move_issue(KEY, "In Progress");
+    world.later(5);
+    world.settle().await;
+
+    assert_eq!(world.issue_state(KEY), "In Progress");
+    assert!(!mentions(&world.inbox(KEY), "moved to In Progress"));
+    assert_eq!(world.record(KEY).issue_state.unwrap().name, "In Progress");
+}
+
+#[tokio::test]
 async fn pickup_in_another_started_state_does_not_suppress_a_later_started_transition() {
     let mut world = World::sample();
     world.delegate(KEY, "Fix the login", Some(2.0));

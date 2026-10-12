@@ -457,3 +457,17 @@ assessment of external test evidence. Unknown write outcomes, unauthorized
 authors, vetoes and reordered reads remain regression-suite checks rather than
 live fault injection. The isolated ticker was stopped afterwards; the installed
 ticker and LayerX issues were not changed.
+
+## State notices and merge authorization (2026-10-12)
+
+A signed macOS development build from [PR #146](https://github.com/civitaspo/herdr-linear-agent/pull/146), including the first-detail pickup fix, ran with Herdr 0.9.3 and OpenCode 2.0.24 in the isolated `p146` session. Its temporary config polled only the Personal `CIV` team and the private `testing-herdr-linear-agent` repository. The default Herdr session and installed ticker were left untouched.
+
+| Scenario | Observed result |
+| --- | --- |
+| [CIV-16](https://linear.app/civitaspo/issue/CIV-16/verify-state-change-notices-after-pickup-pr-146) pickup | The issue moved from Todo to In Progress when the plugin picked it up at 18:34:15Z. The run cursor recorded `In Progress`, and the inbox had no notice for that initial move. |
+| CIV-16 later transition | Linear moved the active issue to In Review at 18:34:28Z. The run wrote exactly one `issue-state` inbox item at 18:34:29Z: `The issue moved to In Review (started).` |
+| [CIV-17](https://linear.app/civitaspo/issue/CIV-17/verify-pr-146-token-authorized-squash-merge-in-an-isolated-run) worker PR | A coordinator and one worker ran in separate Herdr workspaces. The worker changed the scratch README and opened [testing-herdr-linear-agent#18](https://github.com/civitaspo/testing-herdr-linear-agent/pull/18). Its `quick` and `slow` checks passed; the workflow's `failing` job was skipped. |
+| CIV-17 authorization | The coordinator requested one-time authorization for the recorded PR. A reply containing exactly `merge <token>` came from the configured allowed Personal user. The worker record became `authorized` with that user ID and the same PR URL, and the coordinator received one merge inbox item. |
+| CIV-17 merge | The coordinator ran the plugin's `worker merge` command. The persisted attempt became `merged`; GitHub readback reported PR #18 as merged at 18:47:08Z with merge commit `57924398ae7fa1f3b35cd0547d0c212a8e89673a`. The coordinator then used the plugin `finish` command to move CIV-17 to In Review. |
+
+The isolated `p146` session and ticker were stopped after the check. This live run covers an allowed reply and a successful squash merge; unauthorized or malformed replies, changed-PR invalidation, and unknown merge outcomes remain covered by the regression suite rather than live fault injection. The scratch PR was intentionally merged in the test repository.

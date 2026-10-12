@@ -1204,6 +1204,7 @@ impl Reconciler {
             .min_by(|a, b| a.position.total_cmp(&b.position))
             .map(|state| state.name.clone())
             .unwrap_or_default();
+        let observed_state = detail.state.name.clone();
         let key = crate::run::split_key(&run.key).1.to_string();
         self.update_and_push(run, move |r| {
             let mut ops = Vec::new();
@@ -1215,7 +1216,10 @@ impl Reconciler {
                     target: StateTarget::Started,
                 });
             }
-            if !moved && let Some(cursor) = &mut r.issue_state {
+            if let Some(cursor) = &mut r.issue_state
+                && (!moved
+                    || (cursor.state_type != "started" && observed_state == expected_started))
+            {
                 cursor.pickup_state = expected_started;
             }
             ops
