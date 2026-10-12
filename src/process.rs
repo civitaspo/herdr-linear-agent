@@ -81,12 +81,17 @@ impl Output {
 }
 
 pub trait Runner: Send + Sync {
+    fn clone_box(&self) -> Box<dyn Runner>;
     fn run<'a>(&'a self, cmd: &'a Cmd) -> BoxFuture<'a, Result<Output>>;
 }
 
 pub struct RealRunner;
 
 impl Runner for RealRunner {
+    fn clone_box(&self) -> Box<dyn Runner> {
+        Box::new(RealRunner)
+    }
+
     fn run<'a>(&'a self, cmd: &'a Cmd) -> BoxFuture<'a, Result<Output>> {
         Box::pin(run(cmd))
     }
@@ -149,16 +154,17 @@ async fn run(cmd: &Cmd) -> Result<Output> {
 
 #[cfg(test)]
 pub mod fake {
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     use super::*;
 
     /// Answers each command with the last rule whose needle its display line
     /// contains, so a test can override a default. Every command is recorded.
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     pub struct FakeRunner {
-        rules: Mutex<Vec<(String, Output)>>,
-        pub calls: Mutex<Vec<Cmd>>,
+        rules: Arc<Mutex<Vec<(String, Output)>>>,
+        pub calls: Arc<Mutex<Vec<Cmd>>>,
     }
 
     impl FakeRunner {
@@ -203,6 +209,10 @@ pub mod fake {
     }
 
     impl Runner for FakeRunner {
+        fn clone_box(&self) -> Box<dyn Runner> {
+            Box::new(self.clone())
+        }
+
         fn run<'a>(&'a self, cmd: &'a Cmd) -> BoxFuture<'a, Result<Output>> {
             self.calls.lock().unwrap().push(cmd.clone());
             let line = cmd.display();

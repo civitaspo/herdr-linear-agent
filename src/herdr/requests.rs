@@ -55,6 +55,15 @@ pub trait Herdr: Send + Sync {
         label: &str,
     ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
 
+    /// Splits `target` in place with a new pane rooted at `cwd`.
+    fn pane_split(
+        &self,
+        target: &PaneId,
+        cwd: &str,
+    ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
+
+    fn pane_close(&self, pane: &PaneId) -> impl Future<Output = Result<(), HerdrError>> + Send;
+
     fn agent_start(
         &self,
         name: &str,
@@ -123,6 +132,11 @@ struct Worktree {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct SplitAnswer {
+    pane: Pane,
+}
+
 impl PlacedAnswer {
     fn placed(self, requested_cwd: &str) -> Placed {
         let worktree_path = self.worktree.map(|w| w.path);
@@ -183,6 +197,32 @@ impl Herdr for Client {
         let params = json!({"cwd": cwd, "path": path, "label": label, "focus": false});
         let answer: PlacedAnswer = self.call("worktree.open", params).await?;
         Ok(answer.placed(path))
+    }
+
+    async fn pane_split(&self, target: &PaneId, cwd: &str) -> Result<Placed, HerdrError> {
+        let params = json!({
+            "target_pane_id": target,
+            "cwd": cwd,
+            "direction": "right",
+            "ratio": 0.5,
+            "focus": false,
+        });
+        let answer: SplitAnswer = self.call("pane.split", params).await?;
+        let pane = answer.pane;
+        Ok(Placed {
+            workspace: pane.workspace,
+            tab: pane.tab,
+            pane: pane.id,
+            cwd: pane
+                .cwd
+                .or(pane.foreground_cwd)
+                .unwrap_or_else(|| cwd.to_string()),
+            worktree_path: Some(cwd.to_string()),
+        })
+    }
+
+    async fn pane_close(&self, pane: &PaneId) -> Result<(), HerdrError> {
+        self.ok("pane.close", json!({"pane_id": pane})).await
     }
 
     async fn agent_start(
@@ -326,6 +366,11 @@ mod tests {
                    "root_pane": pane_json("w5:p1", "/wt/api"),
                    "worktree": {"path": "/wt/api", "label": "api"}}),
         );
+        fake.answer(
+            "pane.split",
+            json!({"type": "pane_split", "pane": pane_json("w5:p2", "/state/runs/DATA-1")}),
+        );
+        fake.answer("pane.close", json!({"type": "ok"}));
         let client = fake.client();
         let placed = client
             .workspace_create("/state/runs/DATA-1", "DATA-1 Fix")
@@ -371,6 +416,22 @@ mod tests {
         assert_eq!(
             last_request(&fake, "worktree.open")["params"]["label"],
             "acme/DATA-1 · w1"
+        );
+        let split = client
+            .pane_split(&PaneId("w5:p1".into()), "/state/runs/DATA-1")
+            .await
+            .unwrap();
+        assert_eq!(split.pane, PaneId("w5:p2".into()));
+        assert_eq!(split.worktree_path.as_deref(), Some("/state/runs/DATA-1"));
+        assert_eq!(
+            last_request(&fake, "pane.split")["params"],
+            json!({"target_pane_id": "w5:p1", "cwd": "/state/runs/DATA-1",
+                  "direction": "right", "ratio": 0.5, "focus": false})
+        );
+        client.pane_close(&PaneId("w5:p1".into())).await.unwrap();
+        assert_eq!(
+            last_request(&fake, "pane.close")["params"],
+            json!({"pane_id": "w5:p1"})
         );
     }
 

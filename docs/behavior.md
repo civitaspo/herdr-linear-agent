@@ -78,7 +78,7 @@ Rules:
 
 ## Config
 
-File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The kept module `src/config.rs` defines it; the rewrite adds only the poll interval keys.
+File: `<config_dir>/config.toml`. Unknown keys are refused in every table. `src/config.rs` defines the workspace, team and routing settings, including the optional shared-space and merge-authorization settings.
 
 | Key | Type | Default | Validation |
 | --- | --- | --- | --- |
@@ -91,7 +91,13 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `workspaces.<name>.teams.<key>.allowed_user_ids` | list | `[]` | whose replies in that team's sessions reach the coordinator |
 | `workspaces.<name>.teams.<key>.routing` | name | required | a table under `routing`: ``workspaces.<name>.teams.<key>.routing: there is no routing.<routing>``; see [Routing](#routing) |
 | `workspaces.<name>.teams.<key>.allowed_delegator_ids` | list | `allowed_user_ids` | whose delegations of that team's issues the ticker takes (see [Intake and claim](#intake-and-claim)) |
-| `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank: `workspaces.<name>.teams.<key>.review_state is empty`; where `finish` moves that team's issues |
+| `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank; where `finish` moves that team's issues unless finishing from deployment |
+| `workspaces.<name>.teams.<key>.started_state` | string | `In Progress` | not blank; initial state on pickup |
+| `workspaces.<name>.teams.<key>.deploy_state` | string | `In Deploy` | not blank; target after an authorized merge |
+| `workspaces.<name>.teams.<key>.postmortem_state` | string | `In Postmortem` | not blank; target after finishing deployment work |
+| `workspaces.<name>.teams.<key>.done_state` | string | `Done` | not blank; must resolve to a Linear completed state after workflow postmortem |
+| `workspaces.<name>.teams.<key>.single_space_repository` | repository name | unset | must name a configured `repositories.<name>`; runs for this team share that repository's worktree and Herdr workspace between the coordinator and its worker |
+| `workspaces.<name>.teams.<key>.merge_on_authorization` | bool | `false` | when true, an allowed user's exact token reply can authorize `worker merge` to squash-merge that worker's recorded GitHub PR |
 | `herdr.session` | string | unset: Herdr's default session | |
 | `limits.max_runs` | u32 | `2` | the three limits must satisfy `max_runs >= 1`, `max_workers_per_run >= 1`, `max_agents >= 2`: `limits must allow one run with one worker` |
 | `limits.max_workers_per_run` | u32 | `4` | |
@@ -206,6 +212,8 @@ Run record (`run.json`), every field defaulted when missing:
 | `created` | claim time |
 | `issue_updated_at` | the issue's `updatedAt` when `issue.md` was last written |
 | `issue_hash` | hash of the parts a person edits |
+| `issue_state`, `issue_state_id` | last workflow state name and ID recorded after coordinator selection; old records default empty and initialize without a notification |
+| `shared_space` | optional repository name, path, base, branch and worktree path for a team's single-space run |
 | `routing_source` | where the coordinator profile came from: `chosen by the routing agent`, or `the default: <reason>`; records of older builds with `size` and `size_source` read without them |
 | `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory, ignores this field when reading, and drops it on the next write |
 | `coordinator` | the coordinator's agent record |
@@ -367,9 +375,11 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 | --- | --- | --- |
 | `workspace.create` | `cwd`, `label`, `focus: false` | coordinator placement |
 | `workspace.close` | `workspace_id` | run close, worker restart |
+| `pane.split` | `target_pane_id`, `cwd`, `direction: right`, `ratio: 0.5`, `focus: false` | coordinator and worker panes in a single-space run; returns the new pane in the same workspace |
+| `pane.close` | `pane_id` | closes an unused shared-worktree root pane or a worker pane before restart |
 | `workspace.focus` | `workspace_id` | focus-run action |
-| `worktree.create` | `cwd`, `branch`, `base`, `label`, `focus: false` | worker start; result has `root_pane` and `worktree.path` |
-| `worktree.open` | `cwd` (the repository checkout), `path`, `label`, `focus: false` | worker restart in the kept checkout. Without `cwd` Herdr 0.9.1 refuses the request (`not_git_worktree`, or `worktree_not_found`), measured in THLA-10. |
+| `worktree.create` | `cwd`, `branch`, `base`, `label`, `focus: false` | default worker start or single-space setup; result has `root_pane` and `worktree.path` |
+| `worktree.open` | `cwd` (the repository checkout), `path`, `label`, `focus: false` | worker restart or single-space recovery in the kept checkout. Without `cwd` Herdr 0.9.1 refuses the request (`not_git_worktree`, or `worktree_not_found`), measured in THLA-10. |
 | `agent.start` | `name`, `kind`, `pane_id`, `args` | launch |
 | `agent.prompt` | `target` (pane id), `text` | launch prompt, nudge, worker prompt |
 | `agent.send_keys` | `target`, `keys: ["esc"]` | stop, close, detach |
@@ -481,7 +491,7 @@ The kept modules `src/linear/*` define the operations; the rewrite may make them
 | --- | --- | --- |
 | `viewer` | `HerdrLinearAgentViewer` | `{id, name}` |
 | `delegated_issues(teams)` | `HerdrLinearAgentDelegatedIssues` | issues with `delegate.isMe`, team key in the list, state type not `completed`/`canceled`; 50 per page, at most 4 pages. Each issue also brings its first 10 `agentSessions` (`id`, `status`, `createdAt`, `appUser`, `creator { id name }`, and the latest activity's `createdAt` and content type) and its first 20 `history` entries (`createdAt`, `actor { id name }`, `toDelegate { id }`), from which the client keeps the delegator and the app's newest session (see [Who delegated](#who-delegated)). `Issue.agentSessions` is marked internal in Linear's schema; the workspace-wide `agentSessions` list holds other apps' sessions too, so the app's own may be missing from its first page |
-| `issue(id)` | `HerdrLinearAgentIssue` | `IssueDetail`: team states, estimation type (default `notUsed`), labels with parent group name, first 50 comments (author default `(unknown)`) |
+| `issue(id)` | `HerdrLinearAgentIssue` | `IssueDetail`: team states, estimation type (default `notUsed`), Linear `branchName`, labels with parent group name, first 50 comments (author default `(unknown)`) |
 | `open_session(issue)` | `HerdrLinearAgentSessions`, then `HerdrLinearAgentSessionCreate` | the newest (by `createdAt`) session of this app user on the issue whose status is not `complete`; otherwise creates one with `agentSessionCreateOnIssue` |
 | `create_activity(session, id, activity)` | `HerdrLinearAgentActivityCreate` | input `agentSessionId`, `id` (the caller's UUID), `content`, `ephemeral`, and `signal`/`signalMetadata` when set |
 | `activity_exists(session, id)` | `HerdrLinearAgentActivityFind` | whether an activity with that id exists |
@@ -559,7 +569,7 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 ### `claim(issue)`
 
 1. Validate the issue key; read the issue detail.
-2. Create the state and runs directories. Create the run with `workspace`, `issue_id`, `session_id` (the delegation's session unless it is `complete`), `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
+2. Create the state and runs directories. Create the run with `workspace`, `issue_id`, `session_id` (the delegation's session unless it is `complete`), `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`. If the team's `single_space_repository` is set, persist that repository's path and base in `shared_space`; the issue detail fills its branch.
 3. Log `<KEY>: picked up`.
 4. Queue the thought `Picked up <ISSUE>.` and the issue-state request with target `started`, clearing `announce_pending` in the same critical section.
 5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. A run without a session gets one from the flush (Linear's auto-created one, or a new one).
@@ -632,14 +642,14 @@ For every active or detached run, per update, in this order. Detached runs remai
 4. `updatedAt` differs from `issue_updated_at`: refresh the issue.
 5. Relay the prompts.
 
-`refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no item. The hash also leaves out the comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
+`refresh_issue`: read the issue, rewrite `issue.md`, and store `issue_updated_at`, `issue_hash`, `issue_state`, `issue_state_id`, `title` and `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` The hash leaves out the workflow state, so a state ID change gets its own (`state`, `state`) item: `The issue moved from <previous> to <current>.` A state rename updates `issue_state` without reporting a transition. The initial state is recorded after coordinator selection so the plugin's pickup transition does not count as an external state change; later state transitions are reported, including transitions between states of the same type. If other issue content changes in the same refresh, its `issue` item is written as well. The hash also leaves out the comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
 
 `close_run`:
 
 1. Interrupt the agents (Escape).
 2. For each worker: copy its report home; when it is `open` and its pane exists, collect its workspace (the live one, or the recorded one); set it `stopped`.
 3. When the coordinator is `open` and its pane exists, collect its workspace.
-4. Close every collected workspace; log failures.
+4. Close every collected workspace once; the set is de-duplicated because a shared-space coordinator and its worker panes have the same workspace id. Log failures.
 5. Set the run `closed` and the coordinator `stopped` and, when the run has a session, queue the response ``The issue is <state name>; this run is closed.`` in the same critical section, since Linear shows a session as working until a response ends it (the flush covers closed runs). Log the close line.
 6. A closed run is left alone: nothing is started for it. Reopened and still delegated, it becomes active with the coordinator resumed from its session (`--resume sess-...`). `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it` (two workspaces closed, worker `stopped`).
 
@@ -775,6 +785,10 @@ Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a 
 
 ### Coordinator placement
 
+For an active run whose coordinator is `pending`, the default placement below makes a separate coordinator workspace in the run folder. If `shared_space` is present, the placement effect instead prepares its configured repository checkout, then splits a pane at the run folder in that repository's workspace so coordinator instructions and local command permissions still apply. The coordinator's `cwd` remains the canonical run folder; worker panes use the shared checkout.
+
+Shared-space preparation fetches the configured base, then opens the branch named by Linear's `branchName` when it is a safe Git branch name. Otherwise it uses `branch_name(KEY, "shared", title)`. It creates or adopts the worktree at `origin/<base>`, opens it if needed, and splits a pane in its root at `canonical_dir`. The run lock is not held across fetch or Herdr calls; the effect result persists the worktree path and coordinator placement together. An unused root pane is closed after the result is accepted. During recovery, a snapshot pane or `git worktree list` can identify the existing checkout; otherwise the plugin reopens it and splits a fresh run-folder pane. `tests/scenarios:an_opt_in_single_space_run_shares_its_worktree_and_workspace_with_its_worker`
+
 For an active run whose coordinator is `pending`:
 
 1. Write the priming (it is rewritten at every placement, so an updated binary's path is what the coordinator sees):
@@ -791,9 +805,9 @@ For an active run whose coordinator is `pending`:
    - `.claude/settings.local.json`: `{"permissions":{"allow":["Bash(<bin> skill:*)", "Bash(<bin> context:*)", "Bash(<bin> inbox done:*)", "Bash(<bin> plan:*)", "Bash(<bin> say:*)", "Bash(<bin> ask:*)", "Bash(<bin> worker:*)", "Bash(<bin> finish:*)"]}}`. `startup`, `action` and `ticker` are never allowed.
    - `.cursor/cli.json`: `{"permissions":{"allow":["Shell(<bin>)"],"deny":[]}}`. Cursor Agent matches the command as typed, so the entry is the path the sheet gives; without it every `herdr-linear-agent` command waits for approval (measured with Cursor Agent 2026.09.26). `src/coordinator.rs:priming_points_the_coordinator_at_the_binary_and_allows_only_agent_commands`
    - `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
-2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused.
+2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused (default layout only).
 3. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` from the root pane; set `status open`, `prompt_pending true`, `launch_attempts 0`.
-4. `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane whose cwd is `canonical_dir` and that is empty or holds our agent (kind and name) is adopted instead of creating a second workspace; the label is not compared, since a title edit changes it. With our agent in it, the adopted coordinator is prompted, not started. `tests/scenarios:a_placement_without_an_answer_is_adopted_after_a_title_edit` Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
+4. In the default layout, `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane whose cwd is `canonical_dir` and that is empty or holds our agent (kind and name) is adopted instead of creating a second workspace; the label is not compared, since a title edit changes it. With our agent in it, the adopted coordinator is prompted, not started. `tests/scenarios:a_placement_without_an_answer_is_adopted_after_a_title_edit` Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 
 A placement failure counts as a launch attempt (see below); `NotSent` and `OutcomeUnknown` do not.
 
@@ -855,12 +869,12 @@ The kept module `src/outbox.rs` defines the queue.
 ### Requests
 
 - `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, wait_generation?, op...}`, return the id or no id when an activity is suppressed by an inactive, stopped, finished or awaiting-reply run. A question stores its wait slot in the same lock; if the process stops between queueing and updating the record, the next record read repairs the slot from the queued request when its reply generation still matches. A turn completion stores its request id in `turn_complete` in that same critical section. Requests are sent in the order written.
-- Ops (`op` tag): `turn_complete {body}`, `activity {activity, wait_reason?}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`. Only elicitation requests carry a `wait_reason`; terminal responses remain sendable while stopped, finished or awaiting a reply.
+- Ops (`op` tag): `turn_complete {body}`, `activity {activity, wait_reason?}`, `plan {plan}`, `external_urls {urls}`, `issue_state` with a target of `started`, `review`, a workflow stage, or a selected state and its expected current state. Only elicitation requests carry a `wait_reason`; terminal responses remain sendable while stopped, finished or awaiting a reply.
 - `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`. Only the Linear task calls it: it alone moves, rewrites or removes outbox files. The reconciler lists them read-only (`queued`, the requests that parse; `is_empty`, any file). `tests/scenarios:the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task`
 
 ### Send
 
-`send(run, session, issue, review_state)` handles requests in order:
+`send(run, session, issue, state_names)` handles requests in order:
 
 1. When `attempted` is set, check first: an activity or turn completion is looked up by its id (`activity_exists`) and skipped when found; plan, URL and state requests are not checked (they are idempotent or read before writing).
 2. For a question or turn completion, recheck its matching wait/marker under the run lock and persist `attempted` before releasing the lock and sending. For other writes, persist `attempted`, then apply. If an attempted question or completion is absent on read-back and its wait/marker was cleared meanwhile, discard it instead of sending stale content.
@@ -882,7 +896,7 @@ Apply:
 | external_urls | `set_external_urls` with the full list |
 | issue_state | read the issue; compute the target; when there is one, set it, then read the issue again and fail with `RequestFailed` when the state is not the target |
 
-`target_state(issue, target, review_state)`: `started` gives none when the state type is `started`, `completed` or `canceled`, else the team's `started` state with the lowest position, else `Graphql("team <key> has no started state")`. `review` gives none when the state name equals the review state case-insensitively or the type is `completed` or `canceled`, else the state of that name (case-insensitive), else ``Graphql("team <key> has no state named `<review_state>`")``. `src/outbox.rs:state_targets_leave_later_states_alone`
+`target_state(issue, target, state_names)`: workflow targets resolve configured names case-insensitively. `InProgress` uses the configured started state, which must have Linear type `started`; `InReview`, `InDeploy`, and `InPostmortem` use their configured names; `Done` additionally requires a completed state. A missing workflow state asks an allowed user to choose a state, and the chosen state is guarded against the issue changing before delivery. Terminal completed/canceled issues are left alone. `src/outbox.rs:state_targets_leave_later_states`
 
 `parse_plan(text)`: non-empty trimmed lines, each `- [m] content` or `* [m] content` with a one-character mark: space `pending`, `>` `inProgress`, `x`/`X` `completed`, `-` `canceled`. Errors: ``plan lines look like `- [ ] step`; got `<line>` ``, `` `[<m>]` is not a plan mark; use [ ], [>], [x] or [-] ``, ``a plan step is empty: `<line>` ``, `the plan has no steps`. `src/outbox.rs:plans_parse_from_a_checklist`
 
@@ -921,10 +935,10 @@ After the runs, the task answers each decline it has not answered yet with a `re
 | 10 minutes quiet | ephemeral thought naming what each worker does |
 | run timeout | elicitation with `Continue` |
 | stop | response `Stopped <n> agent(s) ...` |
-| `finish` | response and issue state `review` |
-| postmortem written | comment `**Postmortem (<interim or final>)**, method `<name>` version `<version>`` and the summary; the labels, when any |
+| `finish` | response and issue workflow state `InReview` (or `InPostmortem` when finishing from `InDeploy`) |
+| postmortem written | comment `**Postmortem (<workflow, interim or final>)**, method `<name>` version `<version>`` and the summary; the labels, when any |
 
-The plugin never merges, force-pushes, or moves an issue to Done. The only comments it writes are postmortems.
+The plugin never force-pushes. An authorized merge moves the issue to `InDeploy`; a subsequent finish moves it to `InPostmortem`, where a successful workflow postmortem advances it to `Done`. The only comments it writes are postmortems.
 
 ## The inbox
 
@@ -954,13 +968,15 @@ Items for the coordinator in `runs/<KEY>/inbox/`.
 - An id containing `/`, `..`, starting with `.`, or empty is refused before anything moves: `` `<id>` is not an inbox item id ``. `src/inbox.rs:ids_that_could_leave_the_folder_are_refused`
 - **Changed on purpose (THLA-7):** `inbox done --all` moves only the items the coordinator has been shown, so an item written while it worked is never handled unseen. The command prints `<n> item(s) handled`, followed by `; <m> new item(s) since your last context, run context` when unseen items remain. Named ids still move as named. `src/inbox.rs:done_all_moves_only_the_items_context_showed`, `src/commands.rs:done_all_leaves_the_items_written_after_the_last_context`
 
-Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `worker`/`<id>`.
+Kinds and subjects written by the ticker: `issue`/`issue`, `state`/`state`, `reply`/`reply`, `worker`/`<id>`, and `merge`/`<worker id>`.
 
 ## Worker commands
 
 ### Worker record (`workers/<id>.toml`)
 
-Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
+Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `merge_authorization`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
+
+`merge_authorization` defaults to `none` for old records. It is `waiting` with a one-time token and the PR URL, `approved` with the exact PR URL and author ID, `merging` while the external `gh` command runs, or `merged`/`failed` after it returns. A new PR report clears any earlier authorization.
 
 | Operation | Behavior |
 | --- | --- |
@@ -984,9 +1000,9 @@ A worker counts against `max_agents` when its status is `pending` or `open`.
 
 1. `ticker start`; load the config; load the run; it must be active, else ``run <KEY> is <Status>; nothing more is done for it`` (`Active`, `Detached`, `Closed`).
 2. Checks, in this order: the repository is in the catalog; the profile is a worker profile (`not a worker profile`); no other worker of the run uses the repository (message contains `one worker per repository`); the run has fewer than `max_workers_per_run` workers (message contains `max_workers_per_run`); the agent count leaves room under `max_agents`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold`
-3. Allocate the id. Branch: `branch_name(KEY, id, title)`.
-4. `git -C <repo path> fetch origin <base>` (60 s).
-5. `worktree.create` with `cwd` = repo path, `branch`, `base` = `origin/<base>`, not focused. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` and `worktree_path` from the result. When its answer is lost (`OutcomeUnknown`), look for the branch's worktree in `git -C <repo path> worktree list --porcelain` (10 s); when it exists, open it with `worktree.open` and go on, else mark the worker failed. `src/commands.rs:a_worktree_created_without_an_answer_is_opened_not_failed`
+3. Allocate the id. In the default layout, branch is `branch_name(KEY, id, title)`.
+4. In the default layout, `git -C <repo path> fetch origin <base>` (60 s).
+5. In the default layout, `worktree.create` with `cwd` = repo path, `branch`, `base` = `origin/<base>`, not focused. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` and `worktree_path` from the result. When its answer is lost (`OutcomeUnknown`), look for the branch's worktree in `git -C <repo path> worktree list --porcelain` (10 s); when it exists, open it with `worktree.open` and go on, else mark the worker failed. `src/commands.rs:a_worktree_created_without_an_answer_is_opened_not_failed`
 6. Add `.herdr-linear-agent/` to the repository's shared `info/exclude` (the common git dir, so every worktree is covered), once. A failure here does not fail the command. `tests/commands:exclude_is_added_once_to_the_shared_file` (git status stays clean with files under `.herdr-linear-agent/`); the scenario World fails every `git -C` except the fetch and the command still succeeds.
 7. Write `workers/<id>.task.md` and `<brief_dir>/brief.md`.
 8. Set the agent `open`, `prompt_pending`, `profile`, `kind`, `agent_name = <key>-<id>`.
@@ -994,6 +1010,8 @@ A worker counts against `max_agents` when its status is `pending` or `open`.
 10. Return the worker. The ticker starts the agent in a later pass.
 
 `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (branch `herdr-linear-agent/data-1/w1-change-api`, `--base origin/main`, `brief.md` exists).
+
+For a run with `shared_space`, the worker repository must equal the configured shared repository; a different repository is refused. It uses the run's branch, base, path and workspace, and `pane.split` creates its pane at the shared worktree path. It does not fetch or create another worktree. Only one worker per repository still applies. On restart, `pane.split` opens a new worker pane in that same shared workspace without closing the coordinator or another worker pane. The worker brief and report remain in the shared checkout's `.herdr-linear-agent/` folder.
 
 ### Brief (`compose_brief`)
 
@@ -1022,6 +1040,14 @@ Input: issue key, title, URL, worker, task, restart flag, binary. Order in the t
 - Close the old workspace (the checkout stays), open the kept worktree again with `worktree.open` and `path` = `worktree_path`, record the new pane, rewrite the brief with the restart note, set `restarts += 1`, `kind` of the profile, `open`, `prompt_pending`, `launch_attempts = 0`. The ticker starts it in a later pass with the new profile's arguments.
 - `tests/scenarios:restarts_switch_profiles_and_are_limited` (kind `codex`, restarts 1, one workspace closed, `previous attempt` in the brief, `model_reasoning_effort=xhigh` in the next start).
 
+### `worker request-merge <KEY> <id>` and `worker merge <KEY> <id>`
+
+Both commands require the team's `merge_on_authorization = true` setting and an active, unstopped, unfinished run. `worker request-merge` also requires a worker report and its current recorded PR URL to be a GitHub pull-request URL. Under the run lock, it queues a Linear thought containing a fresh UUID token and saves the exact PR URL with `waiting`; it refuses a second waiting request or a PR already approved, merging or marked merged. The Linear request and persisted waiting marker are written together.
+
+When an allowed user replies with exactly `merge <token>`, the relay changes only that worker's matching `waiting` record to `approved` and writes a `merge` inbox item in the same run-lock critical section. Other users and non-exact replies cannot authorize it. A later PR report clears any approval for an older URL.
+
+After the coordinator handles the `[merge]` inbox item, `worker merge` rechecks that authorization still matches the worker's current PR, records `merging` under the lock, then runs `gh pr merge <recorded-url> --squash` without a lock held. Success records `merged`; a failed command records `failed` and requires a new request and exact user reply to retry. It never takes a URL argument. `tests/scenarios:an_allowed_reply_authorizes_only_the_recorded_worker_pr_to_merge`
+
 ## Coordinator commands and the digest
 
 All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands require an active run and run `ticker start` first. None reads the Keychain.
@@ -1035,10 +1061,12 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 | `say <KEY> --text-file` | queues a thought with the trimmed text unless progress is suppressed by an open question or stopped/finished run; empty: `the text is empty` | `queued for the Linear session` |
 | `ask <KEY> --text-file [--option label=value]...` | queues an elicitation and opens the one reply wait; options add `select`; empty: `the question is empty` | `the question is queued for the Linear session; end your turn, the answer arrives in your inbox` |
 | `wait <KEY> --text-file` | queues a response that completes the coordinator's current turn while leaving the run active; requires no open reply wait, no unseen inbox items, and all open/failed/pending workers reported and neither working nor waiting; empty: `the summary is empty` | `the coordinator turn is complete; the run remains active` |
-| `finish <KEY> --text-file` | see below; empty: `the summary is empty` | ``the summary is queued; the issue moves to `<review_state>` `` with the run team's review state (`In Review` when the team is no longer configured) |
+| `worker request-merge <KEY> <id>` | asks an allowed user for a one-time merge approval for the worker's recorded PR; requires the team opt-in | `merge authorization requested for worker <id>` |
+| `worker merge <KEY> <id>` | runs `gh pr merge <recorded-url> --squash` after that exact authorization | `worker <id>'s pull request was squash-merged after authorization` |
+| `finish <KEY> --text-file` | see below; empty: `the summary is empty` | summary queued; issue moves to `<review_state>`, or `<postmortem_state>` when finishing from deployment |
 
 - `parse_option`: `label=value`, or a bare label used as its own value; both trimmed and non-empty, else ``an option looks like `label=value`; got `<text>` ``. `tests/commands:options_parse_as_label_and_value`
-- `finish`: needs the Herdr view (error `the configured Herdr session is not reachable`). Every worker that is `open`, `failed` or `pending` must be in the Reported group, else `not finished: <id> is <Label>, ... . Every worker must have written a report and be neither working nor waiting` (exactly `not finished: ` + the list joined by `, ` + `. Every worker ...`). Then queue the response and the `review` state, and set `finished`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold` (`w1 is Working`), `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (issue `In Review`, response body).
+- `finish`: needs the Herdr view (error `the configured Herdr session is not reachable`). Every worker that is `open`, `failed` or `pending` must be in the Reported group, else `not finished: <id> is <Label>, ... . Every worker must have written a report and be neither working nor waiting` (exactly `not finished: ` + the list joined by `, ` + `. Every worker ...`). Then queue the response and `InReview`, or `InPostmortem` when the confirmed stage is `InDeploy`, and set `finished`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold` (`w1 is Working`), `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (issue `In Review`, response body).
 - `wait`: requires the Herdr view. It captures one snapshot outside the run lock, then under the lock rechecks the reply generation, unread inbox and current worker records before queueing a `response` activity and its request id as `turn_complete`. This completes only the current Linear turn; it does not finish the run or move the issue. Repeating it while that completion is pending is idempotent. A new allowed reply or explicit new coordinator activity clears the marker; heartbeats and timeout questions do not supersede it. The marker and queued write survive restarts. Unknown write outcomes are read back by activity id before retry, and a stale completion is discarded if resumed work has cleared its marker. `tests/scenarios:wait_completes_only_the_coordinator_turn_and_new_input_resumes_it`.
 - After `finish`, replies still reach the coordinator and `finish` may run again.
 
@@ -1048,6 +1076,7 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 
 - `issue.md`;
 - `conversation.md`;
+- the team run settings: the run's shared repository (or `off`) and whether merge on allowed-user authorization is currently enabled;
 - the repository catalog, one line per repository: `- <name>: <path> (base <base>) <U+2014> <description>`;
 - the worker profiles only (never coordinator profiles), one line each starting `- <name>: <kind> <model>, effort <effort>`, with the description;
 - the workers, one line each starting `- <id> [<group label>] <title>`;
@@ -1092,7 +1121,7 @@ Errors: `this action needs a pane of a run`, `this pane does not belong to a run
 - Doctor collects problems and OK lines:
   - herdr version: `herdr <v>` OK, or `herdr <v> is older than 0.9.1`, or `herdr: <error>`;
   - config: `config <path>` OK or its error;
-  - with a config: ``Herdr session `<name or default>` is reachable`` (a snapshot or ping answers), `the configured Herdr session does not answer`, or the session error; each distinct executable of the profiles' kinds and `git`: `` `<program>` found `` or `` `<program>` is not on the ticker's PATH `` (resolved from this process's `PATH`); each repository without `.git`: ``repository `<name>`: <path> is not a git checkout``; credential, per workspace: ``Linear `<name>`: credential stored`` (ready or refresh needed), else ``Linear `<name>`: credential is <status>; run the login action`` or ``Linear `<name>`: credential: <error>``;
+  - with a config: ``Herdr session `<name or default>` is reachable`` (a snapshot or ping answers), `the configured Herdr session does not answer`, or the session error; each distinct executable of the profiles' kinds and `git`, plus `gh` when any team enables merge authorization: `` `<program>` found `` or `` `<program>` is not on the ticker's PATH `` (resolved from this process's `PATH`); each repository without `.git`: ``repository `<name>`: <path> is not a git checkout``; credential, per workspace: ``Linear `<name>`: credential stored`` (ready or refresh needed), else ``Linear `<name>`: credential is <status>; run the login action`` or ``Linear `<name>`: credential: <error>``;
   - ticker: `ticker running` (same version), `the ticker runs <v>, this binary is <v>`, `the ticker is not running`;
   - per workspace, with a stored credential, one viewer read: ``Linear `<name>`: budget <requests remaining>/<limit> requests, <points remaining>/<limit> points, resets <latest reset, whole seconds>`` OK, or ``Linear `<name>`: budget unknown`` when the read failed, a header was missing, or no credential is stored;
   - `<n> active run(s)` OK.
@@ -1160,11 +1189,11 @@ A postmortem's method version is the first 12 hex digits of a SHA-256 over the p
 
 When a postmortem is due, recorded in the run as `postmortem_due`:
 
-- `interim` when `finish` is accepted (kept when one is already due); `final` when the run closes (replacing an interim one not written yet).
+- `workflow` when the issue enters `InPostmortem` after a finish from `InDeploy`; `final` when the run closes (replacing a workflow one not written yet). Finishing into `InReview` does not schedule a postmortem. A successful workflow postmortem queues the configured `Done` state; failure is recorded and is not retried. `interim` remains the legacy value for existing records.
 - Each pass, a run with one due and none being written starts one, off the pass. A run whose team's routing lists no postmortem profile (or a gone one) has it cleared.
-- The brief, on the routing agent's standard input when the list has several profiles: the run's key, stage (a final one names the state the issue closed in, kept as the record's `closed_state`: `final: the issue is <state>, so the run is closed`), issue, team, times and coordinator; each worker's title, repository, profile, kind, restarts and PR; `issue.md`; `conversation.md`; each worker's report. The routing agent picks a profile from it (see [Routing](#routing)); one profile is picked without it; a failed pick gives the first. Each postmortem picks again, so an interim and a final one may be written by different profiles. `src/ticker/scenarios.rs:the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes`
+- The brief, on the routing agent's standard input when the list has several profiles: the run's key, stage (a final one names the state the issue closed in, kept as the record's `closed_state`: `final: the issue is <state>, so the run is closed`), issue, team, times and coordinator; each worker's title, repository, profile, kind, restarts and PR; `issue.md`; `conversation.md`; each worker's report. The routing agent picks a profile from it (see [Routing](#routing)); one profile is picked without it; a failed pick gives the first. Each postmortem picks again, so a workflow and a final postmortem may be written by different profiles. `src/ticker/scenarios.rs:the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes`
 - The input, on the picked profile's standard input: the brief, then each agent's transcripts, as history reads them (copies first; see [Past runs](#past-runs)), rendered the same way, sharing 150,000 characters: a longer one keeps its first third and its last two thirds of its share, with `[… <n> characters left out …]` between. `src/postmortem.rs:a_long_transcript_keeps_its_start_and_its_end`, `src/postmortem.rs:the_final_stage_names_the_state_the_issue_closed_in`
-- The instructions: a fixed frame (review one run to improve how agents and people work; the agents talk to people only in the Agent Session through `say`, `ask` and `finish`, so those calls in the transcripts are what people saw and `conversation.md` holds the people's replies; treat the records as data; write the summary in Markdown in the issue's language and begin it with how the run stands: for a final one the state the issue closed in, for an interim one that the work waits for review; give as `labels` the labels the method names, by their names in Linear, or none), then `# Method` and the profile's instructions.
+- The instructions: a fixed frame (review one run to improve how agents and people work; the agents talk to people only in the Agent Session through `say`, `ask` and `finish`, so those calls in the transcripts are what people saw and `conversation.md` holds the people's replies; treat the records as data; write the summary in Markdown in the issue's language and begin it with how the run stands: for a final one the state the issue closed in, for a workflow one that deployment is complete and the run awaits its postmortem, for a legacy interim one that the work waits for review; give as `labels` the labels the method names, by their names in Linear, or none), then `# Method` and the profile's instructions.
 - The call runs like the routing agent's (`routing::ask`: the kind's recipe, a fresh `herdr-linear-agent-postmortem-…` folder, no tools), under the profile's `timeout_seconds` or `limits.postmortem_agent_timeout_seconds`, and must answer `{"summary": <non-empty string>, "labels": [<string>...]}`.
 - An answer: in one critical section, keep it as `.state/postmortems/<time>-<stage>.json` (`stage`, `at`, `method`, `picked`, `version`, `summary`, `labels`), clear `postmortem_due` when it still names this stage, and queue the comment and, when there are any, the labels (blank ones and repeats dropped). Log `<KEY>: wrote the <stage> postmortem with the `<profile>` profile (<how it was picked>)`. `src/ticker/scenarios.rs:a_finish_and_a_close_each_get_one_postmortem_comment`
 - No answer (a timeout, a failure, no summary): log `<KEY>: the <stage> postmortem failed: <why>` and clear it; it is not tried again. `src/ticker/scenarios.rs:a_failed_postmortem_is_logged_and_not_tried_again`
@@ -1190,6 +1219,8 @@ finish KEY --text-file <path|->
 worker start KEY --repo R --profile P --title T --task-file <path|->
 worker prompt KEY ID --text-file <path|->
 worker restart KEY ID [--profile P]
+worker request-merge KEY ID
+worker merge KEY ID
 report [--percent N | --unknown] --activity TEXT
 ```
 

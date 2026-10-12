@@ -166,6 +166,10 @@ enum WorkerCommand {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Ask an allowed user to authorize squash-merging this worker's recorded PR.
+    RequestMerge { key: String, id: String },
+    /// Squash-merge a worker's recorded PR after the allowed user's reply.
+    Merge { key: String, id: String },
 }
 
 #[derive(Args)]
@@ -296,6 +300,10 @@ async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
                 .await
                 .map(|_| ())
         }
+        WorkerCommand::RequestMerge { key, id } => {
+            commands::worker_request_merge(ctx, &key, &id).await
+        }
+        WorkerCommand::Merge { key, id } => commands::worker_merge(ctx, &key, &id).await,
     }
 }
 

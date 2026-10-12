@@ -3,7 +3,7 @@
 //! against the config, enforce the limits, and queue Linear writes for the
 //! ticker. None of them reads the Keychain.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -308,6 +308,12 @@ pub async fn finish<H: Herdr>(
         );
     }
     let lock = run.lock()?;
+    let current = run.record()?;
+    let target = if current.workflow.confirmed == Some(crate::run::WorkflowStage::InDeploy) {
+        crate::run::WorkflowStage::InPostmortem
+    } else {
+        crate::run::WorkflowStage::InReview
+    };
     outbox::push_held(
         &run,
         &lock,
@@ -319,7 +325,7 @@ pub async fn finish<H: Herdr>(
         &run,
         &lock,
         Op::IssueState {
-            target: StateTarget::Review,
+            target: StateTarget::Workflow(target),
         },
     )?;
     run.update_held(&lock, |r| {
@@ -328,14 +334,19 @@ pub async fn finish<H: Herdr>(
         }
         r.finished = true;
         r.turn_complete = None;
-        r.postmortem_due
-            .get_or_insert(crate::postmortem::Stage::Interim);
     })?;
     ticker::poke(&ctx.state_dir());
-    let review_state = config
+    let target_state = config
         .team(&record.workspace, &record.team_key)
-        .map_or("In Review", |team| team.review_state.as_str());
-    println!("the summary is queued; the issue moves to `{review_state}`");
+        .map(|team| match target {
+            crate::run::WorkflowStage::InPostmortem => team.postmortem_state.as_str(),
+            _ => team.review_state.as_str(),
+        })
+        .unwrap_or(match target {
+            crate::run::WorkflowStage::InPostmortem => "In Postmortem",
+            _ => "In Review",
+        });
+    println!("the summary is queued; the issue moves to `{target_state}`");
     Ok(())
 }
 
@@ -366,7 +377,7 @@ pub async fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
     files::write_atomic(&exclude, text.as_bytes())
 }
 
-async fn fetch(runner: &dyn Runner, repo: &Repository) -> Result<()> {
+pub(crate) async fn fetch(runner: &dyn Runner, repo: &Repository) -> Result<()> {
     let path = repo.path.to_string_lossy();
     let out = runner
         .run(&Cmd::new("git", FETCH_TIMEOUT).args(["-C", &path, "fetch", "origin", &repo.base]))
@@ -412,7 +423,7 @@ async fn find_worktree(runner: &dyn Runner, repo_path: &str, branch: &str) -> Op
 
 /// `worktree.create`, except that a creation whose answer was lost is
 /// found by its branch and opened instead of failing or creating a second.
-async fn create_worktree<H: Herdr>(
+pub(crate) async fn create_worktree<H: Herdr>(
     runner: &dyn Runner,
     herdr: &H,
     repo_path: &str,
@@ -429,6 +440,145 @@ async fn create_worktree<H: Herdr>(
         }
         other => other,
     }
+}
+
+fn empty_pane_in(snapshot: &herdr::Snapshot, workspace: &WorkspaceId, cwd: &str) -> Option<Placed> {
+    let pane = snapshot.panes.values().find(|pane| {
+        pane.workspace == *workspace
+            && (pane.cwd.as_deref() == Some(cwd) || pane.foreground_cwd.as_deref() == Some(cwd))
+            && !snapshot.agents.iter().any(|agent| agent.pane == pane.id)
+    })?;
+    Some(Placed {
+        workspace: pane.workspace.clone(),
+        tab: pane.tab.clone(),
+        pane: pane.id.clone(),
+        cwd: cwd.to_string(),
+        worktree_path: Some(cwd.to_string()),
+    })
+}
+
+/// Recovers a pane split whose response was lost by adopting its empty pane
+/// from a fresh snapshot.
+pub(crate) async fn pane_split_recover<H: Herdr>(
+    herdr: &H,
+    parent: &herdr::PaneId,
+    workspace: &WorkspaceId,
+    cwd: &str,
+) -> Result<Placed, herdr::HerdrError> {
+    match herdr.pane_split(parent, cwd).await {
+        Err(herdr::HerdrError::OutcomeUnknown(detail)) => match herdr.snapshot().await {
+            Ok(snapshot) => empty_pane_in(&snapshot, workspace, cwd)
+                .ok_or(herdr::HerdrError::OutcomeUnknown(detail)),
+            Err(_) => Err(herdr::HerdrError::OutcomeUnknown(detail)),
+        },
+        other => other,
+    }
+}
+
+/// Prepares the one checkout and coordinator pane for a team opting into a
+/// shared-space run. The issue folder remains the coordinator's working
+/// directory so its priming and local command allow-list continue to apply.
+pub(crate) async fn prepare_shared_space<H: Herdr>(
+    runner: &dyn Runner,
+    herdr: &H,
+    run: &Run,
+    snapshot: &herdr::Snapshot,
+    shared: &crate::run::SharedSpace,
+) -> Result<(crate::run::SharedSpace, Placed, Option<herdr::PaneId>), herdr::HerdrError> {
+    if shared.branch.is_empty() {
+        return Err(herdr::HerdrError::Api {
+            code: "shared_space_branch_missing".into(),
+            message: "the issue has no usable branch name yet".into(),
+        });
+    }
+    let repo = Repository {
+        path: PathBuf::from(&shared.repo_path),
+        base: shared.base.clone(),
+        description: String::new(),
+    };
+    fetch(runner, &repo)
+        .await
+        .map_err(|error| herdr::HerdrError::Api {
+            code: "shared_space_fetch_failed".into(),
+            message: format!("could not fetch the shared repository: {error:#}"),
+        })?;
+    let run_dir = run.canonical_dir().to_string_lossy().into_owned();
+
+    let mut shared = shared.clone();
+    let existing_coordinator = snapshot.panes.values().find(|pane| {
+        pane.cwd.as_deref() == Some(run_dir.as_str())
+            || pane.foreground_cwd.as_deref() == Some(run_dir.as_str())
+    });
+    if let Some(existing) = existing_coordinator {
+        let worktree_path = find_worktree(runner, &shared.repo_path, &shared.branch)
+            .await
+            .ok_or_else(|| herdr::HerdrError::Api {
+                code: "shared_space_worktree_missing".into(),
+                message: "the existing coordinator pane has no matching shared worktree".into(),
+            })?;
+        let sibling = snapshot.panes.values().find(|pane| {
+            pane.workspace == existing.workspace
+                && pane.id != existing.id
+                && !snapshot.agents.iter().any(|agent| agent.pane == pane.id)
+                && (pane.cwd.as_deref() == Some(worktree_path.as_str())
+                    || pane.foreground_cwd.as_deref() == Some(worktree_path.as_str()))
+        });
+        shared.worktree_path = worktree_path.clone();
+        let placed = Placed {
+            workspace: existing.workspace.clone(),
+            tab: existing.tab.clone(),
+            pane: existing.id.clone(),
+            cwd: run_dir,
+            worktree_path: Some(worktree_path),
+        };
+        return Ok((shared, placed, sibling.map(|pane| pane.id.clone())));
+    }
+
+    let label = format!("{} · coordinator", run.key);
+    let existing_worktree = find_worktree(runner, &shared.repo_path, &shared.branch).await;
+    let root = if let Some(path) = existing_worktree {
+        shared.worktree_path = path.clone();
+        if let Some(pane) = snapshot.panes.values().find(|pane| {
+            pane.cwd.as_deref() == Some(path.as_str())
+                || pane.foreground_cwd.as_deref() == Some(path.as_str())
+        }) {
+            Placed {
+                workspace: pane.workspace.clone(),
+                tab: pane.tab.clone(),
+                pane: pane.id.clone(),
+                cwd: path.clone(),
+                worktree_path: Some(path),
+            }
+        } else {
+            herdr
+                .worktree_open(&shared.repo_path, &path, &label)
+                .await?
+        }
+    } else {
+        create_worktree(
+            runner,
+            herdr,
+            &shared.repo_path,
+            &shared.branch,
+            &format!("origin/{}", shared.base),
+            &label,
+        )
+        .await?
+    };
+    let worktree_path = root
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| root.cwd.clone());
+    shared.worktree_path = worktree_path.clone();
+    let placed = herdr.pane_split(&root.pane, &run_dir).await?;
+    let close_root = (placed.pane != root.pane
+        && !snapshot.agents.iter().any(|agent| agent.pane == root.pane))
+    .then_some(root.pane);
+    let placed = Placed {
+        worktree_path: Some(worktree_path),
+        ..placed
+    };
+    Ok((shared, placed, close_root))
 }
 
 pub struct WorkerStart {
@@ -479,13 +629,27 @@ pub async fn worker_start<H: Herdr>(
 ) -> Result<Worker> {
     let (config, run, record) = load_active(ctx, key).await?;
     let repo = config.repository(&args.repo)?.clone();
+    let shared = record.shared_space.as_ref();
+    if let Some(shared) = shared
+        && args.repo != shared.repo
+    {
+        bail!(
+            "this run shares `{}`; start its worker in that repository",
+            shared.repo
+        );
+    }
     let routing = config.routing_of(&record.workspace, &record.team_key)?;
     let profile = config.worker_profile(routing, &args.profile)?.clone();
     let limits = config.limits;
     check_room(&worker::list(&run), &args.repo, limits)?;
     check_agents(ctx, limits)?;
-    fetch(ctx.runner, &repo).await?;
-    let repo_path = repo.path.to_string_lossy().into_owned();
+    if shared.is_none() {
+        fetch(ctx.runner, &repo).await?;
+    }
+    let repo_path = shared.map_or_else(
+        || repo.path.to_string_lossy().into_owned(),
+        |shared| shared.repo_path.clone(),
+    );
     let worker = worker::allocate(
         &run,
         |workers| {
@@ -496,8 +660,11 @@ pub async fn worker_start<H: Herdr>(
             w.title = args.title.clone();
             w.repo = args.repo.clone();
             w.repo_path = repo_path.clone();
-            w.base = repo.base.clone();
-            w.branch = worker::branch_name(key, &w.id, &args.title);
+            w.base = shared.map_or_else(|| repo.base.clone(), |shared| shared.base.clone());
+            w.branch = shared.map_or_else(
+                || worker::branch_name(key, &w.id, &args.title),
+                |shared| shared.branch.clone(),
+            );
             w.agent.status = AgentStatus::Pending;
             w.agent.profile = args.profile.clone();
             w.agent.kind = profile.kind.clone();
@@ -524,17 +691,37 @@ pub async fn worker_start<H: Herdr>(
         ticker::poke(&ctx.state_dir());
         return Err(error).context(format!("could not persist the task for worker {worker_id}"));
     }
-    let base = format!("origin/{}", repo.base);
-    let placed = match create_worktree(
-        ctx.runner,
-        &session.herdr,
-        &repo_path,
-        &worker.branch,
-        &base,
-        &worker_label(&run, &worker.id),
-    )
-    .await
-    {
+    let placed_result = if let Some(shared) = shared {
+        if shared.worktree_path.is_empty()
+            || record.coordinator.pane_id.is_empty()
+            || record.coordinator.workspace_id.is_empty()
+        {
+            Err(herdr::HerdrError::Api {
+                code: "shared_space_unavailable".into(),
+                message: "the shared worktree or coordinator pane is not ready".into(),
+            })
+        } else {
+            pane_split_recover(
+                &session.herdr,
+                &herdr::PaneId(record.coordinator.pane_id.clone()),
+                &WorkspaceId(record.coordinator.workspace_id.clone()),
+                &shared.worktree_path,
+            )
+            .await
+        }
+    } else {
+        let base = format!("origin/{}", repo.base);
+        create_worktree(
+            ctx.runner,
+            &session.herdr,
+            &repo_path,
+            &worker.branch,
+            &base,
+            &worker_label(&run, &worker.id),
+        )
+        .await
+    };
+    let placed = match placed_result {
         Ok(placed) => placed,
         Err(error) => {
             worker::update(&run, &worker.id, |w| {
@@ -563,6 +750,158 @@ pub async fn worker_start<H: Herdr>(
         worker.id, worker.worktree_path, worker.branch
     );
     Ok(worker)
+}
+
+/// Asks for a fresh allowed-user reply before a worker's recorded PR can be
+/// squash-merged.
+pub async fn worker_request_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
+    let (config, run, record) = load_active(ctx, key).await?;
+    let team = config.team(&record.workspace, &record.team_key)?;
+    if !team.merge_on_authorization {
+        bail!("merge on authorization is not enabled for this team");
+    }
+    let lock = run.lock()?;
+    let current = run.record()?;
+    if current.status != Status::Active || current.stopped || current.finished {
+        bail!("run {key} cannot request a merge while stopped or finished");
+    }
+    let worker = worker::load(&run, id)?;
+    if worker.report_hash.is_empty() || !valid_pr_url(&worker.pr_url) {
+        bail!("worker {id} has no valid recorded pull request");
+    }
+    match &worker.merge_authorization {
+        worker::MergeAuthorization::Waiting { .. } => {
+            bail!("worker {id} already has a merge authorization request waiting")
+        }
+        worker::MergeAuthorization::Approved { .. } => {
+            bail!("worker {id}'s pull request is authorized; run worker merge")
+        }
+        worker::MergeAuthorization::Merging { .. } => {
+            bail!("worker {id}'s pull request is already being merged")
+        }
+        worker::MergeAuthorization::Merged { .. } => {
+            bail!("worker {id}'s pull request is already marked merged")
+        }
+        worker::MergeAuthorization::None | worker::MergeAuthorization::Failed { .. } => {}
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let body = format!(
+        "The coordinator requested a squash merge for worker {id}: {}. An allowed user can authorize exactly this pull request by replying in this Agent Session with `merge {token}`. The coordinator must run `herdr-linear-agent worker merge {key} {id}` after the approval arrives. The default remains no merge without this explicit reply.",
+        worker.pr_url
+    );
+    let request = outbox::push_held(
+        &run,
+        &lock,
+        Op::activity(Activity::new(Content::Thought { body })),
+    )?;
+    if request.is_none() {
+        bail!("run {key} cannot request a merge while stopped, finished or awaiting a reply");
+    }
+    let pr_url = worker.pr_url.clone();
+    worker::update_held(&run, &lock, id, |worker| {
+        worker.merge_authorization = worker::MergeAuthorization::Waiting { token, pr_url };
+    })?;
+    ticker::poke(&ctx.state_dir());
+    println!("merge authorization requested for worker {id}");
+    Ok(())
+}
+
+/// Squash-merges only the PR recorded for a worker after a fresh allowed-user
+/// reply approved that exact URL.
+pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
+    let (config, run, record) = load_active(ctx, key).await?;
+    let team = config.team(&record.workspace, &record.team_key)?;
+    if !team.merge_on_authorization {
+        bail!("merge on authorization is not enabled for this team");
+    }
+    let (pr_url, user_id) = {
+        let lock = run.lock()?;
+        let current = run.record()?;
+        if current.status != Status::Active || current.stopped {
+            bail!("run {key} cannot merge while stopped");
+        }
+        if current.workflow.confirmed != Some(crate::run::WorkflowStage::InReview) {
+            bail!("run {key} can merge only after the issue reaches In Review");
+        }
+        let worker = worker::load(&run, id)?;
+        let (pr_url, user_id) = match &worker.merge_authorization {
+            worker::MergeAuthorization::Approved {
+                pr_url, user_id, ..
+            } if *pr_url == worker.pr_url && valid_pr_url(pr_url) => {
+                (pr_url.clone(), user_id.clone())
+            }
+            _ => bail!("worker {id} has no current authorization for its recorded pull request"),
+        };
+        worker::update_held(&run, &lock, id, |worker| {
+            worker.merge_authorization = worker::MergeAuthorization::Merging {
+                pr_url: pr_url.clone(),
+                user_id: user_id.clone(),
+            };
+        })?;
+        (pr_url, user_id)
+    };
+
+    let outcome = ctx
+        .runner
+        .run(&Cmd::new("gh", Duration::from_secs(120)).args(["pr", "merge", &pr_url, "--squash"]))
+        .await;
+    let message = match &outcome {
+        Ok(output) if output.success() => None,
+        Ok(output) => Some(format!("gh pr merge failed: {}", output.error_text())),
+        Err(error) => Some(format!("gh pr merge failed: {error:#}")),
+    };
+    let merged_at = files::now();
+    let update_message = message.clone();
+    let lock = run.lock()?;
+    worker::update_held(&run, &lock, id, |worker| {
+        if !matches!(
+            &worker.merge_authorization,
+            worker::MergeAuthorization::Merging { pr_url: current, .. } if current == &pr_url
+        ) {
+            return;
+        }
+        worker.merge_authorization = match &update_message {
+            Some(message) => worker::MergeAuthorization::Failed {
+                pr_url: pr_url.clone(),
+                message: message.clone(),
+            },
+            None => worker::MergeAuthorization::Merged {
+                pr_url: pr_url.clone(),
+                user_id: user_id.clone(),
+                at: merged_at,
+            },
+        };
+    })?;
+    if let Some(message) = message {
+        bail!("{message}; request fresh authorization before retrying")
+    }
+    run.update_held(&lock, |record| {
+        record.finished = false;
+        record.turn_complete = None;
+    })?;
+    outbox::push_held(
+        &run,
+        &lock,
+        Op::IssueState {
+            target: StateTarget::Workflow(crate::run::WorkflowStage::InDeploy),
+        },
+    )?;
+    crate::inbox::write_held(
+        &run,
+        &lock,
+        "merge",
+        id,
+        "The authorized worker pull request was merged; deployment work can continue.",
+    )?;
+    ticker::poke(&ctx.state_dir());
+    println!("worker {id}'s pull request was squash-merged after authorization");
+    Ok(())
+}
+
+fn valid_pr_url(url: &str) -> bool {
+    worker::pr_line(&format!("PR: {url}"))
+        .as_deref()
+        .is_some_and(|parsed| parsed == url)
 }
 
 /// Writes the brief into the new pane's worktree and records the placement.
@@ -685,10 +1024,44 @@ async fn reopen<H: Herdr>(
     ctx: &Ctx<'_>,
     config: &Config,
     session: &Session<H>,
+    run: &Run,
+    record: &RunRecord,
     w: &Worker,
     label: &str,
 ) -> Result<Placed> {
     let id = &w.id;
+    if let Some(shared) = &record.shared_space {
+        let snapshot = session.herdr.snapshot().await?;
+        let workers = worker::list(run);
+        let known_workspaces: Vec<_> = std::iter::once(&record.coordinator)
+            .chain(workers.iter().map(|worker| &worker.agent))
+            .map(|agent| agent.workspace_id.as_str())
+            .filter(|workspace| !workspace.is_empty())
+            .collect();
+        if let Some(pane) = snapshot.panes.values().find(|pane| {
+            known_workspaces.contains(&pane.workspace.0.as_str())
+                || pane.cwd.as_deref() == Some(shared.worktree_path.as_str())
+                || pane.foreground_cwd.as_deref() == Some(shared.worktree_path.as_str())
+        }) {
+            if let Some(existing) = empty_pane_in(&snapshot, &pane.workspace, &shared.worktree_path)
+            {
+                return Ok(existing);
+            }
+            return pane_split_recover(
+                &session.herdr,
+                &pane.id,
+                &pane.workspace,
+                &shared.worktree_path,
+            )
+            .await
+            .with_context(|| format!("could not split a pane in the shared space for {id}"));
+        }
+        return session
+            .herdr
+            .worktree_open(&shared.repo_path, &shared.worktree_path, label)
+            .await
+            .with_context(|| format!("could not open the shared worktree for {id}"));
+    }
     if !w.worktree_path.is_empty() {
         if !w.agent.workspace_id.is_empty() {
             // The checkout stays; a workspace that is already gone is fine.
@@ -788,6 +1161,7 @@ pub async fn worker_restart<H: Herdr>(
     // a worker the watcher leaves alone rather than one whose pane is gone.
     worker::update(&run, id, |w| {
         w.agent.recovery = crate::run::Recovery::None;
+        w.merge_authorization = worker::MergeAuthorization::None;
         w.restarting = true;
         w.gone_reported = false;
         w.agent.status = AgentStatus::Open;
@@ -798,7 +1172,22 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.last_group.clear();
         w.agent.blocked_reported = false;
     })?;
-    let placed = match reopen(ctx, &config, session, &w, &worker_label(&run, id)).await {
+    if record.shared_space.is_some() && !w.agent.pane_id.is_empty() {
+        let pane = herdr::PaneId(w.agent.pane_id.clone());
+        let _ = session.herdr.send_escape(&pane).await;
+        let _ = session.herdr.pane_close(&pane).await;
+    }
+    let placed = match reopen(
+        ctx,
+        &config,
+        session,
+        &run,
+        &record,
+        &w,
+        &worker_label(&run, id),
+    )
+    .await
+    {
         Ok(placed) => placed,
         Err(error) => {
             let message = format!("{error:#}");
@@ -1499,7 +1888,7 @@ mod tests {
                     body: "Opened the PR.".into()
                 })),
                 Op::IssueState {
-                    target: StateTarget::Review
+                    target: StateTarget::Workflow(crate::run::WorkflowStage::InReview)
                 }
             ]
         );

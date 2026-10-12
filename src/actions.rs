@@ -466,7 +466,16 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
             .collect();
         kinds.sort_unstable();
         kinds.dedup();
-        for program in kinds.into_iter().chain(["git"]) {
+        let mut programs: Vec<_> = kinds.into_iter().chain(["git"]).collect();
+        if config
+            .workspaces
+            .values()
+            .flat_map(|workspace| workspace.teams.values())
+            .any(|team| team.merge_on_authorization)
+        {
+            programs.push("gh");
+        }
+        for program in programs {
             if on_path(program) {
                 ok.push(format!("`{program}` found"));
             } else {

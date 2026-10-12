@@ -75,6 +75,20 @@ pub struct Team {
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
+    #[serde(default = "default_started_state")]
+    pub started_state: String,
+    #[serde(default = "default_deploy_state")]
+    pub deploy_state: String,
+    #[serde(default = "default_postmortem_state")]
+    pub postmortem_state: String,
+    #[serde(default = "default_done_state")]
+    pub done_state: String,
+    /// A repository whose runs use one shared worktree and Herdr space.
+    #[serde(default)]
+    pub single_space_repository: Option<String>,
+    /// Let an allowed user authorize a worker to squash-merge its recorded PR.
+    #[serde(default)]
+    pub merge_on_authorization: bool,
     /// The routing of this team's issues: a table under `routing`.
     pub routing: String,
 }
@@ -94,6 +108,22 @@ fn default_callback_port() -> u16 {
 
 fn default_review_state() -> String {
     "In Review".into()
+}
+
+fn default_started_state() -> String {
+    "In Progress".into()
+}
+
+fn default_deploy_state() -> String {
+    "In Deploy".into()
+}
+
+fn default_postmortem_state() -> String {
+    "In Postmortem".into()
+}
+
+fn default_done_state() -> String {
+    "Done".into()
 }
 
 fn default_linear_interval() -> u64 {
@@ -327,6 +357,17 @@ impl Config {
                     !team.review_state.trim().is_empty(),
                     "workspaces.{name}.teams.{key}.review_state is empty"
                 );
+                for (field, value) in [
+                    ("started_state", &team.started_state),
+                    ("deploy_state", &team.deploy_state),
+                    ("postmortem_state", &team.postmortem_state),
+                    ("done_state", &team.done_state),
+                ] {
+                    ensure!(
+                        !value.trim().is_empty(),
+                        "workspaces.{name}.teams.{key}.{field} is empty"
+                    );
+                }
             }
             for (key, seconds) in [
                 ("intake_interval_seconds", workspace.intake_interval_seconds),
@@ -477,6 +518,12 @@ impl Config {
                     "workspaces.{name}.teams.{key}.routing: there is no routing.{}",
                     team.routing
                 );
+                if let Some(repo) = &team.single_space_repository {
+                    ensure!(
+                        self.repositories.contains_key(repo),
+                        "workspaces.{name}.teams.{key}.single_space_repository: there is no repositories.{repo}"
+                    );
+                }
             }
         }
         Ok(())
@@ -767,6 +814,13 @@ workers = ["standard", "deep"]
             config.team("acme", "DATA").unwrap().review_state,
             "In Review"
         );
+        let team = config.team("acme", "DATA").unwrap();
+        assert_eq!(team.started_state, "In Progress");
+        assert_eq!(team.deploy_state, "In Deploy");
+        assert_eq!(team.postmortem_state, "In Postmortem");
+        assert_eq!(team.done_state, "Done");
+        assert_eq!(team.single_space_repository, None);
+        assert!(!team.merge_on_authorization);
         assert!(
             config
                 .team("acme", "WEB")
@@ -822,6 +876,22 @@ workers = ["standard", "deep"]
             "[workspaces.acme.teams.data]",
         );
         bad("client_id = \"client-123\"", "client_id = \" \"");
+        for field in [
+            "started_state",
+            "deploy_state",
+            "postmortem_state",
+            "done_state",
+        ] {
+            let error = bad(
+                "[workspaces.acme.teams.DATA]",
+                &format!("[workspaces.acme.teams.DATA]\n{field} = \" \""),
+            );
+            assert!(error.contains(&format!("{field} is empty")));
+        }
+        bad(
+            "routing = \"default\"",
+            "single_space_repository = \"missing\"\nrouting = \"default\"",
+        );
         bad("[workspaces.acme]", "[workspaces.Acme]");
         bad(
             "[workspaces.acme.teams.DATA]",

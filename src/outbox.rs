@@ -16,9 +16,9 @@ use crate::files;
 use crate::linear::ApiError;
 use crate::linear::api::{Activity, Content, ExternalUrl, IssueDetail};
 use crate::linear::client::LinearApi;
-use crate::run::{AwaitingReply, ResumeDecision, Run, RunLock, Status, WaitReason};
+use crate::run::{AwaitingReply, ResumeDecision, Run, RunLock, Status, WaitReason, WorkflowStage};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StateTarget {
     /// The team's first started state, unless the issue is already started,
@@ -27,6 +27,21 @@ pub enum StateTarget {
     /// The configured review state, unless the issue is already there,
     /// completed or canceled.
     Review,
+    Workflow(WorkflowStage),
+    Selected {
+        stage: WorkflowStage,
+        state_id: String,
+        expected_current_state_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateNames {
+    pub started: String,
+    pub review: String,
+    pub deploy: String,
+    pub postmortem: String,
+    pub done: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -173,7 +188,7 @@ pub fn push_held(run: &Run, lock: &RunLock, op: Op) -> Result<Option<String>> {
             if !terminal
                 && (record.status != crate::run::Status::Active
                     || record.stopped
-                    || record.finished
+                    || (record.finished && *wait_reason != Some(WaitReason::WorkflowState))
                     || record.awaiting_reply.is_some())
             {
                 if wait_reason.is_some() {
@@ -292,7 +307,7 @@ pub async fn send(
     run: &Run,
     session_id: &str,
     issue_id: &str,
-    review_state: &str,
+    state_names: &StateNames,
     linear: &impl LinearApi,
 ) -> Sent {
     let mut sent = Sent {
@@ -318,7 +333,7 @@ pub async fn send(
             run,
             session_id,
             issue_id,
-            review_state,
+            state_names,
             linear,
         )
         .await;
@@ -403,7 +418,7 @@ async fn send_one(
     run: &Run,
     session_id: &str,
     issue_id: &str,
-    review_state: &str,
+    state_names: &StateNames,
     linear: &impl LinearApi,
 ) -> Result<bool, ApiError> {
     if let Op::ResumeQuestion { token, .. } = &request.op {
@@ -486,7 +501,83 @@ async fn send_one(
         } => restore_session(run, issue_id, token, allowed_users, linear).await,
         Op::IssueState { target } => {
             let issue = linear.issue(issue_id).await?;
-            let Some(state_id) = target_state(&issue, *target, review_state)? else {
+            if let StateTarget::Selected {
+                stage,
+                state_id,
+                expected_current_state_id,
+            } = target
+            {
+                if matches!(issue.state.r#type.as_str(), "completed" | "canceled") {
+                    if issue.state.r#type == "completed" && *stage == WorkflowStage::Done {
+                        confirm_stage(run, *stage, Some(&issue.state.id))?;
+                    } else {
+                        clear_stage_choice(run, *stage)?;
+                    }
+                    return Ok(true);
+                }
+                if issue.state.id != *expected_current_state_id
+                    || !issue.team.states.iter().any(|state| state.id == *state_id)
+                    || (*stage == WorkflowStage::Done
+                        && !issue
+                            .team
+                            .states
+                            .iter()
+                            .any(|s| s.id == *state_id && s.r#type == "completed"))
+                {
+                    queue_state_question(run, &issue, *stage)?;
+                    return Ok(true);
+                }
+                if issue.state.id == *state_id {
+                    confirm_stage(run, *stage, Some(state_id))?;
+                    return Ok(true);
+                }
+                linear.set_issue_state(issue_id, state_id).await?;
+                if linear.issue(issue_id).await?.state.id != *state_id {
+                    return Err(ApiError::RequestFailed);
+                }
+                confirm_stage(run, *stage, Some(state_id))?;
+                return Ok(true);
+            }
+            let state_target = target.clone();
+            let Some(state_id) = (match target_state(&issue, state_target.clone(), state_names) {
+                Ok(state) => state,
+                Err(ApiError::Graphql(_)) => {
+                    if let StateTarget::Workflow(stage) = state_target {
+                        queue_state_question(run, &issue, stage)?;
+                        return Ok(true);
+                    }
+                    return Err(ApiError::Graphql(format!(
+                        "team {} has no configured Linear state",
+                        issue.team.key
+                    )));
+                }
+                Err(error) => return Err(error),
+            }) else {
+                if let StateTarget::Workflow(stage) = state_target {
+                    let matches_target = match stage {
+                        WorkflowStage::InProgress => {
+                            issue.state.name.eq_ignore_ascii_case(&state_names.started)
+                                && issue.state.r#type == "started"
+                        }
+                        WorkflowStage::InReview => {
+                            issue.state.name.eq_ignore_ascii_case(&state_names.review)
+                        }
+                        WorkflowStage::InDeploy => {
+                            issue.state.name.eq_ignore_ascii_case(&state_names.deploy)
+                        }
+                        WorkflowStage::InPostmortem => issue
+                            .state
+                            .name
+                            .eq_ignore_ascii_case(&state_names.postmortem),
+                        WorkflowStage::Done => {
+                            issue.state.name.eq_ignore_ascii_case(&state_names.done)
+                                && issue.state.r#type == "completed"
+                        }
+                    };
+                    if matches_target {
+                        confirm_stage(run, stage, None)?;
+                    }
+                }
                 return Ok(true);
             };
             linear.set_issue_state(issue_id, &state_id).await?;
@@ -494,11 +585,159 @@ async fn send_one(
             if linear.issue(issue_id).await?.state.id != state_id {
                 return Err(ApiError::RequestFailed);
             }
+            if let StateTarget::Workflow(stage) = state_target {
+                confirm_stage(run, stage, None)?;
+            }
             Ok(())
         }
     };
     outcome?;
     Ok(true)
+}
+
+fn confirm_stage(
+    run: &Run,
+    stage: WorkflowStage,
+    selected_state_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let lock = run.lock().map_err(|_| ApiError::Configuration)?;
+    run.update_held(&lock, |record| {
+        let entered_postmortem = stage == WorkflowStage::InPostmortem
+            && record.workflow.confirmed != Some(WorkflowStage::InPostmortem);
+        record.workflow.confirmed = Some(stage);
+        record.workflow.selected_state_id = selected_state_id.map(str::to_string);
+        if record
+            .workflow
+            .pending_choice
+            .as_ref()
+            .is_some_and(|choice| choice.stage == stage)
+        {
+            record.workflow.pending_choice = None;
+        }
+        if entered_postmortem
+            && !record.workflow.postmortem_succeeded
+            && record.postmortem_due.is_none()
+        {
+            record.postmortem_due = Some(crate::postmortem::Stage::Workflow);
+        }
+    })
+    .map(|_| ())
+    .map_err(|_| ApiError::Configuration)
+}
+
+fn clear_stage_choice(run: &Run, stage: WorkflowStage) -> Result<(), ApiError> {
+    let lock = run.lock().map_err(|_| ApiError::Configuration)?;
+    run.update_held(&lock, |record| {
+        let matches_choice = record
+            .workflow
+            .pending_choice
+            .as_ref()
+            .is_some_and(|choice| choice.stage == stage);
+        if matches_choice {
+            record.workflow.pending_choice = None;
+        }
+        if matches_choice
+            && record
+                .awaiting_reply
+                .as_ref()
+                .is_some_and(|wait| wait.reason == WaitReason::WorkflowState)
+        {
+            record.cleared_wait_id = record.awaiting_reply.take().unwrap().activity_id;
+        }
+    })
+    .map(|_| ())
+    .map_err(|_| ApiError::Configuration)
+}
+
+fn queue_state_question(
+    run: &Run,
+    issue: &IssueDetail,
+    stage: WorkflowStage,
+) -> Result<(), ApiError> {
+    let options: Vec<_> = issue
+        .team
+        .states
+        .iter()
+        .filter(|state| {
+            !matches!(state.r#type.as_str(), "completed" | "canceled")
+                || (stage == WorkflowStage::Done && state.r#type == "completed")
+        })
+        .map(|state| crate::run::WorkflowStateOption {
+            id: state.id.clone(),
+            name: state.name.clone(),
+        })
+        .collect();
+    let labels: Vec<_> = options
+        .iter()
+        .map(|option| (option.name.as_str(), option.id.as_str()))
+        .collect();
+    let stage_name = match stage {
+        WorkflowStage::InProgress => "In Progress",
+        WorkflowStage::InReview => "In Review",
+        WorkflowStage::InDeploy => "In Deploy",
+        WorkflowStage::InPostmortem => "In Postmortem",
+        WorkflowStage::Done => "Done",
+    };
+    let question = format!(
+        "The configured Linear state for {stage_name} is missing. Choose a state by its label or ID."
+    );
+    let mut activity = match Op::awaiting_reply(question, &labels, WaitReason::WorkflowState) {
+        Op::Activity { activity, .. } => activity,
+        _ => unreachable!(),
+    };
+    activity.ephemeral = false;
+    let lock = run.lock().map_err(|_| ApiError::Configuration)?;
+    let current = run.record().map_err(|_| ApiError::Configuration)?;
+    if current
+        .awaiting_reply
+        .is_some_and(|wait| wait.reason != WaitReason::WorkflowState)
+    {
+        return Err(ApiError::RequestFailed);
+    }
+    let mut should_ask = true;
+    run.update_held(&lock, |record| {
+        if record
+            .awaiting_reply
+            .as_ref()
+            .is_some_and(|wait| wait.reason == WaitReason::WorkflowState)
+            && record
+                .workflow
+                .pending_choice
+                .as_ref()
+                .is_some_and(|choice| {
+                    choice.stage == stage && choice.expected_current_state_id == issue.state.id
+                })
+        {
+            should_ask = false;
+            return;
+        }
+        if let Some(wait) = record.awaiting_reply.take()
+            && wait.reason == WaitReason::WorkflowState
+        {
+            record.cleared_wait_id = wait.activity_id;
+        }
+        record.workflow.pending_choice = Some(crate::run::WorkflowStateChoice {
+            stage,
+            expected_current_state_id: issue.state.id.clone(),
+            options: options.clone(),
+        });
+    })
+    .map_err(|_| ApiError::Configuration)?;
+    if should_ask {
+        let queued = push_held(
+            run,
+            &lock,
+            Op::Activity {
+                activity,
+                wait_reason: Some(WaitReason::WorkflowState),
+            },
+        )
+        .map_err(|_| ApiError::Configuration)?;
+        if queued.is_none() {
+            return Err(ApiError::RequestFailed);
+        }
+    }
+    Ok(())
 }
 
 fn mark_turn_complete_attempt_if_current(
@@ -717,7 +956,7 @@ fn clear_refused_wait(run: &Run, activity_id: &str) -> Result<bool, ApiError> {
 pub fn target_state(
     issue: &IssueDetail,
     target: StateTarget,
-    review_state: &str,
+    state_names: &StateNames,
 ) -> Result<Option<String>, ApiError> {
     let current = &issue.state;
     match target {
@@ -738,25 +977,44 @@ pub fn target_state(
                 ApiError::Graphql(format!("team {} has no started state", issue.team.key))
             })
         }
-        StateTarget::Review => {
-            if current.name.eq_ignore_ascii_case(review_state)
-                || matches!(current.r#type.as_str(), "completed" | "canceled")
-            {
-                return Ok(None);
-            }
-            let review = issue
-                .team
-                .states
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(review_state));
-            review.map(|s| Some(s.id.clone())).ok_or_else(|| {
-                ApiError::Graphql(format!(
-                    "team {} has no state named `{review_state}`",
-                    issue.team.key
-                ))
-            })
+        StateTarget::Review => named_state(issue, current, &state_names.review, None),
+        StateTarget::Workflow(stage) => {
+            let (name, expected_type) = match stage {
+                WorkflowStage::InProgress => (&state_names.started, Some("started")),
+                WorkflowStage::InReview => (&state_names.review, None),
+                WorkflowStage::InDeploy => (&state_names.deploy, None),
+                WorkflowStage::InPostmortem => (&state_names.postmortem, None),
+                WorkflowStage::Done => (&state_names.done, Some("completed")),
+            };
+            named_state(issue, current, name, expected_type)
+        }
+        StateTarget::Selected { .. } => {
+            unreachable!("selected targets are validated before resolution")
         }
     }
+}
+
+fn named_state(
+    issue: &IssueDetail,
+    current: &crate::linear::api::WorkflowState,
+    name: &str,
+    expected_type: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    if (current.name.eq_ignore_ascii_case(name) && expected_type.is_none())
+        || matches!(current.r#type.as_str(), "completed" | "canceled")
+    {
+        return Ok(None);
+    }
+    let state = issue.team.states.iter().find(|state| {
+        state.name.eq_ignore_ascii_case(name)
+            && expected_type.is_none_or(|expected| state.r#type == expected)
+    });
+    state.map(|state| Some(state.id.clone())).ok_or_else(|| {
+        ApiError::Graphql(format!(
+            "team {} has no state named `{name}`",
+            issue.team.key
+        ))
+    })
 }
 
 /// Parses the coordinator's Markdown checklist into Linear's plan: a list of
@@ -800,6 +1058,16 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::linear::api::fake::FakeLinear;
+
+    fn state_names() -> StateNames {
+        StateNames {
+            started: "In Progress".into(),
+            review: "In Review".into(),
+            deploy: "In Deploy".into(),
+            postmortem: "In Postmortem".into(),
+            done: "Done".into(),
+        }
+    }
     use crate::run::RunRecord;
 
     fn thought(body: &str) -> Op {
@@ -838,7 +1106,7 @@ mod tests {
             record.session_id.clear();
         })
         .unwrap();
-        let sent = send(&run, "", &issue, "In Review", &linear).await;
+        let sent = send(&run, "", &issue, &state_names(), &linear).await;
         assert!(sent.blocked.is_none());
         assert!(pending(&run).is_empty());
         assert_eq!(
@@ -869,7 +1137,7 @@ mod tests {
             },
         )
         .unwrap();
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.count, 4);
         assert!(sent.activity_sent && sent.blocked.is_none());
         assert!(pending(&run).is_empty());
@@ -896,10 +1164,10 @@ mod tests {
         let (_dir, run, linear, session, issue) = setup();
         push(&run, thought("once")).unwrap();
         linear.lock().unwrap().lose_next_response = true;
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
         assert!(pending(&run)[0].1.attempted);
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.count, 1);
         let fake = linear.lock().unwrap();
         assert_eq!(fake.sessions[0].sent("thought").len(), 1);
@@ -913,11 +1181,11 @@ mod tests {
             .unwrap()
             .unwrap();
         linear.lock().unwrap().lose_next_response = true;
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
         run.update(|r| r.awaiting_reply = None).unwrap();
 
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.count, 1, "the existing Linear activity is reconciled");
         assert!(pending(&run).is_empty());
         let fake = linear.lock().unwrap();
@@ -937,7 +1205,7 @@ mod tests {
         )
         .unwrap();
         linear.lock().unwrap().fail_next = Some(ApiError::RequestFailed);
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
         assert!(run.record().unwrap().turn_complete.is_some());
 
@@ -945,7 +1213,7 @@ mod tests {
         // be sent after its failed read-back.
         push(&run, thought("Continuing the investigation.")).unwrap();
         assert!(run.record().unwrap().turn_complete.is_none());
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.count, 2, "stale response is removed, new thought sent");
         assert!(pending(&run).is_empty());
         let fake = linear.lock().unwrap();
@@ -967,13 +1235,13 @@ mod tests {
         .unwrap();
         linear.lock().unwrap().lose_next_response = true;
 
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
         assert_eq!(
             run.record().unwrap().turn_complete.as_deref(),
             Some(id.as_str())
         );
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
 
         assert_eq!(sent.count, 1);
         assert!(sent.activity_sent);
@@ -1004,7 +1272,7 @@ mod tests {
         .unwrap();
         linear.lock().unwrap().fail_next = Some(ApiError::Graphql("invalid activity".into()));
 
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
 
         assert_eq!(sent.refused.len(), 1);
         assert!(run.record().unwrap().turn_complete.is_none());
@@ -1046,7 +1314,7 @@ mod tests {
             .unwrap()
             .unwrap();
         linear.lock().unwrap().fail_next = Some(ApiError::Graphql("invalid activity".into()));
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.refused.len(), 1);
         assert!(run.record().unwrap().awaiting_reply.is_none());
         assert!(
@@ -1070,13 +1338,13 @@ mod tests {
         let (_dir, run, linear, session, issue) = setup();
         push(&run, Op::elicitation("Proceed?", &[])).unwrap();
         linear.lock().unwrap().fail_next = Some(ApiError::RateLimited);
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RateLimited));
         assert!(run.record().unwrap().awaiting_reply.is_some());
         assert_eq!(pending(&run).len(), 1);
 
         linear.lock().unwrap().fail_next = Some(ApiError::RequestFailed);
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
         assert!(run.record().unwrap().awaiting_reply.is_some());
         assert_eq!(pending(&run).len(), 1);
@@ -1107,12 +1375,16 @@ mod tests {
         push(&run, thought("a")).unwrap();
         push(&run, thought("b")).unwrap();
         linear.lock().unwrap().fail_next = Some(ApiError::HttpStatus(503));
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!((sent.count, pending(&run).len()), (0, 2));
         // An attempted request whose send never reached Linear is read, then sent.
-        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.count, 2);
 
+        linear.lock().unwrap().issue_mut("DATA-1")["team"]["states"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|state| state["name"] != "In Review");
         push(
             &run,
             Op::IssueState {
@@ -1121,7 +1393,7 @@ mod tests {
         )
         .unwrap();
         push(&run, thought("after")).unwrap();
-        let sent = send(&run, &session, &issue, "Missing State", &linear).await;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
         assert_eq!(sent.refused.len(), 1);
         assert_eq!(sent.count, 1);
         assert!(
@@ -1139,13 +1411,13 @@ mod tests {
         let (_dir, _run, linear, _session, issue) = setup();
         let mut detail = linear.issue(&issue).await.unwrap();
         assert_eq!(
-            target_state(&detail, StateTarget::Started, "In Review")
+            target_state(&detail, StateTarget::Started, &state_names())
                 .unwrap()
                 .as_deref(),
             Some("state-progress")
         );
         assert_eq!(
-            target_state(&detail, StateTarget::Review, "in review")
+            target_state(&detail, StateTarget::Review, &state_names())
                 .unwrap()
                 .as_deref(),
             Some("state-review")
@@ -1158,11 +1430,11 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(
-            target_state(&detail, StateTarget::Started, "In Review").unwrap(),
+            target_state(&detail, StateTarget::Started, &state_names()).unwrap(),
             None
         );
         assert_eq!(
-            target_state(&detail, StateTarget::Review, "In Review").unwrap(),
+            target_state(&detail, StateTarget::Review, &state_names()).unwrap(),
             None
         );
         detail.state = detail
@@ -1173,9 +1445,94 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(
-            target_state(&detail, StateTarget::Review, "In Review").unwrap(),
+            target_state(&detail, StateTarget::Review, &state_names()).unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_workflow_state_persists_a_correlated_choice_question() {
+        let (_dir, run, linear, session, issue) = setup();
+        linear.lock().unwrap().issue_mut("DATA-1")["team"]["states"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|state| state["name"] != "In Review");
+        push(
+            &run,
+            Op::IssueState {
+                target: StateTarget::Workflow(WorkflowStage::InReview),
+            },
+        )
+        .unwrap();
+
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
+
+        assert!(sent.blocked.is_none());
+        let record = run.record().unwrap();
+        let choice = record.workflow.pending_choice.unwrap();
+        assert_eq!(choice.stage, WorkflowStage::InReview);
+        assert_eq!(choice.expected_current_state_id, "state-todo");
+        assert!(
+            choice
+                .options
+                .iter()
+                .any(|option| option.id == "state-progress")
+        );
+        assert_eq!(
+            record.awaiting_reply.unwrap().reason,
+            crate::run::WaitReason::WorkflowState
+        );
+        assert_eq!(pending(&run).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_canceled_issue_does_not_confirm_a_pending_done_choice() {
+        let (_dir, run, linear, session, issue) = setup();
+        let canceled = linear.lock().unwrap().issue("DATA-1")["team"]["states"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["type"] == "canceled")
+            .unwrap()
+            .clone();
+        linear.lock().unwrap().issue_mut("DATA-1")["state"] = canceled;
+        run.update(|record| {
+            record.workflow.confirmed = Some(WorkflowStage::InPostmortem);
+            record.workflow.pending_choice = Some(crate::run::WorkflowStateChoice {
+                stage: WorkflowStage::Done,
+                expected_current_state_id: "state-todo".into(),
+                options: vec![crate::run::WorkflowStateOption {
+                    id: "state-done".into(),
+                    name: "Done".into(),
+                }],
+            });
+            record.awaiting_reply = Some(AwaitingReply {
+                activity_id: "choice-question".into(),
+                asked_at: "2026-10-12T00:00:00Z".into(),
+                reason: WaitReason::WorkflowState,
+            });
+        })
+        .unwrap();
+        push(
+            &run,
+            Op::IssueState {
+                target: StateTarget::Selected {
+                    stage: WorkflowStage::Done,
+                    state_id: "state-done".into(),
+                    expected_current_state_id: "state-todo".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
+
+        assert!(sent.blocked.is_none());
+        assert!(pending(&run).is_empty());
+        let record = run.record().unwrap();
+        assert_eq!(record.workflow.confirmed, Some(WorkflowStage::InPostmortem));
+        assert!(record.workflow.pending_choice.is_none());
+        assert!(record.awaiting_reply.is_none());
     }
 
     #[test]
@@ -1252,9 +1609,9 @@ mod tests {
                 }
                 fake.lose_next_response = true;
             }
-            let first = send(&run, "", &issue, "In Review", &linear).await;
+            let first = send(&run, "", &issue, &state_names(), &linear).await;
             assert_eq!(first.blocked, Some(ApiError::RequestFailed));
-            let second = send(&run, "", &issue, "In Review", &linear).await;
+            let second = send(&run, "", &issue, &state_names(), &linear).await;
             assert!(second.blocked.is_none());
             assert!(second.refused.is_empty());
             assert_eq!(
@@ -1303,7 +1660,7 @@ mod tests {
                     approval["body"] = json!("I withdraw my approval.");
                 }
             }
-            let sent = send(&run, "", &issue, "In Review", &linear).await;
+            let sent = send(&run, "", &issue, &state_names(), &linear).await;
             assert_eq!(sent.refused.len(), 1);
             assert_eq!(
                 linear
@@ -1342,7 +1699,9 @@ mod tests {
                 fake.lose_next_response = true;
             }
             assert_eq!(
-                send(&run, "", &issue, "In Review", &linear).await.blocked,
+                send(&run, "", &issue, &state_names(), &linear)
+                    .await
+                    .blocked,
                 Some(ApiError::RequestFailed)
             );
             {
@@ -1354,7 +1713,7 @@ mod tests {
                         Some("2026-10-09T05:30:14Z".into());
                 }
             }
-            let sent = send(&run, "", &issue, "In Review", &linear).await;
+            let sent = send(&run, "", &issue, &state_names(), &linear).await;
             assert_eq!(sent.refused.len(), 1);
             assert_eq!(
                 linear
@@ -1412,7 +1771,7 @@ mod tests {
             r.resume_request = None;
         })
         .unwrap();
-        let sent = send(&run, "", &issue, "In Review", &linear).await;
+        let sent = send(&run, "", &issue, &state_names(), &linear).await;
         assert!(sent.blocked.is_none() && sent.refused.is_empty());
         assert_eq!(
             linear
