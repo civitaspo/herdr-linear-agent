@@ -6,13 +6,13 @@ use anyhow::Result;
 use jiff::Timestamp;
 
 use super::reconcile::{
-    AgentKey, DETECTION_GRACE, Deps, Effect, EffectDone, MAX_LAUNCH_ATTEMPTS, Placement,
-    Reconciler, error_activity, update_run,
+    AgentKey, DETECTION_GRACE, Deps, Effect, EffectDone, MAX_LAUNCH_ATTEMPTS, Reconciler,
+    error_activity, update_run,
 };
 use crate::config::Config;
 use crate::herdr::{Herdr, HerdrError, PaneId, Placed, Snapshot};
 use crate::run::{AgentRecord, AgentStatus, Run, RunRecord, Status};
-use crate::{agents, claude_trust, commands, coordinator, worker};
+use crate::{agents, claude_trust, coordinator, worker};
 
 /// The session a start begins: the recorded one for a resume, a new id the
 /// plugin picks for Claude, and else none yet (the kind picks its own, found
@@ -47,7 +47,7 @@ fn start_args(config: &Config, record: &AgentRecord, session: &str) -> Result<Ve
 }
 
 /// Sets a placed coordinator open in its root pane, ready to be started.
-pub(super) fn place_coordinator(record: &mut RunRecord, placed: &Placed) {
+fn place_coordinator(record: &mut RunRecord, placed: &Placed) {
     let c = &mut record.coordinator;
     c.placed(placed);
     c.last_state.clear();
@@ -151,14 +151,11 @@ impl Reconciler {
         d: &Deps<'_, H>,
         run: &Run,
         key: &AgentKey,
-        result: Result<Placement, HerdrError>,
+        result: Result<Placed, HerdrError>,
         now: Timestamp,
     ) -> Result<()> {
         match result {
-            Ok(placement) => {
-                let placed = placement.placed.clone();
-                let shared_space = placement.shared_space.clone();
-                let shared_layout = run.record()?.shared_space.is_some();
+            Ok(placed) => {
                 let found = placed.clone();
                 // Decided under the lock: the run may have moved on while
                 // the workspace was created.
@@ -170,26 +167,12 @@ impl Reconciler {
                         {
                             return Ok((false, Vec::new()));
                         }
-                        run.update_held(lock, |r| {
-                            if let Some(shared_space) = &shared_space {
-                                r.shared_space = Some(shared_space.clone());
-                            }
-                            place_coordinator(r, &found);
-                        })?;
+                        run.update_held(lock, |r| place_coordinator(r, &found))?;
                         Ok((true, Vec::new()))
                     })
                     .await?;
                 if !applied {
-                    if shared_layout {
-                        let _ = d.herdr.pane_close(&placed.pane).await;
-                        if let Some(pane) = placement.close_pane {
-                            let _ = d.herdr.pane_close(&pane).await;
-                        }
-                    } else {
-                        let _ = d.herdr.workspace_close(&placed.workspace).await;
-                    }
-                } else if let Some(pane) = placement.close_pane {
-                    let _ = d.herdr.pane_close(&pane).await;
+                    let _ = d.herdr.workspace_close(&placed.workspace).await;
                 }
                 Ok(())
             }
@@ -778,19 +761,10 @@ impl Reconciler {
 
         let record = run.record()?;
         let workers = worker::list(run);
-        let mut coordinator_trusted = vec![
-            record.coordinator.cwd.clone(),
-            run.canonical_dir().to_string_lossy().into_owned(),
-        ];
-        if let Some(shared) = &record.shared_space
-            && !shared.worktree_path.is_empty()
-        {
-            coordinator_trusted.push(shared.worktree_path.clone());
-        }
         let mut candidates: Vec<(AgentKey, AgentRecord, Vec<String>)> = vec![(
             coordinator_key,
             record.coordinator.clone(),
-            coordinator_trusted,
+            vec![run.canonical_dir().to_string_lossy().into_owned()],
         )];
         candidates.extend(workers.iter().map(|w| {
             (
@@ -838,12 +812,7 @@ impl Reconciler {
         coordinator::write_priming(run, record, &self.bin, instructions)?;
         let cwd = run.canonical_dir().to_string_lossy().into_owned();
         let label = coordinator::workspace_label(record);
-        if record
-            .shared_space
-            .as_ref()
-            .is_none_or(|shared| !shared.worktree_path.is_empty())
-            && let Some(found) = placed_before(snapshot, &record.coordinator, &cwd)
-        {
+        if let Some(found) = placed_before(snapshot, &record.coordinator, &cwd) {
             update_run(run, move |r| {
                 if r.coordinator.status == AgentStatus::Pending {
                     place_coordinator(r, &found);
@@ -859,82 +828,8 @@ impl Reconciler {
         self.not_sent.remove(&key);
         self.in_flight.insert(key.clone(), Effect::Place);
         let (herdr, done) = (d.herdr.clone(), self.effects.clone());
-        let shared = record.shared_space.clone();
-        let workers = worker::list(run);
-        let parent = shared.as_ref().and_then(|shared| {
-            let workspace_ids: Vec<_> = std::iter::once(&record.coordinator)
-                .chain(workers.iter().map(|worker| &worker.agent))
-                .map(|agent| agent.workspace_id.as_str())
-                .filter(|workspace| !workspace.is_empty())
-                .collect();
-            snapshot
-                .panes
-                .values()
-                .find(|pane| {
-                    workspace_ids.contains(&pane.workspace.0.as_str())
-                        || pane.cwd.as_deref() == Some(shared.worktree_path.as_str())
-                        || pane.foreground_cwd.as_deref() == Some(shared.worktree_path.as_str())
-                })
-                .map(|pane| pane.id.clone())
-        });
-        let runner = d.ctx.runner.clone_box();
-        let run = run.clone();
-        let snapshot = snapshot.clone();
         tokio::spawn(async move {
-            let result = match shared {
-                Some(shared) if shared.worktree_path.is_empty() => commands::prepare_shared_space(
-                    runner.as_ref(),
-                    &herdr,
-                    &run,
-                    &snapshot,
-                    &shared,
-                )
-                .await
-                .map(|(shared_space, placed, close_pane)| Placement {
-                    placed,
-                    shared_space: Some(shared_space),
-                    close_pane,
-                }),
-                Some(shared) if !shared.worktree_path.is_empty() => {
-                    if let Some(parent) = parent {
-                        herdr.pane_split(&parent, &cwd).await.map(|mut placed| {
-                            placed.worktree_path = Some(shared.worktree_path);
-                            Placement {
-                                placed,
-                                shared_space: None,
-                                close_pane: None,
-                            }
-                        })
-                    } else {
-                        match herdr
-                            .worktree_open(&shared.repo_path, &shared.worktree_path, &label)
-                            .await
-                        {
-                            Ok(root) => match herdr.pane_split(&root.pane, &cwd).await {
-                                Ok(mut placed) => {
-                                    placed.worktree_path = Some(shared.worktree_path);
-                                    Ok(Placement {
-                                        placed,
-                                        shared_space: None,
-                                        close_pane: Some(root.pane),
-                                    })
-                                }
-                                Err(error) => Err(error),
-                            },
-                            Err(error) => Err(error),
-                        }
-                    }
-                }
-                Some(_) => unreachable!("the empty shared-space case is handled above"),
-                None => herdr
-                    .workspace_create(&cwd, &label)
-                    .await
-                    .map(|placed| Placement {
-                        placed,
-                        shared_space: None,
-                        close_pane: None,
-                    }),
-            };
+            let result = herdr.workspace_create(&cwd, &label).await;
             let _ = done.send(EffectDone::Placed { key, result }).await;
         });
         Ok(())

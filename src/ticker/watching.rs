@@ -490,7 +490,6 @@ impl Reconciler {
                     url: review_url,
                 });
                 next.pr_url = url;
-                next.merge_authorization = worker::MergeAuthorization::None;
             }
         }
         if worker::needs_person(&next.agent, &live) && !next.agent.blocked_reported {
@@ -543,7 +542,6 @@ impl Reconciler {
                     }
                     changed!(report_hash);
                     changed!(pr_url);
-                    changed!(merge_authorization);
                     changed!(gone_reported);
                     changed!(activity);
                     changed!(activity_since);

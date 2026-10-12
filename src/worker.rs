@@ -47,8 +47,6 @@ pub struct Worker {
     /// The hash of the report the coordinator was told about.
     pub announced_report_hash: String,
     pub pr_url: String,
-    /// A per-PR request and one-time authorization for a squash merge.
-    pub merge_authorization: MergeAuthorization,
     /// The "lost its pane before a report" error was sent.
     pub gone_reported: bool,
     /// The activity of the worker's own progress record last sent to
@@ -61,35 +59,6 @@ pub struct Worker {
     pub created: String,
     pub updated: String,
     pub agent: AgentRecord,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum MergeAuthorization {
-    #[default]
-    None,
-    Waiting {
-        token: String,
-        pr_url: String,
-    },
-    Approved {
-        token: String,
-        pr_url: String,
-        user_id: String,
-    },
-    Merging {
-        pr_url: String,
-        user_id: String,
-    },
-    Merged {
-        pr_url: String,
-        user_id: String,
-        at: String,
-    },
-    Failed {
-        pr_url: String,
-        message: String,
-    },
 }
 
 impl Worker {
@@ -218,27 +187,6 @@ pub fn branch_name(key: &str, id: &str, title: &str) -> String {
     } else {
         format!("herdr-linear-agent/{key}/{id}-{slug}")
     }
-}
-
-/// Linear branch names are external input; only pass conservative Git ref
-/// names through to Herdr, and fall back to the plugin's own slug otherwise.
-pub fn valid_branch_name(branch: &str) -> bool {
-    !branch.is_empty()
-        && branch.len() <= 240
-        && !branch.starts_with('-')
-        && !branch.starts_with('/')
-        && !branch.ends_with('/')
-        && !branch.ends_with('.')
-        && !branch.contains("..")
-        && !branch.contains("@{")
-        && branch.split('/').all(|part| {
-            !part.is_empty()
-                && !part.starts_with('.')
-                && !part.ends_with(".lock")
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        })
 }
 
 /// The worker's brief folder, `<worktree>/.herdr-linear-agent/<workspace>-<KEY>-<id>`.
@@ -1194,7 +1142,6 @@ last_group = "waiting"
         assert_eq!(worker.restarts, 1);
         assert_eq!(worker.pr_url, "https://github.com/acme/api/pull/7");
         assert_eq!(worker.announced_report_hash, "");
-        assert_eq!(worker.merge_authorization, MergeAuthorization::None);
         assert!(!worker.gone_reported);
         assert_eq!(worker.agent.status, AgentStatus::Open);
         assert_eq!(worker.agent.pane_id, "w1:p1");
@@ -1297,30 +1244,6 @@ last_group = "waiting"
         for (case, seen, ours) in table {
             let found = find_agent(&record, std::slice::from_ref(&seen));
             assert_eq!(found.is_some(), ours, "{case}");
-        }
-    }
-
-    #[test]
-    fn branch_names_from_linear_must_be_safe_git_refs() {
-        for branch in [
-            "feature/login",
-            "herdr-linear-agent/acme/data-1/shared-fix-login",
-        ] {
-            assert!(valid_branch_name(branch), "{branch}");
-        }
-        for branch in [
-            "",
-            "-main",
-            "/main",
-            "main/",
-            "main..other",
-            "main@{1}",
-            "main/.hidden",
-            "main/ends.lock",
-            "main/space name",
-            "main\\unsafe",
-        ] {
-            assert!(!valid_branch_name(branch), "{branch}");
         }
     }
 

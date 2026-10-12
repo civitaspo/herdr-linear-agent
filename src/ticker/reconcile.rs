@@ -33,7 +33,7 @@ use crate::linear::api::{Activity, Content};
 use crate::linear::task::{Decline, Levels, LinearEvent, RunQuery};
 use crate::outbox::{self, Op};
 use crate::paths::Ctx;
-use crate::run::{AgentRecord, AgentStatus, Run, RunLock, RunRecord, SharedSpace, Status};
+use crate::run::{AgentRecord, AgentStatus, Run, RunLock, RunRecord, Status};
 use crate::worker::{self, Live, Worker};
 use crate::{coordinator, inbox, progress, transcript};
 
@@ -124,7 +124,7 @@ impl AgentKey {
 pub enum EffectDone {
     Placed {
         key: AgentKey,
-        result: Result<Placement, HerdrError>,
+        result: Result<Placed, HerdrError>,
     },
     Started {
         key: AgentKey,
@@ -132,14 +132,6 @@ pub enum EffectDone {
         recovery_id: Option<String>,
         result: Result<(), HerdrError>,
     },
-}
-
-/// A placement may also finish preparing the run's opt-in shared space.
-#[derive(Debug)]
-pub struct Placement {
-    pub placed: Placed,
-    pub shared_space: Option<SharedSpace>,
-    pub close_pane: Option<PaneId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,20 +659,14 @@ impl Reconciler {
                 let undecided = active
                     && record.coordinator.profile.is_empty()
                     && !self.routing.contains(&run.key);
-                let team = d.config.team(&record.workspace, &record.team_key).ok();
-                let state_names = crate::outbox::StateNames {
-                    started: team.map_or_else(|| "In Progress".into(), |t| t.started_state.clone()),
-                    review: team.map_or_else(|| "In Review".into(), |t| t.review_state.clone()),
-                    deploy: team.map_or_else(|| "In Deploy".into(), |t| t.deploy_state.clone()),
-                    postmortem: team
-                        .map_or_else(|| "In Postmortem".into(), |t| t.postmortem_state.clone()),
-                    done: team.map_or_else(|| "Done".into(), |t| t.done_state.clone()),
-                };
-                let review_state = state_names.review.clone();
+                // A team no longer in the config keeps the default review state.
+                let review_state = d
+                    .config
+                    .team(&record.workspace, &record.team_key)
+                    .map_or_else(|_| "In Review".to_string(), |t| t.review_state.clone());
                 Some(RunQuery {
                     key: run.key.clone(),
                     review_state,
-                    state_names,
                     issue_id: record.issue_id,
                     run_dir: run.dir.clone(),
                     session_id: if let Some(request) = &record.resume_request {

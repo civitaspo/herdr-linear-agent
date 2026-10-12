@@ -112,39 +112,6 @@ pub enum WaitReason {
     CoordinatorQuestion,
     RunTimeout,
     CoordinatorLost,
-    WorkflowState,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowStage {
-    InProgress,
-    InReview,
-    InDeploy,
-    InPostmortem,
-    Done,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default)]
-pub struct WorkflowProgress {
-    pub confirmed: Option<WorkflowStage>,
-    pub selected_state_id: Option<String>,
-    pub pending_choice: Option<WorkflowStateChoice>,
-    pub postmortem_succeeded: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowStateChoice {
-    pub stage: WorkflowStage,
-    pub expected_current_state_id: String,
-    pub options: Vec<WorkflowStateOption>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowStateOption {
-    pub id: String,
-    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,11 +295,6 @@ pub struct RunRecord {
     pub issue_updated_at: String,
     /// A hash of the snapshot parts a person edits (not the state).
     pub issue_hash: String,
-    pub issue_state: String,
-    pub issue_state_id: String,
-    /// The shared checkout used by coordinator and workers when this team
-    /// opts into a single-space run.
-    pub shared_space: Option<SharedSpace>,
     /// Where the coordinator profile came from: the routing agent or the
     /// default, with the reason.
     pub routing_source: String,
@@ -377,24 +339,11 @@ pub struct RunRecord {
     pub announce_pending: bool,
     /// Sent by the next pass that has a snapshot.
     pub interrupt: Option<Interrupt>,
-    /// A postmortem the ticker writes next: workflow after deployment,
-    /// final when the run closes, or interim for old records.
+    /// A postmortem the ticker writes next: interim after `finish`, final
+    /// when the run closes (which replaces an interim one not written yet).
     pub postmortem_due: Option<crate::postmortem::Stage>,
-    #[serde(default)]
-    pub workflow: WorkflowProgress,
     /// The workflow state the issue was in when the run closed.
     pub closed_state: String,
-}
-
-/// The one checkout shared by every agent in an opt-in single-space run.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default)]
-pub struct SharedSpace {
-    pub repo: String,
-    pub repo_path: String,
-    pub base: String,
-    pub branch: String,
-    pub worktree_path: String,
 }
 
 #[derive(Debug, Clone)]

@@ -65,8 +65,6 @@ struct Model {
     /// The next placement (`workspace.create`, `worktree.create`,
     /// `worktree.open`) does its work, then answers `OutcomeUnknown`.
     placement_unknown: bool,
-    /// The next `pane.split` does its work, then answers `OutcomeUnknown`.
-    split_unknown: bool,
     /// The next `agent.prompt` is delivered, then answers `OutcomeUnknown`.
     prompt_unknown: bool,
     /// The next `agent.start` fails as `NotSent` without doing anything.
@@ -297,10 +295,6 @@ impl FakeHerdr {
         self.model().placement_unknown = true;
     }
 
-    pub fn next_split_unknown(&self) {
-        self.model().split_unknown = true;
-    }
-
     pub fn next_prompt_unknown(&self) {
         self.model().prompt_unknown = true;
     }
@@ -453,50 +447,6 @@ impl Herdr for FakeHerdr {
         }
         let pane = model.new_workspace(path, label);
         model.placed(pane, Some(path.into()))
-    }
-
-    async fn pane_split(&self, target: &PaneId, cwd: &str) -> Result<Placed, HerdrError> {
-        let mut model = self.model();
-        model.request("pane.split")?;
-        let Some(parent) = model.panes.get(target).cloned() else {
-            return Err(not_found("pane", &target.0));
-        };
-        let next = model
-            .panes
-            .keys()
-            .filter(|pane| pane.0.starts_with(&format!("{}:p", parent.workspace.0)))
-            .filter_map(|pane| pane.0.rsplit_once(":p")?.1.parse::<u32>().ok())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let pane = Pane {
-            id: PaneId(format!("{}:p{next}", parent.workspace.0)),
-            workspace: parent.workspace,
-            tab: parent.tab,
-            terminal: format!("term-{}-{next}", target.0),
-            cwd: Some(cwd.into()),
-            foreground_cwd: Some(cwd.into()),
-            label: None,
-        };
-        model.panes.insert(pane.id.clone(), pane.clone());
-        if model.pane_lag > 0 {
-            let lag = model.pane_lag;
-            model.hidden_panes.insert(pane.id.clone(), lag);
-        }
-        if std::mem::take(&mut model.split_unknown) {
-            return Err(HerdrError::OutcomeUnknown("no answer in time".into()));
-        }
-        model.placed(pane, Some(cwd.into()))
-    }
-
-    async fn pane_close(&self, pane: &PaneId) -> Result<(), HerdrError> {
-        let mut model = self.model();
-        model.request("pane.close")?;
-        if model.panes.remove(pane).is_none() {
-            return Err(not_found("pane", &pane.0));
-        }
-        model.agents.remove(pane);
-        Ok(())
     }
 
     async fn agent_start(

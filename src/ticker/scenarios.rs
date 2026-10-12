@@ -11,7 +11,6 @@ use crate::herdr::PaneId;
 use crate::linear::api::fake::APP_USER;
 use crate::linear::api::{IssueStatus, RunUpdate};
 use crate::linear::task::{DECLINED, LinearEvent};
-use crate::process::fake::ok;
 use crate::run::{AgentStatus, Recovery, Status, WaitReason};
 use crate::{inbox, worker};
 
@@ -141,88 +140,6 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
         (world.herdr.starts().len(), world.sessions()),
         (1, 1),
         "claimed once"
-    );
-}
-
-#[tokio::test]
-async fn an_opt_in_single_space_run_shares_its_worktree_and_workspace_with_its_worker() {
-    let mut world = World::with(|config| {
-        config.replace(
-            "allowed_user_ids = [\"user-1\"]\nrouting = \"default\"",
-            "allowed_user_ids = [\"user-1\"]\nsingle_space_repository = \"api\"\nrouting = \"default\"",
-        )
-    });
-    let coordinator_pane = world.running_issue().await;
-    let run = world.run(KEY);
-    let record = world.record(KEY);
-    let shared = record.shared_space.clone().expect("shared-space setting");
-    assert_eq!(record.coordinator.pane_id, coordinator_pane);
-    assert_eq!(
-        record.coordinator.cwd,
-        run.canonical_dir().to_string_lossy()
-    );
-    assert_eq!(shared.repo, "api");
-    assert!(!shared.branch.is_empty());
-    assert!(!shared.worktree_path.is_empty());
-    assert_eq!(world.herdr.worktrees().len(), 1);
-    let requests = world.herdr.requests();
-    assert!(!requests.contains(&"workspace.create".into()));
-    assert_eq!(count(&requests, "worktree.create"), 1);
-    assert_eq!(count(&requests, "pane.split"), 1);
-    assert_eq!(count(&requests, "pane.close"), 1);
-
-    world.herdr.next_split_unknown();
-    let worker = world.start_worker("api").await;
-    assert_eq!(worker.branch, shared.branch);
-    assert_eq!(worker.worktree_path, shared.worktree_path);
-    assert_eq!(worker.agent.cwd, shared.worktree_path);
-    assert_eq!(worker.agent.workspace_id, record.coordinator.workspace_id);
-    assert_eq!(
-        world
-            .herdr
-            .panes()
-            .iter()
-            .filter(|pane| {
-                pane.workspace.0 == record.coordinator.workspace_id
-                    && pane.cwd.as_deref() == Some(shared.worktree_path.as_str())
-            })
-            .count(),
-        1,
-        "the lost pane.split answer is adopted"
-    );
-
-    let error = commands::worker_start(
-        &world.ctx(),
-        &world.session(),
-        KEY,
-        &request("web", "standard", "Change the web client"),
-    )
-    .await
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("this run shares `api`"), "{error}");
-
-    let restarted = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
-        .await
-        .unwrap();
-    assert_eq!(restarted.worktree_path, shared.worktree_path);
-    assert_eq!(
-        restarted.agent.workspace_id,
-        record.coordinator.workspace_id
-    );
-    assert_eq!(
-        world.herdr.worktrees().len(),
-        1,
-        "restart reuses the checkout"
-    );
-
-    world.move_issue(KEY, "Done");
-    world.later(5);
-    world.settle().await;
-    assert_eq!(
-        world.herdr.closed().len(),
-        1,
-        "the shared workspace closes once"
     );
 }
 
@@ -1680,28 +1597,6 @@ fn postmortem_method(world: &mut World, pick: &str, answer: &str) {
     world.fake().labels = vec!["Improvement".into(), "postmortem/rework".into()];
 }
 
-fn add_deploy_states(world: &World) {
-    let mut linear = world.fake_for(KEY);
-    let states = linear.issue_mut("DATA-1")["team"]["states"]["nodes"]
-        .as_array_mut()
-        .unwrap();
-    states.push(json!({"id":"state-deploy","name":"In Deploy","type":"started","position":6.0}));
-    states.push(
-        json!({"id":"state-postmortem","name":"In Postmortem","type":"started","position":7.0}),
-    );
-}
-
-async fn enter_deploy(world: &mut World) {
-    add_deploy_states(world);
-    world.move_issue(KEY, "In Deploy");
-    world.later(5);
-    world.settle().await;
-    assert_eq!(
-        world.record(KEY).workflow.confirmed,
-        Some(crate::run::WorkflowStage::InDeploy)
-    );
-}
-
 fn version_of(world: &World, name: &str) -> String {
     crate::postmortem::Method::new(
         name,
@@ -1733,20 +1628,11 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
         .await
         .unwrap();
     world.settle().await;
-    assert!(
-        posted(&world).is_empty(),
-        "review does not schedule a postmortem"
-    );
-    enter_deploy(&mut world).await;
-    commands::finish(&world.ctx(), &world.session(), KEY, "Deployment complete.")
-        .await
-        .unwrap();
-    world.settle().await;
     let version = version_of(&world, "review");
     assert_eq!(
         posted(&world),
         [format!(
-            "**Postmortem (workflow)**, method `review` version `{version}`\n\nIt went well."
+            "**Postmortem (interim)**, method `review` version `{version}`\n\nIt went well."
         )]
     );
     let labels: Vec<String> = world.fake().issue("DATA-1")["labels"]["nodes"]
@@ -1761,21 +1647,32 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
         "a label outside the method's list is dropped"
     );
 
+    world.move_issue(KEY, "Canceled");
+    world.later(5);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
     let comments = posted(&world);
-    assert_eq!(
-        comments.len(),
-        1,
-        "Done does not schedule a duplicate postmortem"
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1].starts_with("**Postmortem (final)**"),
+        "{comments:?}"
     );
-    assert_eq!(world.record(KEY).closed_state, "Done");
+    assert_eq!(world.record(KEY).closed_state, "Canceled");
     assert_eq!(world.record(KEY).postmortem_due, None);
     let kept = std::fs::read_dir(world.run(KEY).state_dir().join("postmortems"))
         .unwrap()
         .count();
-    assert_eq!(kept, 1);
+    assert_eq!(kept, 2);
     let log = world.log_text();
     assert!(
-        log.contains("acme/DATA-1: wrote the workflow postmortem"),
+        log.contains("acme/DATA-1: wrote the interim postmortem"),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "acme/DATA-1: wrote the final postmortem with the `review` profile (the only candidate)"
+        ),
         "{log}"
     );
 }
@@ -1812,15 +1709,10 @@ async fn a_routing_with_one_candidate_each_asks_no_routing_agent() {
         .await
         .unwrap();
     world.settle().await;
-    enter_deploy(&mut world).await;
-    commands::finish(&world.ctx(), &world.session(), KEY, "Deployment complete.")
-        .await
-        .unwrap();
-    world.settle().await;
     assert_eq!(posted(&world).len(), 1);
     let log = world.log_text();
     assert!(
-        log.contains("acme/DATA-1: wrote the workflow postmortem with the `review` profile (the only candidate)"),
+        log.contains("acme/DATA-1: wrote the interim postmortem with the `review` profile (the only candidate)"),
         "{log}"
     );
 }
@@ -1835,23 +1727,17 @@ async fn the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes()
         .await
         .unwrap();
     world.settle().await;
-    assert!(posted(&world).is_empty());
-    enter_deploy(&mut world).await;
-    commands::finish(&world.ctx(), &world.session(), KEY, "Deployment complete.")
-        .await
-        .unwrap();
-    world.settle().await;
     let version = version_of(&world, "quick");
     assert_eq!(
         posted(&world),
         [format!(
-            "**Postmortem (workflow)**, method `quick` version `{version}`\n\nShort."
+            "**Postmortem (interim)**, method `quick` version `{version}`\n\nShort."
         )]
     );
     let log = world.log_text();
     assert!(
         log.contains(
-            "wrote the workflow postmortem with the `quick` profile (chosen by the routing agent)"
+            "wrote the interim postmortem with the `quick` profile (chosen by the routing agent)"
         ),
         "{log}"
     );
@@ -1866,58 +1752,17 @@ async fn a_failed_postmortem_is_logged_and_not_tried_again() {
         .await
         .unwrap();
     world.settle().await;
-    assert_eq!(world.record(KEY).postmortem_due, None);
-    enter_deploy(&mut world).await;
-    commands::finish(&world.ctx(), &world.session(), KEY, "Deployment complete.")
-        .await
-        .unwrap();
-    world.settle().await;
     world.later(5);
     world.settle().await;
     assert!(posted(&world).is_empty());
     assert_eq!(world.record(KEY).postmortem_due, None);
     let log = world.log_text();
     assert_eq!(
-        log.matches("acme/DATA-1: the workflow postmortem failed: it exited with")
+        log.matches("acme/DATA-1: the interim postmortem failed: it exited with")
             .count(),
         1,
         "{log}"
     );
-}
-
-#[tokio::test]
-async fn an_allowed_reply_selects_a_missing_workflow_state() {
-    let mut world = World::sample();
-    world.running_issue().await;
-    world.fake().issue_mut("DATA-1")["team"]["states"]["nodes"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|state| state["name"] != "In Review");
-
-    commands::finish(&world.ctx(), &world.session(), KEY, "Ready for review.")
-        .await
-        .unwrap();
-    world.settle().await;
-    let record = world.record(KEY);
-    assert_eq!(
-        record.awaiting_reply.unwrap().reason,
-        WaitReason::WorkflowState
-    );
-    assert_eq!(
-        record.workflow.pending_choice.unwrap().stage,
-        crate::run::WorkflowStage::InReview
-    );
-
-    world.message(KEY, "user-1", "Todo", None);
-    world.later(5);
-    world.settle().await;
-
-    assert_eq!(world.fake().issue("DATA-1")["state"]["name"], "Todo");
-    assert_eq!(
-        world.record(KEY).workflow.confirmed,
-        Some(crate::run::WorkflowStage::InReview)
-    );
-    assert!(world.record(KEY).workflow.pending_choice.is_none());
 }
 
 #[tokio::test]
@@ -3290,123 +3135,6 @@ async fn only_a_person_editing_the_issue_writes_an_issue_item() {
     world.later(5);
     world.settle().await;
     assert_eq!(issue_items(&world), 2, "an edited description is");
-
-    world.move_issue(KEY, "In Review");
-    world.later(5);
-    world.settle().await;
-    let state_items: Vec<_> = world
-        .inbox(KEY)
-        .into_iter()
-        .filter(|item| item.contains("The issue moved from In Progress to In Review."))
-        .collect();
-    assert_eq!(state_items.len(), 1);
-    assert_eq!(
-        issue_items(&world),
-        2,
-        "state changes are reported separately"
-    );
-}
-
-#[tokio::test]
-async fn an_allowed_reply_authorizes_only_the_recorded_worker_pr_to_merge() {
-    let mut disabled = World::sample();
-    disabled.running_issue().await;
-    disabled.start_worker("api").await;
-    worker::update(&disabled.run(KEY), "w1", |worker| {
-        worker.report_hash = "report-hash".into();
-        worker.pr_url = PR.into();
-    })
-    .unwrap();
-    let error = commands::worker_request_merge(&disabled.ctx(), KEY, "w1")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("not enabled"), "{error}");
-    assert_eq!(
-        worker::load(&disabled.run(KEY), "w1")
-            .unwrap()
-            .merge_authorization,
-        worker::MergeAuthorization::None,
-        "merge stays disabled by default"
-    );
-
-    let mut world = World::with(|config| {
-        config.replace(
-            "allowed_user_ids = [\"user-1\"]\nrouting = \"default\"",
-            "allowed_user_ids = [\"user-1\"]\nmerge_on_authorization = true\nrouting = \"default\"",
-        )
-    });
-    world.running_issue().await;
-    world.start_worker("api").await;
-    worker::update(&world.run(KEY), "w1", |worker| {
-        worker.report_hash = "report-hash".into();
-        worker.pr_url = PR.into();
-    })
-    .unwrap();
-    commands::worker_request_merge(&world.ctx(), KEY, "w1")
-        .await
-        .unwrap();
-    world.settle().await;
-    let request = world
-        .bodies(KEY, "thought")
-        .into_iter()
-        .find(|body| body.contains("An allowed user can authorize exactly this pull request"))
-        .expect("authorization request sent to Linear");
-    let token = request
-        .split_once("with `merge ")
-        .unwrap()
-        .1
-        .split('`')
-        .next()
-        .unwrap()
-        .to_string();
-
-    world.message(KEY, "unapproved-user", &format!("merge {token}"), None);
-    world.later(5);
-    world.settle().await;
-    assert!(matches!(
-        worker::load(&world.run(KEY), "w1")
-            .unwrap()
-            .merge_authorization,
-        worker::MergeAuthorization::Waiting { .. }
-    ));
-
-    world.message(KEY, "user-1", &format!("merge {token}"), None);
-    world.later(5);
-    world.settle().await;
-    assert!(matches!(
-        worker::load(&world.run(KEY), "w1")
-            .unwrap()
-            .merge_authorization,
-        worker::MergeAuthorization::Approved { user_id, .. } if user_id == "user-1"
-    ));
-    assert!(
-        crate::inbox::unhandled(&world.run(KEY)).iter().any(|item| {
-            item.kind == "merge" && item.subject == "w1" && item.summary.contains(PR)
-        })
-    );
-
-    world.move_issue(KEY, "In Review");
-    world.later(5);
-    world.settle().await;
-
-    world.runner.on("gh pr merge", ok("Merged"));
-    commands::worker_merge(&world.ctx(), KEY, "w1")
-        .await
-        .unwrap();
-    assert_eq!(world.runner.count("gh pr merge"), 1);
-    assert!(matches!(
-        worker::load(&world.run(KEY), "w1")
-            .unwrap()
-            .merge_authorization,
-        worker::MergeAuthorization::Merged { user_id, pr_url, .. }
-            if user_id == "user-1" && pr_url == PR
-    ));
-    let error = commands::worker_merge(&world.ctx(), KEY, "w1")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("no current authorization"), "{error}");
 }
 
 #[tokio::test]
