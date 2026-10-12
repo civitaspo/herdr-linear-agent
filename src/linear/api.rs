@@ -46,7 +46,7 @@ const DELEGATED_QUERY: &str = r#"query HerdrLinearAgentDelegatedIssues($teamKeys
 const ISSUE_QUERY: &str = r#"query HerdrLinearAgentIssue($id: String!) {
   viewer { id app isMe }
   issue(id: $id) {
-    id identifier title url description updatedAt estimate
+    id identifier title url description updatedAt estimate branchName
     state { id name type }
     delegate { id }
     team {
@@ -261,6 +261,9 @@ pub struct IssueDetail {
     pub url: String,
     pub description: String,
     pub updated_at: String,
+    /// Linear's suggested branch name, when present.
+    #[serde(default)]
+    pub branch_name: Option<String>,
     pub estimate: Option<f64>,
     pub state: WorkflowState,
     pub delegate_id: Option<String>,
@@ -1079,6 +1082,7 @@ fn parse_issue(issue: &Value) -> Result<IssueDetail, ApiError> {
         url: text(issue, "url")?,
         description: issue["description"].as_str().unwrap_or("").to_string(),
         updated_at: text(issue, "updatedAt")?,
+        branch_name: issue["branchName"].as_str().map(str::to_string),
         estimate: issue["estimate"].as_f64(),
         state: parse_state(field(issue, "state")?)?,
         delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),

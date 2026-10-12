@@ -235,13 +235,31 @@ pub fn digest(
 ) -> Result<(String, Vec<String>)> {
     let record = run.record()?;
     let mut text = format!(
-        "# Run {} ({:?}{})\n\n## Issue\n\n{}\n\n## Conversation\n\n{}\n\n## Repositories\n\n",
+        "# Run {} ({:?}{})\n\n## Issue\n\n{}\n\n## Conversation\n\n{}\n\n## Run settings\n\n",
         run.key,
         record.status,
         if record.finished { ", finished" } else { "" },
         read_or(&run.issue_md(), "(issue.md is not written yet)"),
         read_or(&run.conversation_md(), "(no replies yet)"),
     );
+    let shared_repository = record
+        .shared_space
+        .as_ref()
+        .map_or("off", |shared| shared.repo.as_str());
+    let merge_authorization = config
+        .team(&record.workspace, &record.team_key)
+        .is_ok_and(|team| team.merge_on_authorization);
+    let _ = writeln!(text, "- Single-space repository: `{shared_repository}`");
+    let _ = writeln!(
+        text,
+        "- Merge on allowed-user authorization: {}",
+        if merge_authorization {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    text.push_str("\n## Repositories\n\n");
     if config.repositories.is_empty() {
         text.push_str("(none)\n");
     }
@@ -563,6 +581,9 @@ mod tests {
                 "The login page loops.",
                 "## Conversation",
                 "please keep the old URL",
+                "## Run settings",
+                "- Single-space repository: `off`",
+                "- Merge on allowed-user authorization: disabled",
                 "## Repositories",
                 "- api: /src/api (base main) \u{2014} The API server\n",
                 "- web: /src/web (base develop)\n",
@@ -587,6 +608,32 @@ mod tests {
         inbox::done(&f.run, &[], true).unwrap();
         let (_, shown) = digest(&f.run, &sample_config(), "/bin/herdr-linear-agent", &[]).unwrap();
         assert!(shown.is_empty());
+    }
+
+    #[test]
+    fn the_digest_explains_shared_space_and_merge_settings_to_the_coordinator() {
+        let f = folder("Fix login");
+        f.run
+            .update(|record| {
+                record.shared_space = Some(crate::run::SharedSpace {
+                    repo: "api".into(),
+                    ..crate::run::SharedSpace::default()
+                });
+            })
+            .unwrap();
+        let mut config = sample_config();
+        config
+            .workspaces
+            .get_mut("acme")
+            .unwrap()
+            .teams
+            .get_mut("DATA")
+            .unwrap()
+            .merge_on_authorization = true;
+
+        let (text, _) = digest(&f.run, &config, "/bin/herdr-linear-agent", &[]).unwrap();
+        assert!(text.contains("- Single-space repository: `api`"));
+        assert!(text.contains("- Merge on allowed-user authorization: enabled"));
     }
 
     fn pane_row(pane: &str) -> (PaneId, Pane) {

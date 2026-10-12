@@ -716,6 +716,7 @@ mod tests {
             url: "https://linear.app/acme/issue/DATA-1".into(),
             description: "The session expires too early.".into(),
             updated_at: "2026-09-28T00:00:00Z".into(),
+            branch_name: None,
             estimate: Some(3.0),
             state: WorkflowState {
                 id: "todo".into(),
