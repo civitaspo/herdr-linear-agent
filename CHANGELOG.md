@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] - 2026-10-12
+## [0.8.0] - 2026-10-13
 
 
 ### Bug Fixes
@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update jdx/mise-action action to v5.1.2 (#143)
 - update rust crate serde_json to v1.0.154 (#139)
 - update dependency jdx/mise to v2026.10.8 (#136)
 - update Securefix caller workflows to v0.2.12 (#137)
