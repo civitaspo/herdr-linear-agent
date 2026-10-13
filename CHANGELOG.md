@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- restore the factory workflow and authorize PR merges (#146)
 - add shared runs and authorized workflow completion (#144)
 
 
