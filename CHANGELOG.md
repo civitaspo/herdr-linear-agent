@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update rust crate sha2 to v0.11.1 (#147)
 - update jdx/mise-action action to v5.1.2 (#143)
 - update rust crate serde_json to v1.0.154 (#139)
 - update dependency jdx/mise to v2026.10.8 (#136)
