@@ -170,31 +170,85 @@ impl Reconciler {
         let (method, picked, outcome) = match written {
             Ok(written) => written,
             Err(error) => {
-                d.log.line(&format!(
-                    "{}: the {} postmortem failed: {error:#}",
-                    run.key,
+                let failure = format!("{error:#}");
+                let summary = format!(
+                    "The {} postmortem failed: {failure}. The issue remains in its postmortem state.",
                     stage.word()
-                ));
-                update_run(run, clear).await?;
+                );
+                let recorded = self
+                    .guarded(run, move |run, lock| {
+                        let record = run.record()?;
+                        if record.postmortem_due != Some(stage)
+                            || (stage == Stage::Workflow
+                                && (record.status != crate::run::Status::Active
+                                    || record.workflow.confirmed
+                                        != Some(crate::run::WorkflowStage::InPostmortem)))
+                        {
+                            return Ok((false, Vec::new()));
+                        }
+                        run.update_held(lock, clear)?;
+                        crate::inbox::write_held(run, lock, "postmortem", "failure", &summary)?;
+                        Ok((true, Vec::new()))
+                    })
+                    .await?;
+                if recorded {
+                    d.log.line(&format!(
+                        "{}: the {} postmortem failed: {failure}",
+                        run.key,
+                        stage.word()
+                    ));
+                }
                 return Ok(());
             }
         };
         let at = now.to_string();
         let told = format!("with the `{}` profile ({picked})", method.name);
-        self.guarded(run, move |run, lock| {
-            postmortem::keep(run, stage, &method, &picked, &outcome, &at)?;
-            run.update_held(lock, clear)?;
-            let mut ops = vec![Op::Comment {
-                body: postmortem::comment(stage, &method, &outcome.summary),
-            }];
-            if !outcome.labels.is_empty() {
-                ops.push(Op::Labels {
-                    names: outcome.labels.clone(),
-                });
-            }
-            Ok(((), ops))
-        })
-        .await?;
+        let (applied, queued) = self
+            .guarded(run, move |run, lock| {
+                let record = run.record()?;
+                if record.postmortem_due != Some(stage) {
+                    return Ok(((false, false), Vec::new()));
+                }
+                if stage == Stage::Workflow
+                    && (record.status != crate::run::Status::Active
+                        || record.workflow.confirmed
+                            != Some(crate::run::WorkflowStage::InPostmortem))
+                {
+                    return Ok(((false, false), Vec::new()));
+                }
+                postmortem::keep(run, stage, &method, &picked, &outcome, &at)?;
+                let mut queued = false;
+                for op in [
+                    Some(Op::Comment {
+                        body: postmortem::comment(stage, &method, &outcome.summary),
+                    }),
+                    (!outcome.labels.is_empty()).then(|| Op::Labels {
+                        names: outcome.labels.clone(),
+                    }),
+                    (stage == Stage::Workflow).then(|| Op::IssueState {
+                        target: crate::outbox::StateTarget::Workflow(
+                            crate::run::WorkflowStage::Done,
+                        ),
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    queued |= crate::outbox::push_held(run, lock, op)?.is_some();
+                }
+                run.update_held(lock, |r| {
+                    clear(r);
+                    if stage == Stage::Workflow {
+                        r.workflow.postmortem_succeeded = true;
+                    }
+                })?;
+                Ok(((true, queued), Vec::new()))
+            })
+            .await?;
+        self.queued |= queued;
+        if !applied {
+            return Ok(());
+        }
         d.log.line(&format!(
             "{}: wrote the {} postmortem {told}",
             run.key,

@@ -70,7 +70,7 @@ enum Command {
     },
     /// End the coordinator's turn without finishing the run.
     Wait(TextArgs),
-    /// Post the final summary and move the issue to review.
+    /// Post a summary and advance the issue to review or postmortem.
     Finish(TextArgs),
     /// Start, prompt or restart workers.
     Worker {

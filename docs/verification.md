@@ -471,3 +471,25 @@ A signed macOS development build from [PR #146](https://github.com/civitaspo/her
 | CIV-17 merge | The coordinator ran the plugin's `worker merge` command. The persisted attempt became `merged`; GitHub readback reported PR #18 as merged at 18:47:08Z with merge commit `57924398ae7fa1f3b35cd0547d0c212a8e89673a`. The coordinator then used the plugin `finish` command to move CIV-17 to In Review. |
 
 The isolated `p146` session and ticker were stopped after the check. This live run covers an allowed reply and a successful squash merge; unauthorized or malformed replies, changed-PR invalidation, and unknown merge outcomes remain covered by the regression suite rather than live fault injection. The scratch PR was intentionally merged in the test repository.
+
+## Restored factory workflow (2026-10-13)
+
+A signed macOS development build from [PR #146](https://github.com/civitaspo/herdr-linear-agent/pull/146) ran with Herdr 0.9.3 and OpenCode 2.0.24 in the isolated `wf146` session. Temporary config and state folders polled only the Personal `CIV` team and used only the private scratch repository. The configured deployment, postmortem and completed state names were `Factory Deployment`, `Factory Postmortem` and `Factory Complete`, none of which existed in that team. All times below are UTC.
+
+The first run, [CIV-18](https://linear.app/civitaspo/issue/CIV-18/verify-pr-146-restored-factory-workflow), opened [testing-herdr-linear-agent#19](https://github.com/civitaspo/testing-herdr-linear-agent/pull/19). Its checks passed and the plugin merged it after an allowed token reply. Linear's GitHub automation immediately moved the associated issue to Done. The plugin closed the run, left the terminal state alone and wrote a final postmortem. This confirms the setup requirement documented in the README: the GitHub integration must move merged work to deployment or take no action for the factory workflow to continue.
+
+The second run, [CIV-19](https://linear.app/civitaspo/issue/CIV-19/verify-unlinked-pr-factory-workflow), used a remote branch, commit subject, PR title and body without an issue identifier. This avoided automatic GitHub association while leaving the team's settings unchanged.
+
+| Step | Observed result |
+| --- | --- |
+| Worker PR and review | Coordinator `w4:p1` and worker `w5:p1` ran in separate workspaces. The worker opened [testing-herdr-linear-agent#20](https://github.com/civitaspo/testing-herdr-linear-agent/pull/20). Its `quick` and `slow` checks passed; `failing` was skipped. The coordinator's first `finish` moved the issue to In Review at 00:58:19Z and did not schedule a postmortem. |
+| Authorized merge | The allowed Personal user replied with the exact current merge token at 00:59:16Z. The coordinator used the plugin's `worker merge`; GitHub reported the PR merged at 00:59:27Z with commit `fc53e159f809a8498df2585f58caa1a36f2fdccc`. The run remained Active, and the raw token was absent from `conversation.md`. |
+| Missing deployment state | A workflow-state question was delivered at 00:59:30Z. The allowed user's `In Progress` reply selected that existing state. At 01:00:19Z the visible issue became In Progress, while the persisted confirmed stage became InDeploy. The coordinator resumed deployment work with that stage. |
+| Deployment verification | The same worker fetched main without force and verified `Factory workflow completed through postmortem.` in `origin/main` at the merge commit. Its new canonical report reached the coordinator, which consumed it and called `finish`. |
+| Missing postmortem state | A separate question was delivered at 01:02:01Z. The allowed user's `In Review` reply moved the issue there at 01:02:27Z, with confirmed stage InPostmortem. Only then was a workflow postmortem due. |
+| Postmortem and missing completed state | The real headless OpenCode postmortem succeeded at 01:03:15Z. Its workflow comment was delivered at 01:03:16Z and `postmortem_succeeded` became true. A third state question offered only Done, the team's completed state. |
+| Completion | The allowed user's `Done` reply moved the issue to Done at 01:03:54Z. The run closed at 01:03:56Z with confirmed stage Done, no pending choice, no due postmortem and an empty outbox. Both agents exited. Exactly one workflow postmortem artifact and comment remained, with no duplicate final postmortem. |
+
+The run required driver help with a scratch-directory permission, the test Git signing environment, a coordinator report path and replacing an auxiliary worker report with its canonical `report.md`. The check exercised the real plugin workflow with real agents and allowed-user replies. Deployment was represented by the merged README check; no production deployment ran. Postmortem generation and delivery were checked, but its prose was not independently graded. Unauthorized replies, stale selections, unknown write outcomes and failed postmortems remain regression-suite checks.
+
+The default Herdr session and installed ticker were left untouched. No Linear team settings or states were changed. Both scratch PRs were intentionally merged. The isolated session and ticker were stopped after the check.

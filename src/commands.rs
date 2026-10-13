@@ -308,6 +308,11 @@ pub async fn finish<H: Herdr>(
         );
     }
     let lock = run.lock()?;
+    let target = if run.record()?.workflow.confirmed == Some(crate::run::WorkflowStage::InDeploy) {
+        crate::run::WorkflowStage::InPostmortem
+    } else {
+        crate::run::WorkflowStage::InReview
+    };
     outbox::push_held(
         &run,
         &lock,
@@ -319,7 +324,7 @@ pub async fn finish<H: Herdr>(
         &run,
         &lock,
         Op::IssueState {
-            target: StateTarget::Review,
+            target: StateTarget::Workflow(target),
         },
     )?;
     run.update_held(&lock, |r| {
@@ -328,14 +333,19 @@ pub async fn finish<H: Herdr>(
         }
         r.finished = true;
         r.turn_complete = None;
-        r.postmortem_due
-            .get_or_insert(crate::postmortem::Stage::Interim);
     })?;
     ticker::poke(&ctx.state_dir());
-    let review_state = config
+    let target_state = config
         .team(&record.workspace, &record.team_key)
-        .map_or("In Review", |team| team.review_state.as_str());
-    println!("the summary is queued; the issue moves to `{review_state}`");
+        .map(|team| match target {
+            crate::run::WorkflowStage::InPostmortem => team.postmortem_state.as_str(),
+            _ => team.review_state.as_str(),
+        })
+        .unwrap_or(match target {
+            crate::run::WorkflowStage::InPostmortem => "In Postmortem",
+            _ => "In Review",
+        });
+    println!("the summary is queued; the issue moves to `{target_state}`");
     Ok(())
 }
 
@@ -716,11 +726,10 @@ pub async fn worker_request_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<
     outbox::push_held(
         &run,
         &lock,
-        Op::activity(Activity::new(Content::Thought {
-            body: format!(
-                "To authorize a squash merge of worker {id}'s pull request, reply exactly `merge {token}`."
-            ),
-        })),
+        Op::MergeAuthorizationRequest {
+            worker_id: id.into(),
+            token: token.clone(),
+        },
     )?;
     ticker::poke(&ctx.state_dir());
     Ok(())
@@ -784,6 +793,9 @@ pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
     if !should_merge {
         let outcome = read_merge_outcome(ctx, &pr_url).await;
         record_merge_result(&run, id, &pr_url, outcome.clone())?;
+        if matches!(outcome, MergeAttempt::Merged { .. }) {
+            ticker::poke(&ctx.state_dir());
+        }
         return match outcome {
             MergeAttempt::Merged { .. } => Ok(()),
             MergeAttempt::Unmerged { .. } => {
@@ -810,6 +822,7 @@ pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
                 pr_url: pr_url.clone(),
             },
         )?;
+        ticker::poke(&ctx.state_dir());
         return Ok(());
     }
 
@@ -817,6 +830,7 @@ pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
     let merged = matches!(outcome, MergeAttempt::Merged { .. });
     record_merge_result(&run, id, &pr_url, outcome)?;
     if merged {
+        ticker::poke(&ctx.state_dir());
         Ok(())
     } else {
         let detail = first
@@ -861,13 +875,45 @@ async fn read_merge_outcome(ctx: &Ctx<'_>, pr_url: &str) -> MergeAttempt {
 }
 
 fn record_merge_result(run: &Run, id: &str, pr_url: &str, outcome: MergeAttempt) -> Result<()> {
-    worker::update(run, id, |w| {
-        if w.pr_url == pr_url
-            && matches!(w.merge_attempt, Some(MergeAttempt::Attempting { pr_url: ref current }) if current == pr_url)
-        {
-            w.merge_attempt = Some(outcome);
-        }
+    let lock = run.lock()?;
+    let current = worker::load(run, id)?;
+    let unresolved = current
+        .merge_attempt
+        .as_ref()
+        .is_some_and(|attempt| match attempt {
+            MergeAttempt::Attempting { pr_url: current }
+            | MergeAttempt::Unknown { pr_url: current } => current == pr_url,
+            _ => false,
+        });
+    if current.pr_url != pr_url || !unresolved {
+        return Ok(());
+    }
+    let merged = matches!(&outcome, MergeAttempt::Merged { .. });
+    let active = run.record()?.status == Status::Active && !run.record()?.stopped;
+    if merged && active {
+        outbox::push_held(
+            run,
+            &lock,
+            Op::IssueState {
+                target: StateTarget::Workflow(crate::run::WorkflowStage::InDeploy),
+            },
+        )?;
+        crate::inbox::write_held(
+            run,
+            &lock,
+            "merge",
+            id,
+            "The authorized worker pull request was merged; deployment work can continue.",
+        )?;
+        run.update_held(&lock, |record| {
+            record.finished = false;
+            record.turn_complete = None;
+        })?;
+    }
+    worker::update_held(run, &lock, id, |worker| {
+        worker.merge_attempt = Some(outcome)
     })?;
+    drop(lock);
     Ok(())
 }
 
@@ -1850,7 +1896,7 @@ mod tests {
                     body: "Opened the PR.".into()
                 })),
                 Op::IssueState {
-                    target: StateTarget::Review
+                    target: StateTarget::Workflow(crate::run::WorkflowStage::InReview)
                 }
             ]
         );

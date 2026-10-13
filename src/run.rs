@@ -112,6 +112,39 @@ pub enum WaitReason {
     CoordinatorQuestion,
     RunTimeout,
     CoordinatorLost,
+    WorkflowState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStage {
+    InProgress,
+    InReview,
+    InDeploy,
+    InPostmortem,
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct WorkflowProgress {
+    pub confirmed: Option<WorkflowStage>,
+    pub selected_state_id: Option<String>,
+    pub pending_choice: Option<WorkflowStateChoice>,
+    pub postmortem_succeeded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowStateChoice {
+    pub stage: WorkflowStage,
+    pub expected_current_state_id: String,
+    pub options: Vec<WorkflowStateOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowStateOption {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,9 +375,14 @@ pub struct RunRecord {
     pub announce_pending: bool,
     /// Sent by the next pass that has a snapshot.
     pub interrupt: Option<Interrupt>,
-    /// A postmortem the ticker writes next: interim after `finish`, final
-    /// when the run closes (which replaces an interim one not written yet).
+    /// A queued legacy interim/final postmortem or workflow postmortem stage.
     pub postmortem_due: Option<crate::postmortem::Stage>,
+    #[serde(default)]
+    pub workflow: WorkflowProgress,
+    #[serde(default)]
+    pub workflow_state_id: String,
+    #[serde(default)]
+    pub workflow_state_updated_at: String,
     /// The workflow state the issue was in when the run closed.
     pub closed_state: String,
 }

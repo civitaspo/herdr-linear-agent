@@ -72,9 +72,16 @@ pub struct Team {
     /// when unset.
     #[serde(default)]
     pub allowed_delegator_ids: Option<Vec<String>>,
-    /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
+    #[serde(default = "default_started_state")]
+    pub started_state: String,
+    #[serde(default = "default_deploy_state")]
+    pub deploy_state: String,
+    #[serde(default = "default_postmortem_state")]
+    pub postmortem_state: String,
+    #[serde(default = "default_done_state")]
+    pub done_state: String,
     /// Let an allowed Linear reply authorize a worker PR merge.
     #[serde(default)]
     pub merge_on_authorization: bool,
@@ -97,6 +104,19 @@ fn default_callback_port() -> u16 {
 
 fn default_review_state() -> String {
     "In Review".into()
+}
+
+fn default_started_state() -> String {
+    "In Progress".into()
+}
+fn default_deploy_state() -> String {
+    "In Deploy".into()
+}
+fn default_postmortem_state() -> String {
+    "In Postmortem".into()
+}
+fn default_done_state() -> String {
+    "Done".into()
 }
 
 fn default_linear_interval() -> u64 {
@@ -330,6 +350,17 @@ impl Config {
                     !team.review_state.trim().is_empty(),
                     "workspaces.{name}.teams.{key}.review_state is empty"
                 );
+                for (field, value) in [
+                    ("started_state", &team.started_state),
+                    ("deploy_state", &team.deploy_state),
+                    ("postmortem_state", &team.postmortem_state),
+                    ("done_state", &team.done_state),
+                ] {
+                    ensure!(
+                        !value.trim().is_empty(),
+                        "workspaces.{name}.teams.{key}.{field} is empty"
+                    );
+                }
             }
             for (key, seconds) in [
                 ("intake_interval_seconds", workspace.intake_interval_seconds),
@@ -682,6 +713,11 @@ client_id = "client-123"
 
 [workspaces.acme.teams.DATA]
 allowed_user_ids = ["user-1"]
+review_state = "In Review"
+started_state = "In Progress"
+deploy_state = "In Deploy"
+postmortem_state = "In Postmortem"
+done_state = "Done"
 routing = "default"
 
 [herdr]
@@ -814,6 +850,42 @@ workers = ["standard", "deep"]
     }
 
     #[test]
+    fn workflow_states_default_when_omitted() {
+        let text = SAMPLE
+            .lines()
+            .filter(|line| {
+                !line.starts_with("review_state = ")
+                    && !line.starts_with("started_state = ")
+                    && !line.starts_with("deploy_state = ")
+                    && !line.starts_with("postmortem_state = ")
+                    && !line.starts_with("done_state = ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let team = load_with(&text, &[])
+            .unwrap()
+            .team("acme", "DATA")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (
+                team.started_state.as_str(),
+                team.review_state.as_str(),
+                team.deploy_state.as_str(),
+                team.postmortem_state.as_str(),
+                team.done_state.as_str()
+            ),
+            (
+                "In Progress",
+                "In Review",
+                "In Deploy",
+                "In Postmortem",
+                "Done"
+            )
+        );
+    }
+
+    #[test]
     fn invalid_configs_are_refused() {
         let bad = |from: &str, to: &str| {
             let text = SAMPLE.replacen(from, to, 1);
@@ -826,10 +898,19 @@ workers = ["standard", "deep"]
         );
         bad("client_id = \"client-123\"", "client_id = \" \"");
         bad("[workspaces.acme]", "[workspaces.Acme]");
-        bad(
-            "[workspaces.acme.teams.DATA]",
-            "[workspaces.acme.teams.DATA]\nreview_state = \"\"",
-        );
+        for (field, value) in [
+            ("review_state", "In Review"),
+            ("started_state", "In Progress"),
+            ("deploy_state", "In Deploy"),
+            ("postmortem_state", "In Postmortem"),
+            ("done_state", "Done"),
+        ] {
+            let error = bad(
+                &format!("{field} = \"{value}\""),
+                &format!("{field} = \"  \""),
+            );
+            assert!(error.contains(&format!("workspaces.acme.teams.DATA.{field} is empty")));
+        }
         bad(
             "workers = [\"standard\", \"deep\"]",
             "workers = [\"standard\", \"deep\"]\ndefault = \"coordinator\"",
@@ -1247,7 +1328,7 @@ workers = ["standard", "deep"]
         );
         let none = SAMPLE
             .replace(
-                "[workspaces.acme.teams.DATA]\nallowed_user_ids = [\"user-1\"]\nrouting = \"default\"\n",
+                "[workspaces.acme.teams.DATA]\nallowed_user_ids = [\"user-1\"]\nreview_state = \"In Review\"\nstarted_state = \"In Progress\"\ndeploy_state = \"In Deploy\"\npostmortem_state = \"In Postmortem\"\ndone_state = \"Done\"\nrouting = \"default\"\n",
                 "",
             )
             .replace("[workspaces.acme]\nclient_id = \"client-123\"\n", "");

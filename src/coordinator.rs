@@ -257,6 +257,34 @@ pub fn digest(
         }
         text.push('\n');
     }
+    let workflow = config.team(&record.workspace, &record.team_key).ok();
+    let stage_name = |stage: crate::run::WorkflowStage| match stage {
+        crate::run::WorkflowStage::InProgress => "In Progress",
+        crate::run::WorkflowStage::InReview => "In Review",
+        crate::run::WorkflowStage::InDeploy => "In Deploy",
+        crate::run::WorkflowStage::InPostmortem => "In Postmortem",
+        crate::run::WorkflowStage::Done => "Done",
+    };
+    let _ = writeln!(
+        text,
+        "\n## Workflow\n\nConfirmed stage: {}.",
+        record.workflow.confirmed.map(stage_name).unwrap_or("none")
+    );
+    if let Some(choice) = &record.workflow.pending_choice {
+        let _ = writeln!(text, "Pending state choice: {}.", stage_name(choice.stage));
+        for option in &choice.options {
+            let _ = writeln!(text, "- {} ({})", option.name, option.id);
+        }
+    }
+    let _ = writeln!(
+        text,
+        "Targets: In Progress = {}; In Review = {}; In Deploy = {}; In Postmortem = {}; Done = {}.",
+        workflow.map_or("In Progress", |team| team.started_state.as_str()),
+        workflow.map_or("In Review", |team| team.review_state.as_str()),
+        workflow.map_or("In Deploy", |team| team.deploy_state.as_str()),
+        workflow.map_or("In Postmortem", |team| team.postmortem_state.as_str()),
+        workflow.map_or("Done", |team| team.done_state.as_str()),
+    );
     text.push_str("\n## Worker profiles\n\n");
     // A team no longer in the config has no worker profiles.
     let workers = config
@@ -529,6 +557,19 @@ mod tests {
     #[test]
     fn the_digest_lists_issue_catalog_worker_profiles_workers_and_inbox_in_order() {
         let f = folder("Fix login");
+        f.run
+            .update(|record| {
+                record.workflow.confirmed = Some(crate::run::WorkflowStage::InReview);
+                record.workflow.pending_choice = Some(crate::run::WorkflowStateChoice {
+                    stage: crate::run::WorkflowStage::InDeploy,
+                    expected_current_state_id: "state-review".into(),
+                    options: vec![crate::run::WorkflowStateOption {
+                        id: "state-deploy".into(),
+                        name: "Deploying".into(),
+                    }],
+                });
+            })
+            .unwrap();
         std::fs::write(
             f.run.issue_md(),
             "# DATA-1 Fix login\n\nThe login page loops.\n",
@@ -575,6 +616,11 @@ mod tests {
                 "## Repositories",
                 "- api: /src/api (base main) \u{2014} The API server\n",
                 "- web: /src/web (base develop)\n",
+                "## Workflow",
+                "Confirmed stage: In Review.",
+                "Pending state choice: In Deploy.",
+                "- Deploying (state-deploy)",
+                "Targets: In Progress = In Progress; In Review = In Review; In Deploy = In Deploy; In Postmortem = In Postmortem; Done = Done.",
                 "## Worker profiles",
                 "- standard: claude sonnet, effort high \u{2014} scoped features and fixes",
                 "- deep: codex gpt-6-sol, effort xhigh \u{2014} cross-module changes",

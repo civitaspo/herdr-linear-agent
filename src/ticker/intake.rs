@@ -240,11 +240,13 @@ impl Reconciler {
         let issue = &update.issue;
         if matches!(issue.state_type.as_str(), "completed" | "canceled") {
             self.changed_at.insert(record.issue_id.clone(), read_at);
-            return self.close_run(d, snap, run, &issue.state_name, now).await;
+            return self
+                .close_run(d, snap, run, &issue.state_name, &issue.state_type, now)
+                .await;
         }
         if let Some(request) = &record.resume_request {
             if let Some(ref detail) = detail {
-                self.refresh_issue(run, detail).await?;
+                self.refresh_issue(d.config, run, detail).await?;
             }
             if matches!(request.decision, ResumeDecision::Denied) {
                 return Ok(());
@@ -321,21 +323,39 @@ impl Reconciler {
             if record.coordinator.profile.is_empty() && !self.routing.contains(&run.key) {
                 self.finish_claim(d, run, &detail).await?;
             }
-            self.refresh_issue(run, &detail).await?;
+            self.refresh_issue(d.config, run, &detail).await?;
         }
         self.relay(d, run, &update.prompts, now).await
     }
 
     /// Rewrites `issue.md` and tells the coordinator when a person edited
     /// the issue. The first write, at the claim, is not an edit.
-    async fn refresh_issue(&mut self, run: &Run, detail: &IssueDetail) -> Result<()> {
+    async fn refresh_issue(
+        &mut self,
+        config: &crate::config::Config,
+        run: &Run,
+        detail: &IssueDetail,
+    ) -> Result<()> {
         let hash = crate::run::issue_hash(detail);
         let (updated_at, title) = (detail.updated_at.clone(), detail.title.clone());
         let labels: Vec<String> = detail.labels.iter().map(|l| l.name.clone()).collect();
         let snapshot = crate::run::issue_markdown(detail);
         let cursor_updated_at = detail.updated_at.clone();
         let state_name = detail.state.name.clone();
+        let state_id = detail.state.id.clone();
         let state_type = detail.state.r#type.clone();
+        let before = run.record()?;
+        let configured = config
+            .team(&before.workspace, &before.team_key)
+            .ok()
+            .map(|team| {
+                (
+                    team.review_state.clone(),
+                    team.deploy_state.clone(),
+                    team.postmortem_state.clone(),
+                    team.done_state.clone(),
+                )
+            });
         blocking({
             let run = run.clone();
             let hash = hash.clone();
@@ -349,6 +369,38 @@ impl Reconciler {
                     updated_at: cursor_updated_at,
                     pickup_state: String::new(),
                 };
+                if !current.workflow_state_updated_at.is_empty()
+                    && observed.updated_at <= current.workflow_state_updated_at
+                    && current.workflow_state_id != state_id
+                {
+                    return Ok(false);
+                }
+                let observed_stage =
+                    if current.workflow.selected_state_id.as_deref() == Some(state_id.as_str()) {
+                        current.workflow.confirmed
+                    } else if configured.as_ref().is_some_and(|(review, _, _, _)| {
+                        review.eq_ignore_ascii_case(&observed.name)
+                    }) {
+                        Some(crate::run::WorkflowStage::InReview)
+                    } else if configured.as_ref().is_some_and(|(_, deploy, _, _)| {
+                        deploy.eq_ignore_ascii_case(&observed.name)
+                    }) {
+                        Some(crate::run::WorkflowStage::InDeploy)
+                    } else if configured.as_ref().is_some_and(|(_, _, postmortem, _)| {
+                        postmortem.eq_ignore_ascii_case(&observed.name)
+                    }) {
+                        Some(crate::run::WorkflowStage::InPostmortem)
+                    } else if configured
+                        .as_ref()
+                        .is_some_and(|(_, _, _, done)| done.eq_ignore_ascii_case(&observed.name))
+                        && observed.state_type == "completed"
+                    {
+                        Some(crate::run::WorkflowStage::Done)
+                    } else if observed.state_type == "started" {
+                        Some(crate::run::WorkflowStage::InProgress)
+                    } else {
+                        None
+                    };
                 if current.issue_state.as_ref().is_some_and(|cursor| {
                     !cursor.updated_at.is_empty() && observed.updated_at < cursor.updated_at
                 }) {
@@ -357,6 +409,12 @@ impl Reconciler {
                 let pickup = current.issue_state.as_ref().is_some_and(|cursor| {
                     !cursor.pickup_state.is_empty() && cursor.pickup_state == observed.name
                 });
+                let stage_changed =
+                    observed_stage.is_some_and(|stage| current.workflow.confirmed != Some(stage));
+                let state_changed = current
+                    .issue_state
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.name != observed.name);
                 if current.status == Status::Active
                     && current
                         .issue_state
@@ -376,6 +434,36 @@ impl Reconciler {
                 }
                 files::write_atomic(&run.issue_md(), snapshot.as_bytes())?;
                 run.update_held(&lock, move |r| {
+                    if r.workflow_state_id != state_id {
+                        r.workflow.confirmed = observed_stage;
+                        r.workflow.selected_state_id = None;
+                        r.workflow_state_id = state_id;
+                        r.workflow_state_updated_at = observed.updated_at.clone();
+                        if observed_stage == Some(crate::run::WorkflowStage::InPostmortem)
+                            && stage_changed
+                            && !r.workflow.postmortem_succeeded
+                            && r.postmortem_due.is_none()
+                        {
+                            r.postmortem_due = Some(crate::postmortem::Stage::Workflow);
+                        }
+                        if observed_stage != Some(crate::run::WorkflowStage::InPostmortem)
+                            && r.postmortem_due == Some(crate::postmortem::Stage::Workflow)
+                        {
+                            r.postmortem_due = None;
+                        }
+                    }
+                    if state_changed
+                        && matches!(
+                            observed_stage,
+                            Some(
+                                crate::run::WorkflowStage::InProgress
+                                    | crate::run::WorkflowStage::InDeploy
+                            )
+                        )
+                    {
+                        r.finished = false;
+                        r.turn_complete = None;
+                    }
                     r.issue_updated_at = updated_at;
                     r.issue_hash = hash;
                     r.title = title;
@@ -549,6 +637,10 @@ impl Reconciler {
                             &summary,
                         )?;
                         run.update_held(lock, |r| {
+                            if accepted {
+                                r.finished = false;
+                                r.turn_complete = None;
+                            }
                             advance_prompt_cursor(r, &merge_created, &merge_id);
                             remove_pending_prompt(r, &merge_id);
                         })?;
@@ -615,6 +707,63 @@ impl Reconciler {
                     }
                 })
                 .await?;
+                continue;
+            }
+            let current = run.record()?;
+            if let (Some(wait), Some(choice)) = (
+                current.awaiting_reply.as_ref().filter(|wait| {
+                    wait.reason == WaitReason::WorkflowState
+                        && after_cursor(&created, &wait.asked_at)
+                }),
+                current.workflow.pending_choice.as_ref(),
+            ) {
+                let exact = choice
+                    .options
+                    .iter()
+                    .find(|option| option.id == body.trim());
+                let named: Vec<_> = choice
+                    .options
+                    .iter()
+                    .filter(|option| option.name.eq_ignore_ascii_case(body.trim()))
+                    .collect();
+                let chosen = exact
+                    .or_else(|| (named.len() == 1).then(|| named[0]))
+                    .map(|option| option.id.clone());
+                let choice = choice.clone();
+                let wait_id = wait.activity_id.clone();
+                let created = created.clone();
+                let id = id.clone();
+                let user = user.clone();
+                let body = body.clone();
+                let at = displayed_at.clone();
+                self.guarded(run, move |run, lock| {
+                    let current = run.record()?;
+                    if current.awaiting_reply.as_ref().is_none_or(|wait| wait.activity_id != wait_id)
+                        || current.workflow.pending_choice.as_ref() != Some(&choice)
+                        || !prompt_is_new(&current, &id, &created) { return Ok((false, Vec::new())); }
+                    inbox::write_held(run, lock, "reply", "reply", "An allowed user answered the workflow state question in conversation.md.")?;
+                    run.append_conversation_held(lock, &at, &user, &body)?;
+                    let op = if let Some(state_id) = chosen {
+                        Op::IssueState { target: StateTarget::Selected {
+                            stage: choice.stage, state_id, expected_current_state_id: choice.expected_current_state_id.clone(),
+                        }}
+                    } else {
+                        let options: Vec<_> = choice.options.iter().map(|option| (option.name.as_str(), option.id.as_str())).collect();
+                        Op::awaiting_reply("That answer did not identify one offered Linear state. Choose a listed state by label or ID.", &options, WaitReason::WorkflowState)
+                    };
+                    if let Some(wait) = run.record()?.awaiting_reply {
+                        run.update_held(lock, |record| { record.awaiting_reply = None; record.cleared_wait_id = wait.activity_id; })?;
+                    }
+                    outbox::push_held(run, lock, op)?;
+                    run.update_held(lock, |record| {
+                        advance_prompt_cursor(record, &created, &id);
+                        remove_pending_prompt(record, &id);
+                        record.reply_generation = record.reply_generation.saturating_add(1);
+                        record.turn_complete = None;
+                        record.stopped = false;
+                    })?;
+                    Ok((true, Vec::new()))
+                }).await?;
                 continue;
             }
             // The inbox item comes first: a failure before the cursor moves
@@ -735,6 +884,7 @@ impl Reconciler {
         snap: Option<&Snapshot>,
         run: &Run,
         state: &str,
+        state_type: &str,
         now: Timestamp,
     ) -> Result<()> {
         let record = run.record()?;
@@ -780,11 +930,17 @@ impl Reconciler {
         // Linear shows the session working until a response ends it.
         let body = format!("The issue is {state}; this run is closed.");
         let closed_state = state.to_string();
+        let state_type = state_type.to_string();
         self.update_and_push(run, move |r| {
             r.status = Status::Closed;
             r.closed_state = closed_state;
             r.coordinator.status = AgentStatus::Stopped;
-            r.postmortem_due = Some(crate::postmortem::Stage::Final);
+            if !r.workflow.postmortem_succeeded {
+                r.postmortem_due = Some(crate::postmortem::Stage::Final);
+            }
+            if state_type == "completed" && r.workflow.postmortem_succeeded {
+                r.workflow.confirmed = Some(crate::run::WorkflowStage::Done);
+            }
             if let Some(wait) = r.awaiting_reply.take() {
                 r.cleared_wait_id = wait.activity_id;
             }
@@ -1172,7 +1328,7 @@ impl Reconciler {
             vec![
                 thought(format!("Picked up {key}.")),
                 Op::IssueState {
-                    target: StateTarget::Started,
+                    target: StateTarget::Workflow(crate::run::WorkflowStage::InProgress),
                 },
             ]
         })
@@ -1196,14 +1352,22 @@ impl Reconciler {
         let queued = outbox::queued(run)
             .iter()
             .any(|request| matches!(request.op, Op::IssueState { .. }));
+        let record = run.record()?;
+        let configured_started = d
+            .config
+            .team(&record.workspace, &record.team_key)
+            .map_or_else(
+                |_| "In Progress".to_string(),
+                |team| team.started_state.clone(),
+            );
         let expected_started = detail
             .team
             .states
             .iter()
-            .filter(|state| state.r#type == "started")
-            .min_by(|a, b| a.position.total_cmp(&b.position))
-            .map(|state| state.name.clone())
-            .unwrap_or_default();
+            .find(|state| {
+                state.r#type == "started" && state.name.eq_ignore_ascii_case(&configured_started)
+            })
+            .map_or(configured_started, |state| state.name.clone());
         let observed_state = detail.state.name.clone();
         let key = crate::run::split_key(&run.key).1.to_string();
         self.update_and_push(run, move |r| {
@@ -1213,7 +1377,7 @@ impl Reconciler {
             }
             if !moved && !queued {
                 ops.push(Op::IssueState {
-                    target: StateTarget::Started,
+                    target: StateTarget::Workflow(crate::run::WorkflowStage::InProgress),
                 });
             }
             if let Some(cursor) = &mut r.issue_state

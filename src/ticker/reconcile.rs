@@ -659,14 +659,21 @@ impl Reconciler {
                 let undecided = active
                     && record.coordinator.profile.is_empty()
                     && !self.routing.contains(&run.key);
-                // A team no longer in the config keeps the default review state.
-                let review_state = d
-                    .config
-                    .team(&record.workspace, &record.team_key)
-                    .map_or_else(|_| "In Review".to_string(), |t| t.review_state.clone());
+                let team = d.config.team(&record.workspace, &record.team_key).ok();
+                let state_names = outbox::StateNames {
+                    started: team
+                        .map_or("In Progress", |t| t.started_state.as_str())
+                        .into(),
+                    review: team.map_or("In Review", |t| t.review_state.as_str()).into(),
+                    deploy: team.map_or("In Deploy", |t| t.deploy_state.as_str()).into(),
+                    postmortem: team
+                        .map_or("In Postmortem", |t| t.postmortem_state.as_str())
+                        .into(),
+                    done: team.map_or("Done", |t| t.done_state.as_str()).into(),
+                };
                 Some(RunQuery {
                     key: run.key.clone(),
-                    review_state,
+                    state_names,
                     issue_id: record.issue_id,
                     run_dir: run.dir.clone(),
                     session_id: if let Some(request) = &record.resume_request {
