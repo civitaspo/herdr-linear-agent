@@ -1,11 +1,3 @@
-//! Postmortems: when the coordinator calls `finish` (interim) and when the
-//! run closes (final), an agent reads the run and writes a summary for the
-//! issue. The agent is a profile its team's routing picks when it is
-//! written; its `instructions.md` is the method, which also says which labels to add.
-//! It runs headless the way the routing agent does, with the run's records
-//! on standard input; the plugin posts the comment and adds the labels that
-//! exist in Linear, so the agent holds no Linear credential.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -74,10 +66,9 @@ fn text_of(profile: &Profile) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
-    /// The coordinator called `finish`; people may still ask for changes.
     Interim,
-    /// The issue was completed or canceled.
     Final,
+    Workflow,
 }
 
 impl Stage {
@@ -85,6 +76,7 @@ impl Stage {
         match self {
             Stage::Interim => "interim",
             Stage::Final => "final",
+            Stage::Workflow => "workflow",
         }
     }
 }
@@ -121,8 +113,9 @@ fn instructions(method: &Method) -> String {
          Write what the method below asks for as the summary: Markdown for a comment on the \
          issue, in the language of the issue. Begin it with how the run stands, from the \
          records' Stage line: for a final postmortem, the state the issue closed in (for \
-         example Done or Canceled); for an interim one, that the work waits for people's \
-         review. As `labels`, give the labels the method says to add, by their names in \
+         example Done or Canceled); for a workflow postmortem, that deployment is complete \
+         and the run awaits its postmortem; for a legacy interim one, that the work waits for \
+         people's review. As `labels`, give the labels the method says to add, by their names in \
          Linear (`Label`, or `Group/Label` for a label in a group); an empty list when it names \
          none.\n\n\
          Answer only with JSON: `summary` (the comment's text) and `labels`.\n\n\
@@ -161,6 +154,8 @@ pub fn brief(run: &Run, record: &RunRecord, stage: Stage) -> String {
             }
             (Stage::Final, "") => "final: the issue was completed or canceled".to_string(),
             (Stage::Final, state) => format!("final: the issue is {state}, so the run is closed"),
+            (Stage::Workflow, _) =>
+                "workflow: deployment is complete; the run is awaiting its postmortem".to_string(),
         },
         record.title,
         record.url,
@@ -374,6 +369,10 @@ mod tests {
         let text = instructions(&method);
         assert!(
             text.contains("Begin it with how the run stands, from the records' Stage line: for a final postmortem, the state the issue closed in"),
+            "{text}"
+        );
+        assert!(
+            text.contains("for a workflow postmortem, that deployment is complete and the run awaits its postmortem"),
             "{text}"
         );
         assert!(text.ends_with("# Method\n\nSay what went well."), "{text}");

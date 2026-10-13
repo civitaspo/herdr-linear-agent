@@ -108,9 +108,7 @@ pub struct RunQuery {
     /// The run's key, `<workspace>/<ISSUE-KEY>`: only that workspace's task
     /// reads and flushes the run.
     pub key: String,
-    /// The state `finish` moves the issue to: the review state of the run's
-    /// team.
-    pub review_state: String,
+    pub state_names: outbox::StateNames,
     pub issue_id: String,
     pub run_dir: PathBuf,
     pub session_id: Option<String>,
@@ -681,8 +679,7 @@ impl LinearTask {
                 }
             {
                 let sent =
-                    outbox::send(&run, &session, &query.issue_id, &query.review_state, client)
-                        .await;
+                    outbox::send(&run, &session, &query.issue_id, &query.state_names, client).await;
                 if sent.activity_sent {
                     let _ = events
                         .send(LinearEvent::ActivitySent {
@@ -955,7 +952,13 @@ mod tests {
         fn query(&self, n: usize, session: Option<&str>, updated_at: Option<&str>) -> RunQuery {
             RunQuery {
                 key: self.runs[n].key.clone(),
-                review_state: "In Review".into(),
+                state_names: outbox::StateNames {
+                    started: "In Progress".into(),
+                    review: "In Review".into(),
+                    deploy: "In Deploy".into(),
+                    postmortem: "In Postmortem".into(),
+                    done: "Done".into(),
+                },
                 issue_id: self.issues[n].clone(),
                 run_dir: self.runs[n].dir.clone(),
                 session_id: session.map(str::to_string),

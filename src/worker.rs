@@ -47,6 +47,8 @@ pub struct Worker {
     /// The hash of the report the coordinator was told about.
     pub announced_report_hash: String,
     pub pr_url: String,
+    pub merge_authorization: Option<MergeAuthorization>,
+    pub merge_attempt: Option<MergeAttempt>,
     /// The "lost its pane before a report" error was sent.
     pub gone_reported: bool,
     /// The activity of the worker's own progress record last sent to
@@ -59,6 +61,29 @@ pub struct Worker {
     pub created: String,
     pub updated: String,
     pub agent: AgentRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MergeAuthorization {
+    Pending {
+        token: String,
+        pr_url: String,
+    },
+    Authorized {
+        token: String,
+        pr_url: String,
+        by: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MergeAttempt {
+    Attempting { pr_url: String },
+    Merged { pr_url: String },
+    Unmerged { pr_url: String },
+    Unknown { pr_url: String },
 }
 
 impl Worker {
@@ -301,6 +326,12 @@ pub fn pr_line(report: &str) -> Option<String> {
         && !number.is_empty()
         && number.chars().all(|c| c.is_ascii_digit());
     valid.then(|| url.to_string())
+}
+
+/// An exact reply command; malformed commands remain ordinary conversation.
+pub fn merge_token(body: &str) -> Option<&str> {
+    let token = body.strip_prefix("merge ")?;
+    uuid::Uuid::parse_str(token).ok().map(|_| token)
 }
 
 pub struct BriefInput<'a> {
@@ -585,6 +616,22 @@ mod tests {
 
     const SOCKET: &str = "/tmp/herdr-work.sock";
     const WORKTREE: &str = "/wt/api";
+
+    #[test]
+    fn merge_tokens_require_an_exact_single_line_command() {
+        let token = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(merge_token(&format!("merge {token}")), Some(token));
+        for body in [
+            " merge 550e8400-e29b-41d4-a716-446655440000",
+            "merge ",
+            "merge 550e8400-e29b-41d4-a716-446655440000\n",
+            "merge 550e8400-e29b-41d4-a716-446655440000 extra",
+            "merge the PR",
+            "merge abc-123",
+        ] {
+            assert_eq!(merge_token(body), None, "{body:?}");
+        }
+    }
 
     fn noon() -> Timestamp {
         "2026-09-28T12:00:00Z".parse().unwrap()
@@ -1141,6 +1188,8 @@ last_group = "waiting"
         );
         assert_eq!(worker.restarts, 1);
         assert_eq!(worker.pr_url, "https://github.com/acme/api/pull/7");
+        assert!(worker.merge_authorization.is_none());
+        assert!(worker.merge_attempt.is_none());
         assert_eq!(worker.announced_report_hash, "");
         assert!(!worker.gone_reported);
         assert_eq!(worker.agent.status, AgentStatus::Open);

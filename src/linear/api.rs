@@ -30,7 +30,7 @@ const DELEGATED_QUERY: &str = r#"query HerdrLinearAgentDelegatedIssues($teamKeys
     }
   ) {
     nodes {
-      id identifier title url updatedAt state { type } team { key }
+      id identifier title url updatedAt state { type name } team { key }
       agentSessions(first: 10) {
         nodes {
           id status createdAt appUser { id } creator { id name }
@@ -160,8 +160,7 @@ pub struct IssueRef {
     pub title: String,
     pub url: String,
     pub updated_at: String,
-    #[serde(deserialize_with = "state_type")]
-    pub state: String,
+    pub state: IssueState,
     #[serde(deserialize_with = "team_key")]
     pub team: String,
     /// Who delegated the issue to the app, and when.
@@ -199,12 +198,10 @@ pub struct User {
     pub name: String,
 }
 
-fn state_type<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    #[derive(Deserialize)]
-    struct State {
-        r#type: String,
-    }
-    Ok(State::deserialize(deserializer)?.r#type)
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct IssueState {
+    pub name: String,
+    pub r#type: String,
 }
 
 fn team_key<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -1487,7 +1484,7 @@ pub mod fake {
                         .map(|i| {
                             json!({
                                 "id": i["id"], "identifier": i["identifier"], "title": i["title"], "url": i["url"],
-                                "updatedAt": i["updatedAt"], "state": { "type": i["state"]["type"] }, "team": { "key": i["team"]["key"] },
+                                "updatedAt": i["updatedAt"], "state": { "type": i["state"]["type"], "name": i["state"]["name"] }, "team": { "key": i["team"]["key"] },
                                 "agentSessions": { "nodes": self.sessions.iter().filter(|s| s.issue_id == i["id"]).map(|s| json!({
                                     "id": s.id, "status": s.status, "createdAt": s.created_at, "appUser": { "id": APP_USER }, "creator": s.creator,
                                     "activities": { "nodes": s.activities.last().map(|a| json!({
@@ -1834,7 +1831,7 @@ mod tests {
             (
                 issues[0].identifier.as_str(),
                 issues[0].team.as_str(),
-                issues[0].state.as_str()
+                issues[0].state.r#type.as_str()
             ),
             ("DATA-1", "DATA", "unstarted")
         );

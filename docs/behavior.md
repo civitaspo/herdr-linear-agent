@@ -78,7 +78,7 @@ Rules:
 
 ## Config
 
-File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The kept module `src/config.rs` defines it; the rewrite adds only the poll interval keys.
+File: `<config_dir>/config.toml`. Unknown keys are refused in every table. `src/config.rs` defines the workspace, team and routing settings, including workflow states and merge authorization.
 
 | Key | Type | Default | Validation |
 | --- | --- | --- | --- |
@@ -91,7 +91,12 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `workspaces.<name>.teams.<key>.allowed_user_ids` | list | `[]` | whose replies in that team's sessions reach the coordinator |
 | `workspaces.<name>.teams.<key>.routing` | name | required | a table under `routing`: ``workspaces.<name>.teams.<key>.routing: there is no routing.<routing>``; see [Routing](#routing) |
 | `workspaces.<name>.teams.<key>.allowed_delegator_ids` | list | `allowed_user_ids` | whose delegations of that team's issues the ticker takes (see [Intake and claim](#intake-and-claim)) |
-| `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank: `workspaces.<name>.teams.<key>.review_state is empty`; where `finish` moves that team's issues |
+| `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank; where `finish` moves that team's issues unless finishing from deployment |
+| `workspaces.<name>.teams.<key>.started_state` | string | `In Progress` | not blank; initial state on pickup |
+| `workspaces.<name>.teams.<key>.deploy_state` | string | `In Deploy` | not blank; target after an authorized merge |
+| `workspaces.<name>.teams.<key>.postmortem_state` | string | `In Postmortem` | not blank; target after finishing deployment work |
+| `workspaces.<name>.teams.<key>.done_state` | string | `Done` | not blank; must resolve to a Linear completed state after workflow postmortem |
+| `workspaces.<name>.teams.<key>.merge_on_authorization` | bool | `false` | permit a one-time worker PR squash merge after an allowed user authorizes it in Linear |
 | `herdr.session` | string | unset: Herdr's default session | |
 | `limits.max_runs` | u32 | `2` | the three limits must satisfy `max_runs >= 1`, `max_workers_per_run >= 1`, `max_agents >= 2`: `limits must allow one run with one worker` |
 | `limits.max_workers_per_run` | u32 | `4` | |
@@ -206,6 +211,9 @@ Run record (`run.json`), every field defaulted when missing:
 | `created` | claim time |
 | `issue_updated_at` | the issue's `updatedAt` when `issue.md` was last written |
 | `issue_hash` | hash of the parts a person edits |
+| `workflow` | confirmed stage, selected state ID for the current transition, pending state choice and whether the workflow postmortem succeeded; defaults for older records |
+| `workflow_state_id`, `workflow_state_updated_at` | state ID and issue timestamp confirmed by a workflow write or observation; keep delayed reads from replacing a newer confirmed stage |
+| `issue_state` | optional `{name, state_type, updated_at, pickup_state}` cursor for workflow state notices; absent in older records, whose first detail seeds it quietly |
 | `routing_source` | where the coordinator profile came from: `chosen by the routing agent`, or `the default: <reason>`; records of older builds with `size` and `size_source` read without them |
 | `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory, ignores this field when reading, and drops it on the next write |
 | `coordinator` | the coordinator's agent record |
@@ -218,7 +226,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `timeout_since` | start of the run timeout window |
 | `timeout_asked` | compatibility field for old records; new timeout waits use `awaiting_reply` |
 | `resume_request` | optional incident consent record: unique token, request comment UUID, waiting/denied/approved decision (including approving comment and user IDs), verified replacement session ID, restoration error, and durable delegate/session attempt markers |
-| `awaiting_reply` | optional `{activity_id, asked_at, reason}` for the one Linear question currently waiting on a person (`coordinator_question`, `run_timeout`, or `coordinator_lost`) |
+| `awaiting_reply` | optional `{activity_id, asked_at, reason}` for the one Linear question currently waiting on a person (`coordinator_question`, `run_timeout`, `coordinator_lost`, or `workflow_state`) |
 | `turn_complete` | optional request ID for the completed coordinator turn; holds background heartbeat, timeout and recovery until new work resumes |
 | `cleared_wait_id` | the last cleared question id; prevents a refused request still awaiting archival from restoring its wait after a crash |
 | `reply_generation` | local counter incremented only for a newly accepted allowed prompt; queued questions carry its value so restart recovery cannot reopen an answered question, without comparing Linear and local clocks |
@@ -502,7 +510,7 @@ Activity content JSON: `{"type":"thought","body"}`, `{"type":"action","action","
 
 ## Linear polling and rate limits
 
-The ticker runs one Linear task per workspace, each with its own client, token (the credential stored under the workspace's name), app user and rate budget. They share the query list the reconciler publishes, and each reads and flushes only the runs of its workspace (the workspace part of `RunQuery.key`); a query also carries the review state of the run's team, the default `In Review` when the team is no longer configured. They share one level channel, a map from workspace name to that workspace's level (app user and delegated list), and each sets only its own entry. Events are keyed by issue UUID, which is unique across workspaces. The reconciler wakes each task after queuing requests. Log lines about a whole workspace start with `<workspace>: ` (the intake error, the rate-limit pause, the budget and the run read cost); per-run lines start with `<KEY>: `. A task ending ends the ticker (`a Linear task ended`).
+The ticker runs one Linear task per workspace, each with its own client, token (the credential stored under the workspace's name), app user and rate budget. They share the query list the reconciler publishes, and each reads and flushes only the runs of its workspace (the workspace part of `RunQuery.key`); a query also carries the workflow state names of the run's team, using their defaults when the team is no longer configured. They share one level channel, a map from workspace name to that workspace's level (app user and delegated list), and each sets only its own entry. Events are keyed by issue UUID, which is unique across workspaces. The reconciler wakes each task after queuing requests. Log lines about a whole workspace start with `<workspace>: ` (the intake error, the rate-limit pause, the budget and the run read cost); per-run lines start with `<KEY>: `. A task ending ends the ticker (`a Linear task ended`).
 
 Operations of the Linear task:
 
@@ -561,14 +569,14 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 1. Validate the issue key; read the issue detail.
 2. Create the state and runs directories. Create the run with `workspace`, `issue_id`, `session_id` (the delegation's session unless it is `complete`), `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
 3. Log `<KEY>: picked up`.
-4. Queue the thought `Picked up <ISSUE>.` and the issue-state request with target `started`, clearing `announce_pending` in the same critical section.
+4. Queue the thought `Picked up <ISSUE>.` and the issue-state request with target `Workflow(InProgress)`, clearing `announce_pending` in the same critical section.
 5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. A run without a session gets one from the flush (Linear's auto-created one, or a new one).
 
 ### `finish_claim(run, detail)`
 
 1. The session is opened by the flush, never here.
 2. When `announce_pending` is still set (a crash between creating the run and queuing its first thought), queue `Picked up <ISSUE>.` and clear it. `tests/scenarios:a_claim_cut_short_before_its_first_thought_still_announces_it`
-3. Queue an issue-state request with target `started`, unless one is queued or the issue is already started, completed or canceled.
+3. Queue an issue-state request with target `Workflow(InProgress)`, unless one is queued or the issue is already started, completed or canceled.
 4. Route.
 
 Rules pinned:
@@ -632,7 +640,7 @@ For every active or detached run, per update, in this order. Detached runs remai
 4. `updatedAt` differs from `issue_updated_at`: refresh the issue.
 5. Relay the prompts.
 
-`refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no item. The hash also leaves out the comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
+`refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no edit item. Workflow state names have a separate persisted cursor: an active run writes an `issue`/`state` inbox item when the state name changes, including transitions between states of the same type. Claim seeds the cursor with the observed state in the same lock as the configured InProgress-state outbox request. During the first detailed read, `finish_claim` also suppresses the exact configured pickup state if Linear already moved the issue before that read; other state names remain visible. Repeated and older issue reads do not move the cursor backward. Older run records without a cursor initialize from their first issue detail without a notice. The hash leaves out state as well as comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:workflow_state_changes_reach_the_coordinator_once_including_same_type_changes`, `tests/scenarios:pickup_state_already_started_before_the_first_detail_is_silent`, `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
 
 `close_run`:
 
@@ -855,12 +863,12 @@ The kept module `src/outbox.rs` defines the queue.
 ### Requests
 
 - `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, wait_generation?, op...}`, return the id or no id when an activity is suppressed by an inactive, stopped, finished or awaiting-reply run. A question stores its wait slot in the same lock; if the process stops between queueing and updating the record, the next record read repairs the slot from the queued request when its reply generation still matches. A turn completion stores its request id in `turn_complete` in that same critical section. Requests are sent in the order written.
-- Ops (`op` tag): `turn_complete {body}`, `activity {activity, wait_reason?}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`. Only elicitation requests carry a `wait_reason`; terminal responses remain sendable while stopped, finished or awaiting a reply.
+- Ops (`op` tag): `turn_complete {body}`, `activity {activity, wait_reason?}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target}` with legacy `started` and `review`, `Workflow(stage)`, or `Selected {stage, state_id, expected_current_state_id}`. Only elicitation requests carry a `wait_reason`; terminal responses remain sendable while stopped, finished or awaiting a reply.
 - `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`. Only the Linear task calls it: it alone moves, rewrites or removes outbox files. The reconciler lists them read-only (`queued`, the requests that parse; `is_empty`, any file). `tests/scenarios:the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task`
 
 ### Send
 
-`send(run, session, issue, review_state)` handles requests in order:
+`send(run, session, issue, state_names)` handles requests in order:
 
 1. When `attempted` is set, check first: an activity or turn completion is looked up by its id (`activity_exists`) and skipped when found; plan, URL and state requests are not checked (they are idempotent or read before writing).
 2. For a question or turn completion, recheck its matching wait/marker under the run lock and persist `attempted` before releasing the lock and sending. For other writes, persist `attempted`, then apply. If an attempted question or completion is absent on read-back and its wait/marker was cleared meanwhile, discard it instead of sending stale content.
@@ -882,7 +890,7 @@ Apply:
 | external_urls | `set_external_urls` with the full list |
 | issue_state | read the issue; compute the target; when there is one, set it, then read the issue again and fail with `RequestFailed` when the state is not the target |
 
-`target_state(issue, target, review_state)`: `started` gives none when the state type is `started`, `completed` or `canceled`, else the team's `started` state with the lowest position, else `Graphql("team <key> has no started state")`. `review` gives none when the state name equals the review state case-insensitively or the type is `completed` or `canceled`, else the state of that name (case-insensitive), else ``Graphql("team <key> has no state named `<review_state>`")``. `src/outbox.rs:state_targets_leave_later_states_alone`
+`target_state(issue, target, state_names)`: workflow targets resolve configured names case-insensitively. `InProgress` uses the configured started state, which must have Linear type `started`; `InReview`, `InDeploy`, and `InPostmortem` use their configured names; `Done` additionally requires a completed state. A missing workflow state asks an allowed user to choose a state, and the chosen state is guarded against the issue changing before delivery. Terminal completed/canceled issues are left alone. `src/outbox.rs:state_targets_leave_later_states_alone`
 
 `parse_plan(text)`: non-empty trimmed lines, each `- [m] content` or `* [m] content` with a one-character mark: space `pending`, `>` `inProgress`, `x`/`X` `completed`, `-` `canceled`. Errors: ``plan lines look like `- [ ] step`; got `<line>` ``, `` `[<m>]` is not a plan mark; use [ ], [>], [x] or [-] ``, ``a plan step is empty: `<line>` ``, `the plan has no steps`. `src/outbox.rs:plans_parse_from_a_checklist`
 
@@ -898,11 +906,19 @@ Requests queued before the session existed wait and go out once it exists.
 
 After the runs, the task answers each decline it has not answered yet with a `response` activity (see [Who delegated](#who-delegated)).
 
+### Workflow transitions
+
+An issue's observed state maps to the team's configured workflow stage. An allowed user's selected state ID preserves the chosen stage until the issue leaves that state. Entering deployment reopens the coordinator's completed turn so its state inbox item can start deployment work. Older issue reads do not roll the stage or the state cursor backward.
+
+When a configured target is missing, the plugin posts a non-ephemeral elicitation in the Linear session and saves its stage, candidate state IDs and current issue state ID under the run lock. Only allowed users can answer. An invalid answer asks again. Before applying a selected state, the outbox rechecks the issue's current state and the team's available states. A changed issue asks again rather than applying an obsolete selection. Done choices include only completed states. A choice applies to one transition, so another missing target asks again.
+
+Completed and canceled issues are left alone by queued workflow writes. Entering the postmortem stage schedules a workflow postmortem only once. A failed or unconfigured postmortem leaves the issue in its postmortem state for manual follow-up.
+
 ### Linear writes by event
 
 | Event | Write |
 | --- | --- |
-| claim | session (when none), thought `Picked up <ISSUE>.`, issue state `started` |
+| claim | session (when none), thought `Picked up <ISSUE>.`, issue state `Workflow(InProgress)` |
 | coordinator decided | thought with the profile and the reason |
 | delegated again | thought `The issue was delegated again; the run continues.` |
 | declined delegation | response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.`, in the delegation's session; no run |
@@ -921,10 +937,10 @@ After the runs, the task answers each decline it has not answered yet with a `re
 | 10 minutes quiet | ephemeral thought naming what each worker does |
 | run timeout | elicitation with `Continue` |
 | stop | response `Stopped <n> agent(s) ...` |
-| `finish` | response and issue state `review` |
-| postmortem written | comment `**Postmortem (<interim or final>)**, method `<name>` version `<version>`` and the summary; the labels, when any |
+| `finish` | response and `Workflow(InReview)`, or `Workflow(InPostmortem)` when finishing deployment |
+| postmortem written | comment `**Postmortem (<workflow, interim or final>)**, method `<name>` version `<version>`` and the summary; the labels, when any; a successful workflow postmortem also queues `Workflow(Done)` |
 
-The plugin never merges, force-pushes, or moves an issue to Done. The only comments it writes are postmortems.
+The plugin never force-pushes. Only a successful workflow postmortem queues the completed state. A team may opt into one-time worker PR squash merges with `merge_on_authorization`; it defaults off. When any team enables it, `gh` must be on the ticker's `PATH`. A worker's `request-merge` stores its exact recorded PR and asks for `merge <token>`. Only a reply from `allowed_user_ids` that exactly matches a current pending token authorizes it. UUID-token merge replies are consumed without copying their raw text to the coordinator conversation or inbox; ordinary text such as `merge the PR` remains a normal reply. The coordinator must invoke `worker merge`; that command consumes authorization before calling `gh pr merge <recorded-url> --squash`, then reads the PR state after an ambiguous failure. A changed PR invalidates authorization and attempt state. Attempts are never automatically retried.
 
 ## The inbox
 
@@ -954,13 +970,13 @@ Items for the coordinator in `runs/<KEY>/inbox/`.
 - An id containing `/`, `..`, starting with `.`, or empty is refused before anything moves: `` `<id>` is not an inbox item id ``. `src/inbox.rs:ids_that_could_leave_the_folder_are_refused`
 - **Changed on purpose (THLA-7):** `inbox done --all` moves only the items the coordinator has been shown, so an item written while it worked is never handled unseen. The command prints `<n> item(s) handled`, followed by `; <m> new item(s) since your last context, run context` when unseen items remain. Named ids still move as named. `src/inbox.rs:done_all_moves_only_the_items_context_showed`, `src/commands.rs:done_all_leaves_the_items_written_after_the_last_context`
 
-Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `worker`/`<id>`.
+Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `worker`/`<id>`, `merge`/`<worker id>` for a token matching a pending request or `merge`/`authorization` for an unmatched token.
 
 ## Worker commands
 
 ### Worker record (`workers/<id>.toml`)
 
-Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
+Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, optional `merge_authorization` and `merge_attempt`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
 
 | Operation | Behavior |
 | --- | --- |
@@ -977,6 +993,10 @@ Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `
 | `pr_line(report)` | the URL from the first line `PR: https://github.com/<owner>/<repo>/pull/<digits>`; any other host, path or trailing text gives none |
 
 `tests/worker:ids_branches_briefs_and_pr_lines`, `tests/worker:allocation_follow_ups_and_report_copies`
+
+`worker request-merge <KEY> <id>` requires the team's `merge_on_authorization`, a valid recorded PR URL, and a current worker record. It stores a random one-use token and the PR URL under the run lock while queueing a Linear thought that requests an exact `merge <token>` reply. The ticker accepts that exact reply only from `allowed_user_ids`, binds it to the still-current PR, records `Authorized`, and writes a sanitized inbox item naming the worker. Other UUID-token merge replies are sanitized and ignored. A PR URL change clears both merge fields.
+
+`worker merge <KEY> <id>` atomically consumes `Authorized` into `Attempting`, releases the lock, then runs `gh pr merge <recorded-url> --squash` once. On failure or unknown command outcome it reads `gh pr view <recorded-url> --json state,mergedAt`; state becomes `Merged`, `Unmerged` or `Unknown`. After a process interruption, the next `worker merge` reads back an `Attempting` or `Unknown` result without retrying the merge; a new authorization request is refused until that readback completes. The authorization is never restored for a retry, and a result is saved only if the worker still records the same PR and attempt. A confirmed merged result queues the deployment transition, reopens the coordinator turn and writes a sanitized merge inbox item in the same run-lock critical section. Direct command success and merged readback use this same finalizer. Repeating a completed attempt does not queue another deployment transition.
 
 A worker counts against `max_agents` when its status is `pending` or `open`.
 
@@ -1035,10 +1055,10 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 | `say <KEY> --text-file` | queues a thought with the trimmed text unless progress is suppressed by an open question or stopped/finished run; empty: `the text is empty` | `queued for the Linear session` |
 | `ask <KEY> --text-file [--option label=value]...` | queues an elicitation and opens the one reply wait; options add `select`; empty: `the question is empty` | `the question is queued for the Linear session; end your turn, the answer arrives in your inbox` |
 | `wait <KEY> --text-file` | queues a response that completes the coordinator's current turn while leaving the run active; requires no open reply wait, no unseen inbox items, and all open/failed/pending workers reported and neither working nor waiting; empty: `the summary is empty` | `the coordinator turn is complete; the run remains active` |
-| `finish <KEY> --text-file` | see below; empty: `the summary is empty` | ``the summary is queued; the issue moves to `<review_state>` `` with the run team's review state (`In Review` when the team is no longer configured) |
+| `finish <KEY> --text-file` | see below; empty: `the summary is empty` | ``the summary is queued; the issue moves to `<target_state>` `` with the team's review state, or its postmortem state when finishing deployment work |
 
 - `parse_option`: `label=value`, or a bare label used as its own value; both trimmed and non-empty, else ``an option looks like `label=value`; got `<text>` ``. `tests/commands:options_parse_as_label_and_value`
-- `finish`: needs the Herdr view (error `the configured Herdr session is not reachable`). Every worker that is `open`, `failed` or `pending` must be in the Reported group, else `not finished: <id> is <Label>, ... . Every worker must have written a report and be neither working nor waiting` (exactly `not finished: ` + the list joined by `, ` + `. Every worker ...`). Then queue the response and the `review` state, and set `finished`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold` (`w1 is Working`), `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (issue `In Review`, response body).
+- `finish`: needs the Herdr view (error `the configured Herdr session is not reachable`). Every worker that is `open`, `failed` or `pending` must be in the Reported group, else `not finished: <id> is <Label>, ... . Every worker must have written a report and be neither working nor waiting` (exactly `not finished: ` + the list joined by `, ` + `. Every worker ...`). Then queue the response and `Workflow(InReview)`, or `Workflow(InPostmortem)` when the confirmed stage is `InDeploy`, and set `finished`. Finishing into review does not schedule a postmortem. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold` (`w1 is Working`), `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (issue `In Review`, response body).
 - `wait`: requires the Herdr view. It captures one snapshot outside the run lock, then under the lock rechecks the reply generation, unread inbox and current worker records before queueing a `response` activity and its request id as `turn_complete`. This completes only the current Linear turn; it does not finish the run or move the issue. Repeating it while that completion is pending is idempotent. A new allowed reply or explicit new coordinator activity clears the marker; heartbeats and timeout questions do not supersede it. The marker and queued write survive restarts. Unknown write outcomes are read back by activity id before retry, and a stale completion is discarded if resumed work has cleared its marker. `tests/scenarios:wait_completes_only_the_coordinator_turn_and_new_input_resumes_it`.
 - After `finish`, replies still reach the coordinator and `finish` may run again.
 
@@ -1050,6 +1070,7 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 - `conversation.md`;
 - the repository catalog, one line per repository: `- <name>: <path> (base <base>) <U+2014> <description>`;
 - the worker profiles only (never coordinator profiles), one line each starting `- <name>: <kind> <model>, effort <effort>`, with the description;
+- the team setting for worker PR squash merge authorization, enabled or disabled;
 - the workers, one line each starting `- <id> [<group label>] <title>`;
 - the unhandled inbox items, each containing `[<kind>] <subject>: <summary>` and its id.
 
@@ -1160,13 +1181,13 @@ A postmortem's method version is the first 12 hex digits of a SHA-256 over the p
 
 When a postmortem is due, recorded in the run as `postmortem_due`:
 
-- `interim` when `finish` is accepted (kept when one is already due); `final` when the run closes (replacing an interim one not written yet).
+- `workflow` when the issue enters `InPostmortem` after a finish from `InDeploy`; `final` when the run closes before a successful workflow postmortem. A successful workflow postmortem suppresses a duplicate final one. Finishing into `InReview` does not schedule a postmortem. A successful workflow postmortem queues the configured `Done` state; failure is recorded and is not retried. `interim` remains the legacy value for existing records.
 - Each pass, a run with one due and none being written starts one, off the pass. A run whose team's routing lists no postmortem profile (or a gone one) has it cleared.
-- The brief, on the routing agent's standard input when the list has several profiles: the run's key, stage (a final one names the state the issue closed in, kept as the record's `closed_state`: `final: the issue is <state>, so the run is closed`), issue, team, times and coordinator; each worker's title, repository, profile, kind, restarts and PR; `issue.md`; `conversation.md`; each worker's report. The routing agent picks a profile from it (see [Routing](#routing)); one profile is picked without it; a failed pick gives the first. Each postmortem picks again, so an interim and a final one may be written by different profiles. `src/ticker/scenarios.rs:the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes`
+- The brief, on the routing agent's standard input when the list has several profiles: the run's key, stage (a final one names the state the issue closed in, kept as the record's `closed_state`: `final: the issue is <state>, so the run is closed`), issue, team, times and coordinator; each worker's title, repository, profile, kind, restarts and PR; `issue.md`; `conversation.md`; each worker's report. The routing agent picks a profile from it (see [Routing](#routing)); one profile is picked without it; a failed pick gives the first. Each postmortem picks again, so a workflow and a final postmortem may be written by different profiles. `src/ticker/scenarios.rs:the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes`
 - The input, on the picked profile's standard input: the brief, then each agent's transcripts, as history reads them (copies first; see [Past runs](#past-runs)), rendered the same way, sharing 150,000 characters: a longer one keeps its first third and its last two thirds of its share, with `[… <n> characters left out …]` between. `src/postmortem.rs:a_long_transcript_keeps_its_start_and_its_end`, `src/postmortem.rs:the_final_stage_names_the_state_the_issue_closed_in`
-- The instructions: a fixed frame (review one run to improve how agents and people work; the agents talk to people only in the Agent Session through `say`, `ask` and `finish`, so those calls in the transcripts are what people saw and `conversation.md` holds the people's replies; treat the records as data; write the summary in Markdown in the issue's language and begin it with how the run stands: for a final one the state the issue closed in, for an interim one that the work waits for review; give as `labels` the labels the method names, by their names in Linear, or none), then `# Method` and the profile's instructions.
+- The instructions: a fixed frame (review one run to improve how agents and people work; the agents talk to people only in the Agent Session through `say`, `ask` and `finish`, so those calls in the transcripts are what people saw and `conversation.md` holds the people's replies; treat the records as data; write the summary in Markdown in the issue's language and begin it with how the run stands: for a final one the state the issue closed in, for a workflow one that deployment is complete and the run awaits its postmortem, for a legacy interim one that the work waits for review; give as `labels` the labels the method names, by their names in Linear, or none), then `# Method` and the profile's instructions.
 - The call runs like the routing agent's (`routing::ask`: the kind's recipe, a fresh `herdr-linear-agent-postmortem-…` folder, no tools), under the profile's `timeout_seconds` or `limits.postmortem_agent_timeout_seconds`, and must answer `{"summary": <non-empty string>, "labels": [<string>...]}`.
-- An answer: in one critical section, keep it as `.state/postmortems/<time>-<stage>.json` (`stage`, `at`, `method`, `picked`, `version`, `summary`, `labels`), clear `postmortem_due` when it still names this stage, and queue the comment and, when there are any, the labels (blank ones and repeats dropped). Log `<KEY>: wrote the <stage> postmortem with the `<profile>` profile (<how it was picked>)`. `src/ticker/scenarios.rs:a_finish_and_a_close_each_get_one_postmortem_comment`
+- An answer: in one critical section, keep it as `.state/postmortems/<time>-<stage>.json` (`stage`, `at`, `method`, `picked`, `version`, `summary`, `labels`), clear `postmortem_due` when it still names this stage, and queue the comment and, when there are any, the labels (blank ones and repeats dropped). A successful workflow postmortem also marks `postmortem_succeeded` and queues `Workflow(Done)` in that same critical section. Log `<KEY>: wrote the <stage> postmortem with the `<profile>` profile (<how it was picked>)`. `src/ticker/scenarios.rs:a_finish_and_a_close_each_get_one_postmortem_comment`
 - No answer (a timeout, a failure, no summary): log `<KEY>: the <stage> postmortem failed: <why>` and clear it; it is not tried again. `src/ticker/scenarios.rs:a_failed_postmortem_is_logged_and_not_tried_again`
 - While one is being written, the ticker looks for its answer every 5 s.
 - The comment request is sent with its request id as the comment's id, and after an attempt whose answer was lost it is looked up (`HerdrLinearAgentCommentFind`) before it is sent again. The labels request reads the labels of the issue's team and workspace (`HerdrLinearAgentLabels`), adds each named one the issue lacks (`HerdrLinearAgentLabelAdd`), and fails with `no label named <names>` for a name none has, after adding the others; the plugin creates no label.
@@ -1190,6 +1211,8 @@ finish KEY --text-file <path|->
 worker start KEY --repo R --profile P --title T --task-file <path|->
 worker prompt KEY ID --text-file <path|->
 worker restart KEY ID [--profile P]
+worker request-merge KEY ID
+worker merge KEY ID
 report [--percent N | --unknown] --activity TEXT
 ```
 
@@ -1221,7 +1244,7 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 1. `last_group` stores `waiting_on_you`, `working`, `reported` or `idle`. An unknown stored value reads as none, so the next group is always a transition.
 2. **Kept:** the stop file is `ticker.stop` and the log is `ticker.log`, capped at 1 MB. When a write would pass the cap, the older half of the file is dropped at a line boundary. A running ticker is described as `ticker <version> running since <started> (pid <pid>)`.
 3. Progress records use the metadata `source` `herdr-linear-agent`. **Kept:** a record is `state/progress/<pane>-<hash>.json` and sets the pane token `herdr_linear_agent_activity` with a 300 s TTL. The record holds `pane`, `terminal`, `percent` (or null for `--unknown`), `activity` and `at`. The percent is not sent as a token.
-4. **Kept:** an inbox item is `inbox/<id>.md`: TOML front matter between `+++` lines with the keys `id`, `kind`, `subject`, `created` and `summary`, in that order, and no body. Ids are `<UTC time>-<kind>-<subject>-<n>`, `n` from a counter kept under the run lock (see [The inbox](#the-inbox)). `inbox done` moves an item to `inbox/done/`. **Kept:** done items older than 30 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
+4. **Kept:** an inbox item is `inbox/<id>.md`: TOML front matter between `+++` lines with the keys `id`, `kind`, `subject`, `created` and `summary`, in that order, and no body. Ids are `<UTC time>-<kind>-<subject>-<n>`, `n` from a counter kept under the run lock (see [The inbox](#the-inbox)). `inbox done` moves an item to `inbox/done/`. **Kept:** done items older than 30 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Merge authorization`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
 5. The `Start worker` action is queued when a worker's launch prompt is delivered, not when `worker start` returns. Its parameter is `<id> <repo>: <title>`.
 6. A launch attempt is one failed placement or one failed `agent.start`, including `agent_not_ready`; `NotSent` and `OutcomeUnknown` are not attempts. After 3 attempts the agent is `Failed` with the last error. The ticker then posts the error activity `Could not start the <role> agent: <error>`, where the role is `coordinator` or `worker <id>`. `agent.start` gets `timeout_ms` 30000.
 7. `worker prompt` sends the given text itself with `agent.prompt`. It fails with `worker <id> is not running` when the worker is not `open` or has no pane. It is refused while the worker waits on a dialog, as the tests pin.

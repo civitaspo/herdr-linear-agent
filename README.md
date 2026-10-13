@@ -16,13 +16,14 @@ Workspace labels put the ticket first. A coordinator is labeled `acme/DATA-1 · 
 - **One writer.** Only the plugin's background ticker writes to Linear. Agents call plugin subcommands that queue requests; they never hold a Linear token.
 - **Profiles, not flags.** Agent kind, model, effort and permission flags live in profiles you write in the config. Agents choose a profile by name and nothing else.
 - **Limits enforced by the binary.** Concurrent runs, workers per run and total agents are capped by the plugin, not by the agents.
-- **Nothing is merged for you.** No merge, no force push, and no issue moved to Done. The plugin moves an issue to a started state when it picks it up and to your review state when the coordinator finishes.
+- **Merging is opt-in and requires an allowed Linear reply.** A team can enable one-time squash-merge authorization with `merge_on_authorization = true`; without it, the plugin never merges. The coordinator requests authorization for a worker's recorded PR, and a user in that team's `allowed_user_ids` must reply with the exact token shown in Linear. The coordinator then asks the plugin to make one `gh pr merge --squash` attempt. A confirmed merge moves the issue to deployment and resumes the coordinator for the remaining work. The plugin never force-pushes.
 
 ## Requirements
 
 - macOS or Linux, and Herdr 0.9.1 or later
 - On Linux: a Secret Service provider (GNOME Keyring, KWallet) for the token, and `xdg-open`
 - The agent CLIs your profiles use (`claude`, `codex`, `cursor-agent`, ...) and `git`
+- `gh` on the ticker's `PATH` when any team enables `merge_on_authorization`
 - One or more Linear workspaces where you can install an OAuth application (workspace admin)
 
 ## Set up
@@ -54,7 +55,12 @@ client_id = "your-oauth-client-id"       # the OAuth application of this workspa
 [workspaces.acme.teams.DATA]             # a team to pick issues from, by team key
 allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
 # allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
-review_state = "In Review"               # where `finish` moves the issue (default)
+started_state = "In Progress"            # where issues move on pickup (default)
+review_state = "In Review"               # where the first `finish` moves the issue (default)
+# deploy_state = "In Deploy"             # after an authorized worker merge succeeds
+# postmortem_state = "In Postmortem"     # when the coordinator finishes deployment work
+# done_state = "Done"                    # after a successful workflow postmortem
+# merge_on_authorization = false          # allow one-time worker PR squash merges after an allowed Linear reply
 routing = "default"                      # the routing of this team's issues, a table under [routing] (required)
 
 [workspaces.acme.teams.OPS]              # each team has its own allowed users, review state and routing
@@ -104,13 +110,17 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 - Removing a profile that a running run uses is not refused; restarting or resuming with it fails then with the usual unknown-profile error.
 - Lowering a limit below the current count leaves running runs alone; new ones wait until there is room.
 
-**Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids`, `allowed_delegator_ids` and `review_state` apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and moves to `In Review` on `finish`.
+**Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids`, `allowed_delegator_ids` and workflow states apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and uses the default workflow states.
+
+**Workflow states.** The plugin moves issues through the configured started, review, deployment, postmortem and completed states. State names are matched case-insensitively. If a target is missing, the plugin asks an allowed user in the Linear session which team state to use for that transition. The answer applies to that transition only, so a later missing target asks again. The completed target must have Linear's `completed` type. If you call the deployment phase "In Release", set `deploy_state = "In Release"`.
 
 **Who may delegate.** The ticker takes an issue only when a person in the team's `allowed_delegator_ids` delegated it; see [Security notes](#security-notes), and [Finding user IDs](#finding-user-ids) for the IDs. Without the key, the team's `allowed_user_ids` may delegate. Set it apart when someone should start runs without their replies counting as instructions, or the other way round.
 
 ### Postmortems
 
-To improve how the agents work run after run, a routing can list postmortem profiles: when the coordinator calls `finish` (an interim postmortem) and when the issue is completed or canceled (a final one), an agent reads the run and the plugin posts its summary as a comment on the issue, with the labels it names. A postmortem profile is an ordinary profile: its `instructions.md` is the method, and says which labels to add. Edit it as often as you like; each comment names the profile and the method's version.
+To improve how the agents work run after run, a routing can list postmortem profiles. After an authorized merge, the coordinator completes deployment work and calls `finish`. The issue moves to its postmortem state, and a postmortem agent reads the run. The plugin posts the summary and labels, then moves the issue to its completed state only after that postmortem succeeds. Without a postmortem profile, or after a failed postmortem, the issue stays in its postmortem state for manual follow-up. Finishing into review does not run a postmortem.
+
+An issue completed or canceled before a successful workflow postmortem gets a final postmortem when its run closes. A successful workflow postmortem prevents a duplicate final one. A postmortem profile is an ordinary profile: its `instructions.md` is the method, and says which labels to add. Edit it as often as you like; each comment names the profile and the method's version.
 
 ```toml
 # profiles/postmortem/config.toml: any kind that can be a routing agent
@@ -127,7 +137,7 @@ description = "Reviews a run for what to change in how the agents work"
 Add the label `Improvement` only when there is something concrete to change in how the agents work.
 ```
 
-Then list it in the routing: `postmortems = ["postmortem"]`. Each postmortem, interim or final, picks its profile when it is written: a list with one profile gives that profile; with several, the routing agent picks one from the run's issue, `conversation.md`, workers' reports, PRs and times (not the transcripts), and a failed pick gives the first. The picked profile runs headless the way the routing agent does, with no tools: the plugin gives it the run's records on standard input (the issue, `conversation.md`, the workers' reports, and the agents' transcripts, long ones shortened in the middle), and it answers with the summary and the labels. The plugin keeps each answer in the run folder (`.state/postmortems/`), posts the comment, and adds the labels that exist in Linear (it creates none). A comment reads `**Postmortem (interim)**, method `postmortem` version `<12 hex digits>``, then the summary; the version is a hash of the profile, so it changes when you edit the method.
+Then list it in the routing: `postmortems = ["postmortem"]`. Each postmortem, workflow or final, picks its profile when it is written: a list with one profile gives that profile; with several, the routing agent picks one from the run's issue, `conversation.md`, workers' reports, PRs and times (not the transcripts), and a failed pick gives the first. The picked profile runs headless the way the routing agent does, with no tools: the plugin gives it the run's records on standard input (the issue, `conversation.md`, the workers' reports, and the agents' transcripts, long ones shortened in the middle), and it answers with the summary and the labels. The plugin keeps each answer in the run folder (`.state/postmortems/`), posts the comment, and adds the labels that exist in Linear (it creates none). A workflow comment reads `**Postmortem (workflow)**, method `postmortem` version `<12 hex digits>``, then the summary; the version is a hash of the profile, so it changes when you edit the method.
 
 ### Finding user IDs
 
@@ -361,11 +371,11 @@ Other kinds are not registered.
 
 1. The ticker (a background process the startup hook starts) polls each workspace every 5 seconds (`intake_interval_seconds`) for issues delegated to its app user in the configured teams that are neither completed nor canceled.
 2. It checks who delegated each new issue. An issue that someone outside the team's `allowed_delegator_ids` delegated gets no run: the ticker answers its session once, logs the delegator's name and ID and shows a Herdr notification.
-3. For a new issue it creates a run folder, creates an Agent Session, posts a first thought, moves the issue to the team's first started state, picks the coordinator profile, and opens a Herdr workspace with the coordinator in the run folder.
+3. For a new issue it creates a run folder, creates an Agent Session, posts a first thought, moves the issue to the team's configured started state, picks the coordinator profile, and opens a Herdr workspace with the coordinator in the run folder.
 4. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. If a worker is still working, it says what it is waiting for and ends its turn. Once all workers have reported, `herdr-linear-agent wait` can end a completed turn while keeping the issue active; `finish` moves work ready for review. Each worker gets a worktree created by `herdr worktree create` on a branch `herdr-linear-agent/<workspace>/<issue-key>/<id>-<title>`.
 5. Workers report what they are doing (`herdr-linear-agent report --activity`) and write a report (`PR: <url>`, `## Report`, `## Next`). The ticker shows each new activity in the session, posts a worker that waits on someone, its report and its pull requests, copies the report into the run folder, and tells the coordinator through its inbox. After 10 quiet minutes it posts what each worker is doing and for how long.
-6. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. A stop signal interrupts the run's agents.
-7. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported.
+6. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. Changes to the issue's Linear workflow state create inbox items for the coordinator. A stop signal interrupts the run's agents.
+7. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported. An authorized worker merge moves the issue to deployment and resumes the coordinator. After deployment work, a later `finish` moves the issue to its postmortem state. A successful workflow postmortem advances it to the completed state.
 8. When the issue is completed or canceled, the ticker stops the agents, closes their workspaces and ends the session with a short response. Checkouts and branches are kept.
 
 If Linear removes the delegate or archives/dismisses the run's session, the ticker pauses the run, interrupts its agents and keeps its worktrees and history. It posts an ordinary issue comment with an incident-specific code. To authorize restoration, add an issue comment containing exactly `resume <code>`; `stop <code>` declines that request and leaves the run paused. The author must be a human in both the team's `allowed_user_ids` and `allowed_delegator_ids` (which defaults to `allowed_user_ids`). Restoring the delegate in the UI does not bypass a pending comment request.
@@ -375,6 +385,10 @@ After approval, the Linear task restores delegation and opens a new Linear sessi
 When a pane needs a person (a permission or trust dialog), the ticker says so in the session with the pane to go to, and shows a Herdr notification.
 
 If an agent process exits while its Herdr pane remains open, the ticker confirms the pane is still empty for 30 seconds, then can resume that agent in the same pane and native session. It waits 15, 30 and 60 seconds before up to three automatic resume starts (in addition to the original launch); the attempt budget survives successful resumes and ticker restarts. A pane occupied by another agent is left alone. A missing native session or exhausted budget marks recovery stale; the coordinator receives an explicit `resume` action, and a worker's coordinator inbox gets a manual restart item.
+
+When `merge_on_authorization = true`, the coordinator runs `worker request-merge <KEY> <id>` for a worker's recorded pull request. An allowed user's exact `merge <token>` reply authorizes one `worker merge <KEY> <id>` attempt. If the command result is unknown, the plugin checks the PR with `gh pr view` before allowing a new authorization. It never retries a merge with the consumed token.
+
+For this workflow, set the Linear team's **Workflows & automations → On PR merge, move to…** to the configured deployment state, or to **No action**. If the GitHub integration moves the issue directly to `Done`, the plugin closes the run and writes its final postmortem. Deployment work and the workflow postmortem do not run. Queued workflow transitions leave completed and canceled issues alone.
 
 ## Actions
 

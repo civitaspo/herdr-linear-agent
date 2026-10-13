@@ -95,6 +95,10 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
     ];
     assert_eq!(world.bodies(KEY, "thought"), expected);
     assert_eq!(world.issue_state(KEY), "In Progress");
+    assert!(
+        !mentions(&world.inbox(KEY), "moved to"),
+        "pickup is not a state notice"
+    );
     let canonical = run.canonical_dir().to_string_lossy().into_owned();
     let cwds: Vec<Option<String>> = world.herdr.panes().into_iter().map(|p| p.cwd).collect();
     assert_eq!(cwds, [Some(canonical)]);
@@ -140,6 +144,176 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
         (world.herdr.starts().len(), world.sessions()),
         (1, 1),
         "claimed once"
+    );
+}
+
+#[tokio::test]
+async fn workflow_state_changes_reach_the_coordinator_once_including_same_type_changes() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+
+    world.move_issue(KEY, "In Review");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Review"))
+            .count(),
+        1,
+        "cursor {:?}",
+        world.record(KEY).issue_state
+    );
+
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Review"))
+            .count(),
+        1,
+        "{:?}",
+        world.inbox(KEY)
+    );
+
+    world.move_issue(KEY, "In Progress");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-13T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(world.record(KEY).issue_state.unwrap().name, "In Review");
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Progress"))
+            .count(),
+        0,
+        "stale issue details are ignored"
+    );
+
+    world.move_issue(KEY, "In Progress");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|s| s.contains("moved to In Progress"))
+            .count(),
+        1,
+        "{:?}",
+        world.inbox(KEY)
+    );
+
+    world.later(120);
+    world.settle().await;
+    let coordinator = world.record(KEY).coordinator.pane_id;
+    assert_eq!(count(&to(&world, &coordinator), NUDGE_INBOX), 1);
+}
+
+#[tokio::test]
+async fn pickup_state_already_started_before_the_first_detail_is_silent() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.once().await;
+
+    assert_eq!(
+        world.runs(),
+        1,
+        "claim is created before the first run read"
+    );
+    assert!(world.record(KEY).coordinator.profile.is_empty());
+    assert_eq!(world.issue_state(KEY), "Todo");
+
+    // Linear can move an issue to its started state when it opens the agent
+    // session, before the ticker's first detailed read.
+    world.move_issue(KEY, "In Progress");
+    world.later(5);
+    world.settle().await;
+
+    assert_eq!(world.issue_state(KEY), "In Progress");
+    assert!(!mentions(&world.inbox(KEY), "moved to In Progress"));
+    assert_eq!(world.record(KEY).issue_state.unwrap().name, "In Progress");
+}
+
+#[tokio::test]
+async fn selecting_a_started_state_for_initial_pickup_is_silent_and_keeps_later_transitions() {
+    let mut world = World::with(|config| {
+        config.replace(
+            "started_state = \"In Progress\"",
+            "started_state = \"Missing Started State\"",
+        )
+    });
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+
+    assert_eq!(
+        world.record(KEY).workflow.pending_choice.unwrap().stage,
+        crate::run::WorkflowStage::InProgress
+    );
+    assert_eq!(
+        world.record(KEY).issue_state.unwrap().pickup_state,
+        "Missing Started State"
+    );
+    world.message(KEY, "user-1", "In Review", None);
+    world.settle().await;
+
+    assert_eq!(world.issue_state(KEY), "In Review");
+    assert!(!mentions(&world.inbox(KEY), "moved to In Review"));
+    assert_eq!(
+        world.record(KEY).issue_state.unwrap().pickup_state,
+        "In Review"
+    );
+
+    world.move_issue(KEY, "In Progress");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|summary| summary.contains("moved to In Progress"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn configured_started_state_uses_linear_canonical_name_case_insensitively() {
+    let mut world = World::with(|config| {
+        config.replace(
+            "started_state = \"In Progress\"",
+            "started_state = \"in progress\"",
+        )
+    });
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+
+    assert_eq!(world.issue_state(KEY), "In Progress");
+    assert!(!mentions(&world.inbox(KEY), "moved to In Progress"));
+}
+
+#[tokio::test]
+async fn pickup_in_another_started_state_does_not_suppress_a_later_started_transition() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.move_issue(KEY, "In Review");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.settle().await;
+    assert!(!mentions(&world.inbox(KEY), "moved to"));
+
+    world.move_issue(KEY, "In Progress");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    world.settle().await;
+    assert_eq!(
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|summary| summary.contains("moved to In Progress"))
+            .count(),
+        1
     );
 }
 
@@ -899,6 +1073,133 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
 }
 
 #[tokio::test]
+async fn a_merge_needs_an_exact_allowed_reply_and_the_plugin_consumes_it_once() {
+    let mut world = World::with(|config| {
+        config.replacen(
+            "routing = \"default\"",
+            "merge_on_authorization = true\nrouting = \"default\"",
+            1,
+        )
+    });
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.report(&worker, &format!("PR: {PR}\n## Report\nReady to review.\n"));
+    world.settle().await;
+    add_workflow_states(&world);
+    commands::finish(&world.ctx(), &world.session(), KEY, "Ready for review.")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert!(world.record(KEY).finished);
+    assert_eq!(world.issue_state(KEY), "In Review");
+
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.settle().await;
+    let prompt = world
+        .bodies(KEY, "thought")
+        .into_iter()
+        .find(|body| body.contains("reply exactly `merge "))
+        .expect("merge request was sent to Linear");
+    let token = prompt
+        .split("reply exactly `merge ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(uuid::Uuid::parse_str(&token).is_ok());
+
+    world.message(KEY, "user-2", &format!("merge {token}"), None);
+    world.settle().await;
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Pending { .. })
+    ));
+    assert!(!world.text(KEY, "conversation.md").contains(&token));
+    assert!(mentions(
+        &world.inbox(KEY),
+        "reply for worker w1 was ignored"
+    ));
+
+    world.later(1);
+    let wrong = uuid::Uuid::new_v4().to_string();
+    world.message(KEY, "user-1", &format!("merge {wrong}"), None);
+    world.settle().await;
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Pending { .. })
+    ));
+    assert!(!world.text(KEY, "conversation.md").contains(&wrong));
+
+    world.later(1);
+    world.message(KEY, "user-1", "merge the PR", None);
+    world.settle().await;
+    assert!(world.text(KEY, "conversation.md").contains("merge the PR"));
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Pending { .. })
+    ));
+
+    world.later(1);
+    world.message(KEY, "user-1", &format!("merge {token}"), None);
+    world.settle().await;
+    assert_eq!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_authorization,
+        Some(worker::MergeAuthorization::Authorized {
+            token: token.clone(),
+            pr_url: PR.into(),
+            by: "user-1".into(),
+        })
+    );
+    assert!(!world.text(KEY, "conversation.md").contains(&token));
+    assert!(mentions(
+        &world.inbox(KEY),
+        "An allowed user authorized worker w1's pull request merge."
+    ));
+
+    world.runner.on("gh pr merge", crate::process::fake::ok(""));
+    commands::worker_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+    assert_eq!(
+        worker::load(&world.run(KEY), "w1").unwrap().merge_attempt,
+        Some(worker::MergeAttempt::Merged { pr_url: PR.into() })
+    );
+    world.settle().await;
+    assert_eq!(world.issue_state(KEY), "In Deploy");
+    assert!(!world.record(KEY).finished);
+    assert!(
+        commands::worker_merge(&world.ctx(), KEY, "w1")
+            .await
+            .is_err()
+    );
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+
+    let current = worker::load(&world.run(KEY), "w1").unwrap();
+    world.report(
+        &current,
+        "PR: https://github.com/acme/api/pull/8\n## Report\nMoved the work.\n",
+    );
+    world.settle().await;
+    let updated = worker::load(&world.run(KEY), "w1").unwrap();
+    assert_eq!(updated.pr_url, "https://github.com/acme/api/pull/8");
+    assert!(updated.merge_authorization.is_none());
+    assert!(updated.merge_attempt.is_none());
+}
+
+#[tokio::test]
 async fn finish_and_worker_start_hold_their_limits() {
     let mut world = World::with(limit("max_workers_per_run", 1));
     world.running_issue().await;
@@ -1615,6 +1916,55 @@ fn posted(world: &World) -> Vec<String> {
         .collect()
 }
 
+fn add_workflow_states(world: &World) {
+    let mut linear = world.fake_for(KEY);
+    let states = linear.issue_mut("DATA-1")["team"]["states"]["nodes"]
+        .as_array_mut()
+        .unwrap();
+    states.push(json!({"id":"state-deploy","name":"In Deploy","type":"started","position":6.0}));
+    states.push(
+        json!({"id":"state-postmortem","name":"In Postmortem","type":"started","position":7.0}),
+    );
+    states.push(json!({"id":"state-done","name":"Done","type":"completed","position":8.0}));
+}
+
+#[tokio::test]
+async fn deployment_finish_runs_workflow_postmortem_then_moves_to_done() {
+    let mut world = World::sample();
+    postmortem_method(
+        &mut world,
+        "review",
+        r#"{"summary":"Deployment learned from.","labels":[]}"#,
+    );
+    world.running_issue().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Ready for review.")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert!(
+        posted(&world).is_empty(),
+        "review does not schedule a postmortem"
+    );
+
+    add_workflow_states(&world);
+    world.move_issue(KEY, "In Deploy");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.later(5);
+    world.settle().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Deployment complete.")
+        .await
+        .unwrap();
+    world.settle().await;
+
+    assert_eq!(world.fake().issue("DATA-1")["state"]["name"], "Done");
+    assert_eq!(
+        world.record(KEY).workflow.confirmed,
+        Some(crate::run::WorkflowStage::Done)
+    );
+    assert!(world.record(KEY).workflow.postmortem_succeeded);
+    assert_eq!(posted(&world).len(), 1);
+}
+
 #[tokio::test]
 async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
     let mut world = World::sample();
@@ -1628,34 +1978,21 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
         .await
         .unwrap();
     world.settle().await;
-    let version = version_of(&world, "review");
-    assert_eq!(
-        posted(&world),
-        [format!(
-            "**Postmortem (interim)**, method `review` version `{version}`\n\nIt went well."
-        )]
-    );
-    let labels: Vec<String> = world.fake().issue("DATA-1")["labels"]["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|l| l["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        labels,
-        ["Improvement"],
-        "a label outside the method's list is dropped"
+    assert!(
+        posted(&world).is_empty(),
+        "review does not schedule a postmortem"
     );
 
     world.move_issue(KEY, "Canceled");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
     world.later(5);
     world.settle().await;
     world.later(5);
     world.settle().await;
     let comments = posted(&world);
-    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert_eq!(comments.len(), 1, "{comments:?}");
     assert!(
-        comments[1].starts_with("**Postmortem (final)**"),
+        comments[0].starts_with("**Postmortem (final)**"),
         "{comments:?}"
     );
     assert_eq!(world.record(KEY).closed_state, "Canceled");
@@ -1663,12 +2000,8 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
     let kept = std::fs::read_dir(world.run(KEY).state_dir().join("postmortems"))
         .unwrap()
         .count();
-    assert_eq!(kept, 2);
+    assert_eq!(kept, 1);
     let log = world.log_text();
-    assert!(
-        log.contains("acme/DATA-1: wrote the interim postmortem"),
-        "{log}"
-    );
     assert!(
         log.contains(
             "acme/DATA-1: wrote the final postmortem with the `review` profile (the only candidate)"
@@ -1705,6 +2038,11 @@ async fn a_routing_with_one_candidate_each_asks_no_routing_agent() {
         world.bodies(KEY, "thought")[1..],
         ["The coordinator uses the `coordinator-light` profile (the only candidate)."]
     );
+    add_workflow_states(&world);
+    world.move_issue(KEY, "In Deploy");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.later(5);
+    world.settle().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
         .await
         .unwrap();
@@ -1712,7 +2050,7 @@ async fn a_routing_with_one_candidate_each_asks_no_routing_agent() {
     assert_eq!(posted(&world).len(), 1);
     let log = world.log_text();
     assert!(
-        log.contains("acme/DATA-1: wrote the interim postmortem with the `review` profile (the only candidate)"),
+        log.contains("acme/DATA-1: wrote the workflow postmortem with the `review` profile (the only candidate)"),
         "{log}"
     );
 }
@@ -1723,6 +2061,11 @@ async fn the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes()
     postmortem_profile(&world, "quick");
     postmortem_method(&mut world, "quick", r#"{"summary":"Short.","labels":[]}"#);
     world.running_issue().await;
+    add_workflow_states(&world);
+    world.move_issue(KEY, "In Deploy");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.later(5);
+    world.settle().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
         .await
         .unwrap();
@@ -1731,13 +2074,13 @@ async fn the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes()
     assert_eq!(
         posted(&world),
         [format!(
-            "**Postmortem (interim)**, method `quick` version `{version}`\n\nShort."
+            "**Postmortem (workflow)**, method `quick` version `{version}`\n\nShort."
         )]
     );
     let log = world.log_text();
     assert!(
         log.contains(
-            "wrote the interim postmortem with the `quick` profile (chosen by the routing agent)"
+            "wrote the workflow postmortem with the `quick` profile (chosen by the routing agent)"
         ),
         "{log}"
     );
@@ -1748,6 +2091,11 @@ async fn a_failed_postmortem_is_logged_and_not_tried_again() {
     let mut world = World::sample();
     postmortem_method(&mut world, "review", "");
     world.running_issue().await;
+    add_workflow_states(&world);
+    world.move_issue(KEY, "In Deploy");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    world.later(5);
+    world.settle().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
         .await
         .unwrap();
@@ -1758,7 +2106,7 @@ async fn a_failed_postmortem_is_logged_and_not_tried_again() {
     assert_eq!(world.record(KEY).postmortem_due, None);
     let log = world.log_text();
     assert_eq!(
-        log.matches("acme/DATA-1: the interim postmortem failed: it exited with")
+        log.matches("acme/DATA-1: the workflow postmortem failed: it exited with")
             .count(),
         1,
         "{log}"
