@@ -567,6 +567,9 @@ The failures shared a test-fixture issue: the scenarios pinned Linear's
 the fixture update as stale and ignored it. The scenarios now derive those
 timestamps from `World::now()`, retaining the intended newer, older, and later
 event ordering without depending on the calendar date. The full workspace
-suite on the updated feature branch passes 443 tests with 1 ignored. The earlier
-base and PR runs remain historical evidence; CI for the updated branch is
-pending.
+suite on feature head `1d6d363` passes 443 tests with 1 ignored. GitHub CI run
+[38509891860](https://github.com/civitaspo/herdr-linear-agent/actions/runs/38509891860)
+also passes on macOS and Ubuntu. The earlier base and PR runs remain historical
+evidence. The required Securefix check failed at run
+[38509931848](https://github.com/civitaspo/securefix-server/actions/runs/38509931848)
+when the service received 403 Forbidden posting a comment to PR #151.
