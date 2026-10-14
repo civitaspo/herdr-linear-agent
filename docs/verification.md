@@ -512,3 +512,39 @@ returned the same 944 diff bytes as `gh pr diff 15`: both SHA-256 hashes were
 This was a read-only GitHub compatibility check. No assessment model, agent
 CLI or Linear request was run, and no scratch PR or issue was changed. It does
 not verify a real machine assessment, merge, restart or performance lane.
+
+## Merge-decision transport and machine merge (2026-10-14)
+
+The feature build at `e818494` ran with Herdr 0.9.3 and Codex CLI 0.160.0
+(`gpt-6-luna`, low reasoning) in the isolated `mda151` session. A temporary
+configuration polled only the Personal workspace's CIV team and used the
+private `civitaspo/testing-herdr-linear-agent` repository, with a risk threshold
+of 100. No separate decision pane appeared.
+
+The worker's branch-bound PR, [testing-herdr-linear-agent#22](https://github.com/civitaspo/testing-herdr-linear-agent/pull/22), had
+head `08bd7a0e51fc578c6cdd1ff1553db8b8ad962ab0` and base
+`fc53e159f809a8498df2585f58caa1a36f2fdccc`. The `quick` and `slow` checks
+passed; `failing` was intentionally skipped. An initial assessment request
+against a PR on the wrong branch ended with `identity_mismatch`. The corrected
+PR was then rejected while its `slow` check was in progress. After all checks
+were terminal, a fresh request passed the strict output parser with a real risk
+score of 18/100. This confirms that a skipped check can coexist with successful
+checks and that a pending check blocks assessment.
+
+`worker merge` rechecked the evidence, submitted one squash merge bound to the
+recorded head SHA, and read back the merged PR. GitHub reported the merge at
+03:38:11Z; the worker record stored the matching head, decision ID and merged
+result. Linear moved CIV-21 to Done at 03:38:13Z. The isolated team did not
+have an In Deploy state, so its temporary configuration mapped deployment to
+Done; this did not exercise a multi-stage deployment or postmortem workflow.
+
+The worker CLI could not write the linked worktree's Git metadata in its
+sandbox. The coordinator therefore made the one-file fixture commit in the
+disposable clone and updated the worker report with the resulting PR receipt.
+The issue asked for the fixture line with a final period, but the committed
+line omitted it; the model noted the omission and still scored the documentation
+change at 18. This run verifies the real model transport, provenance, hard
+gates, head-bound merge and readback, not task correctness or risk-score
+calibration. It did not test restart recovery, concurrent assessments,
+in-flight evidence changes, ambiguous merge transport, or performance. The
+project PR remains open and unmerged.
