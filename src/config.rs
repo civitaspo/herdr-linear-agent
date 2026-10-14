@@ -85,8 +85,18 @@ pub struct Team {
     /// Let an allowed Linear reply authorize a worker PR merge.
     #[serde(default)]
     pub merge_on_authorization: bool,
+    /// Assess a worker PR with one configured headless decision profile.
+    #[serde(default)]
+    pub merge_decision: Option<MergeDecisionConfig>,
     /// The routing of this team's issues: a table under `routing`.
     pub routing: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MergeDecisionConfig {
+    pub profile: String,
+    pub max_risk_score: u8,
 }
 
 impl Team {
@@ -209,12 +219,12 @@ pub struct Profile {
     /// out. Markdown the plugin adds to the agent's instructions for work
     /// under this profile, after the built-in sheet. Only people write it.
     pub instructions: Vec<Instructions>,
-    /// Environment variables for the routing agent's call. Herdr starts
-    /// coordinators and workers and cannot pass them any, so only the
-    /// routing agent's profile may set this.
+    /// Environment variables for routing, postmortem, and merge decision
+    /// agent calls. Herdr starts coordinators and workers and cannot pass
+    /// them any.
     pub env: BTreeMap<String, String>,
-    /// How long a call of this profile as a routing or postmortem agent may
-    /// take; the limits' default for that role when unset.
+    /// How long a routing, postmortem, or merge decision call may take.
+    /// Unset values use the role's limit; merge decisions use the routing limit.
     pub timeout_seconds: Option<u64>,
 }
 
@@ -269,6 +279,24 @@ impl Config {
             .with_context(|| format!("could not read {}", path.display()))?;
         let profiles = load_profiles(&config_dir.join(PROFILES_DIR))?;
         Self::parse(&text, profiles).with_context(|| format!("{} is not valid", path.display()))
+    }
+
+    /// Loads one config snapshot only when its before/after content hashes
+    /// match. This detects ordinary concurrent edits without claiming a
+    /// multi-file atomic read.
+    pub fn load_stable(config_dir: &Path) -> Result<(Config, [u8; 32])> {
+        let before = Self::fingerprint(config_dir)?;
+        let config = Self::load(config_dir)?;
+        let after = Self::fingerprint(config_dir)?;
+        anyhow::ensure!(before == after, "config changed while it was being read");
+        Ok((config, after))
+    }
+
+    pub fn fingerprint_hex(fingerprint: &[u8; 32]) -> String {
+        fingerprint
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// A SHA-256 over the files `load` reads, by sorted path and content:
@@ -491,11 +519,11 @@ impl Config {
                 .any(|r| r.coordinators.contains(name) || r.workers.contains(name));
             ensure!(
                 profile.env.is_empty() || !used,
-                "profile `{name}`: env applies only to the routing and postmortem agents, but `{name}` is also a coordinator or worker profile"
+                "profile `{name}`: env applies only to routing, postmortem, or merge decision agents, but `{name}` is also a coordinator or worker profile"
             );
             ensure!(
                 profile.timeout_seconds.is_none() || !used,
-                "profile `{name}`: timeout_seconds applies only to the routing and postmortem agents, but `{name}` is also a coordinator or worker profile"
+                "profile `{name}`: timeout_seconds applies only to routing, postmortem, or merge decision agents, but `{name}` is also a coordinator or worker profile"
             );
             if let Some(seconds) = profile.timeout_seconds {
                 ensure!(
@@ -511,6 +539,30 @@ impl Config {
                     "workspaces.{name}.teams.{key}.routing: there is no routing.{}",
                     team.routing
                 );
+                if let Some(decision) = &team.merge_decision {
+                    let at = format!("workspaces.{name}.teams.{key}.merge_decision");
+                    ensure!(
+                        !team.merge_on_authorization,
+                        "{at}: set either merge_on_authorization or merge_decision, not both"
+                    );
+                    ensure!(
+                        decision.max_risk_score <= 100,
+                        "{at}.max_risk_score must be between 0 and 100"
+                    );
+                    headless(&at, &decision.profile, "a merge decision agent")?;
+                    ensure!(
+                        !self.profiles[&decision.profile].instructions.is_empty(),
+                        "{at}: profile `{}` has no {INSTRUCTIONS_FILE}, which holds the method",
+                        decision.profile
+                    );
+                    for key in ["HERDR_PLUGIN_CONFIG_DIR", "HERDR_PLUGIN_STATE_DIR"] {
+                        ensure!(
+                            !self.profiles[&decision.profile].env.contains_key(key),
+                            "{at}: profile `{}` may not set {key}",
+                            decision.profile
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -718,6 +770,7 @@ started_state = "In Progress"
 deploy_state = "In Deploy"
 postmortem_state = "In Postmortem"
 done_state = "Done"
+# merge_decision = { profile = "merge-risk", max_risk_score = 20 }
 routing = "default"
 
 [herdr]
@@ -739,7 +792,7 @@ workers = ["standard", "deep"]
 "#;
 
     /// The sample's profile folders: name, `config.toml`, `instructions.md`.
-    pub const SAMPLE_PROFILES: [(&str, &str, Option<&str>); 5] = [
+    pub const SAMPLE_PROFILES: [(&str, &str, Option<&str>); 6] = [
         (
             "coordinator",
             "kind = \"claude\"\nmodel = \"opus\"\neffort = \"high\"\nargs = [\"--permission-mode\", \"auto\"]\ndescription = \"default coordinator\"\n",
@@ -760,6 +813,11 @@ workers = ["standard", "deep"]
             "deep",
             "kind = \"codex\"\nmodel = \"gpt-6-sol\"\neffort = \"xhigh\"\nargs = [\"-s\", \"workspace-write\"]\ndescription = \"cross-module changes\"\n",
             None,
+        ),
+        (
+            "merge-risk",
+            "kind = \"codex\"\nmodel = \"gpt-6-sol\"\n",
+            Some("Assess the change and its evidence, then report its risks.\n"),
         ),
     ];
 
@@ -797,6 +855,36 @@ workers = ["standard", "deep"]
         Config::load(dir.path()).map_err(|e| format!("{e:#}"))
     }
 
+    fn load_with_merge_profile(
+        text: &str,
+        profile: &str,
+        profile_config: &str,
+        instructions: Option<&str>,
+    ) -> Result<Config, String> {
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), text);
+        let folder = dir.path().join(PROFILES_DIR).join(profile);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(FILE_NAME), profile_config).unwrap();
+        let instructions_path = folder.join(INSTRUCTIONS_FILE);
+        if let Some(text) = instructions {
+            std::fs::write(instructions_path, text).unwrap();
+        } else {
+            let _ = std::fs::remove_file(instructions_path);
+        }
+        Config::load(dir.path()).map_err(|e| format!("{e:#}"))
+    }
+
+    fn merge_decision(text: &str, profile: &str, max_risk_score: u8) -> String {
+        text.replacen(
+            "routing = \"default\"",
+            &format!(
+                "merge_decision = {{ profile = \"{profile}\", max_risk_score = {max_risk_score} }}\nrouting = \"default\""
+            ),
+            1,
+        )
+    }
+
     #[test]
     fn the_sample_parses_with_defaults() {
         let config = sample();
@@ -805,6 +893,13 @@ workers = ["standard", "deep"]
         assert_eq!(
             config.team("acme", "DATA").unwrap().review_state,
             "In Review"
+        );
+        assert!(
+            config
+                .team("acme", "DATA")
+                .unwrap()
+                .merge_decision
+                .is_none()
         );
         assert!(
             config
@@ -823,6 +918,7 @@ workers = ["standard", "deep"]
                 "coordinator",
                 "coordinator-light",
                 "deep",
+                "merge-risk",
                 "router",
                 "standard"
             ]
@@ -975,6 +1071,7 @@ workers = ["standard", "deep"]
                 "coordinator",
                 "coordinator-light",
                 "deep",
+                "merge-risk",
                 "router",
                 "shared",
                 "standard"
@@ -1071,7 +1168,7 @@ workers = ["standard", "deep"]
         )
         .unwrap_err();
         assert!(error.ends_with(
-            "profile `standard`: env applies only to the routing and postmortem agents, but `standard` is also a coordinator or worker profile"
+            "profile `standard`: env applies only to routing, postmortem, or merge decision agents, but `standard` is also a coordinator or worker profile"
         ), "{error}");
     }
 
@@ -1297,6 +1394,175 @@ workers = ["standard", "deep"]
     }
 
     #[test]
+    fn merge_decision_config_is_opt_in_and_accepts_inclusive_threshold_bounds() {
+        let profile =
+            "kind = \"claude\"\nenv = { DECISION_PROFILE = \"isolated\" }\ntimeout_seconds = 60\n";
+        let instructions = "Review the complete change and evidence.\n";
+        for score in [0, 100] {
+            let text = merge_decision(SAMPLE, "merge-risk", score);
+            let config =
+                load_with_merge_profile(&text, "merge-risk", profile, Some(instructions)).unwrap();
+            assert_eq!(
+                config.team("acme", "DATA").unwrap().merge_decision,
+                Some(MergeDecisionConfig {
+                    profile: "merge-risk".into(),
+                    max_risk_score: score,
+                })
+            );
+            assert_eq!(
+                config.profile("merge-risk").unwrap().timeout_seconds,
+                Some(60)
+            );
+        }
+    }
+
+    #[test]
+    fn merge_decision_config_rejects_invalid_mode_score_and_schema() {
+        let profile = "kind = \"claude\"\n";
+        let instructions = Some("Review the complete change.\n");
+
+        let over_limit = merge_decision(SAMPLE, "merge-risk", 101);
+        assert!(
+            load_with_merge_profile(&over_limit, "merge-risk", profile, instructions)
+                .unwrap_err()
+                .contains("max_risk_score must be between 0 and 100")
+        );
+
+        let both_modes = merge_decision(
+            &SAMPLE.replace(
+                "routing = \"default\"",
+                "merge_on_authorization = true\nrouting = \"default\"",
+            ),
+            "merge-risk",
+            20,
+        );
+        assert!(
+            load_with_merge_profile(&both_modes, "merge-risk", profile, instructions)
+                .unwrap_err()
+                .contains("set either merge_on_authorization or merge_decision, not both")
+        );
+
+        let unknown = SAMPLE.replace(
+            "routing = \"default\"",
+            "merge_decision = { profile = \"merge-risk\", max_risk_score = 20, threshold = 20 }\nrouting = \"default\"",
+        );
+        assert!(
+            load_with_merge_profile(&unknown, "merge-risk", profile, instructions)
+                .unwrap_err()
+                .contains("unknown field `threshold`")
+        );
+
+        for (entry, missing) in [
+            (
+                "merge_decision = { profile = \"merge-risk\" }\nrouting = \"default\"",
+                "max_risk_score",
+            ),
+            (
+                "merge_decision = { max_risk_score = 20 }\nrouting = \"default\"",
+                "profile",
+            ),
+        ] {
+            let text = SAMPLE.replacen("routing = \"default\"", entry, 1);
+            assert!(
+                load_with_merge_profile(&text, "merge-risk", profile, instructions)
+                    .unwrap_err()
+                    .contains(&format!("missing field `{missing}`"))
+            );
+        }
+
+        let negative = SAMPLE.replace(
+            "routing = \"default\"",
+            "merge_decision = { profile = \"merge-risk\", max_risk_score = -1 }\nrouting = \"default\"",
+        );
+        assert!(load_with_merge_profile(&negative, "merge-risk", profile, instructions).is_err());
+    }
+
+    #[test]
+    fn merge_decision_requires_an_existing_registered_profile_with_resolved_instructions() {
+        let missing_profile = merge_decision(SAMPLE, "missing", 20);
+        assert!(
+            load_with_merge_profile(
+                &missing_profile,
+                "merge-risk",
+                "kind = \"claude\"\n",
+                Some("Review the change.\n"),
+            )
+            .unwrap_err()
+            .contains("no profile named `missing`")
+        );
+
+        let unsupported = merge_decision(SAMPLE, "merge-risk", 20);
+        assert!(
+            load_with_merge_profile(
+                &unsupported,
+                "merge-risk",
+                "kind = \"gemini\"\n",
+                Some("Review the change.\n"),
+            )
+            .unwrap_err()
+            .contains("the `gemini` kind cannot be a merge decision agent")
+        );
+
+        for instructions in [None, Some("  \n\t")] {
+            assert!(
+                load_with_merge_profile(
+                    &unsupported,
+                    "merge-risk",
+                    "kind = \"claude\"\n",
+                    instructions,
+                )
+                .unwrap_err()
+                .contains("profile `merge-risk` has no instructions.md")
+            );
+        }
+    }
+
+    #[test]
+    fn decision_profile_env_and_timeout_keep_headless_only_restrictions() {
+        let shared = merge_decision(
+            &SAMPLE.replace(
+                "workers = [\"standard\", \"deep\"]",
+                "workers = [\"standard\", \"deep\", \"merge-risk\"]",
+            ),
+            "merge-risk",
+            20,
+        );
+        let instructions = Some("Review the complete change.\n");
+        let env_error = load_with_merge_profile(
+            &shared,
+            "merge-risk",
+            "kind = \"claude\"\nenv = { X = \"1\" }\n",
+            instructions,
+        )
+        .unwrap_err();
+        assert!(
+            env_error.contains("env applies only to routing, postmortem, or merge decision agents")
+        );
+
+        let timeout_error = load_with_merge_profile(
+            &shared,
+            "merge-risk",
+            "kind = \"claude\"\ntimeout_seconds = 30\n",
+            instructions,
+        )
+        .unwrap_err();
+        assert!(timeout_error.contains(
+            "timeout_seconds applies only to routing, postmortem, or merge decision agents"
+        ));
+
+        for key in ["HERDR_PLUGIN_CONFIG_DIR", "HERDR_PLUGIN_STATE_DIR"] {
+            let error = load_with_merge_profile(
+                &merge_decision(SAMPLE, "merge-risk", 20),
+                "merge-risk",
+                &format!("kind = \"claude\"\nenv = {{ {key} = \"/private\" }}\n"),
+                instructions,
+            )
+            .unwrap_err();
+            assert!(error.contains(&format!("profile `merge-risk` may not set {key}")));
+        }
+    }
+
+    #[test]
     fn workspaces_and_their_teams_have_their_own_settings() {
         let text = SAMPLE.to_string()
             + "\n[workspaces.beta]\nclient_id = \"client-456\"\ncallback_port = 43872\n\n[workspaces.beta.teams.DATA]\nallowed_user_ids = [\"user-2\"]\nreview_state = \"Review\"\nrouting = \"default\"\n\n[workspaces.beta.teams.OPS]\nrouting = \"default\"\n";
@@ -1328,7 +1594,7 @@ workers = ["standard", "deep"]
         );
         let none = SAMPLE
             .replace(
-                "[workspaces.acme.teams.DATA]\nallowed_user_ids = [\"user-1\"]\nreview_state = \"In Review\"\nstarted_state = \"In Progress\"\ndeploy_state = \"In Deploy\"\npostmortem_state = \"In Postmortem\"\ndone_state = \"Done\"\nrouting = \"default\"\n",
+                "[workspaces.acme.teams.DATA]\nallowed_user_ids = [\"user-1\"]\nreview_state = \"In Review\"\nstarted_state = \"In Progress\"\ndeploy_state = \"In Deploy\"\npostmortem_state = \"In Postmortem\"\ndone_state = \"Done\"\n# merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }\nrouting = \"default\"\n",
                 "",
             )
             .replace("[workspaces.acme]\nclient_id = \"client-123\"\n", "");
@@ -1340,7 +1606,7 @@ workers = ["standard", "deep"]
     }
 
     #[test]
-    fn a_profiles_timeout_is_for_routing_and_postmortem_agents_only() {
+    fn a_profiles_timeout_is_for_headless_agents_only() {
         let config = load_with(
             SAMPLE,
             &[("router", "kind = \"claude\"\ntimeout_seconds = 30\n")],
@@ -1351,7 +1617,7 @@ workers = ["standard", "deep"]
         let worker = "kind = \"claude\"\ntimeout_seconds = 30\n";
         let error = load_with(SAMPLE, &[("standard", worker)]).unwrap_err();
         assert!(
-            error.ends_with("profile `standard`: timeout_seconds applies only to the routing and postmortem agents, but `standard` is also a coordinator or worker profile"),
+            error.ends_with("profile `standard`: timeout_seconds applies only to routing, postmortem, or merge decision agents, but `standard` is also a coordinator or worker profile"),
             "{error}"
         );
         let error = load_with(
@@ -1366,7 +1632,7 @@ workers = ["standard", "deep"]
     }
 
     #[test]
-    fn only_the_routing_agents_profile_may_set_env() {
+    fn only_headless_agent_profiles_may_set_env() {
         let with_env = |profile: &str| {
             let (_, config, _) = SAMPLE_PROFILES
                 .iter()
@@ -1391,7 +1657,7 @@ workers = ["standard", "deep"]
             Some("/tmp/empty")
         );
         assert!(with_env("standard").unwrap_err().ends_with(
-            "profile `standard`: env applies only to the routing and postmortem agents, but `standard` is also a coordinator or worker profile"
+            "profile `standard`: env applies only to routing, postmortem, or merge decision agents, but `standard` is also a coordinator or worker profile"
         ));
     }
 

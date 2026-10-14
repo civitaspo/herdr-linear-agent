@@ -268,6 +268,8 @@ pub async fn write(
         path_var,
         parent,
         role: "postmortem",
+        max_output_bytes: None,
+        remove_plugin_dirs: false,
     };
     let answer = match routing::ask(&call).await? {
         Ok(answer) => answer,

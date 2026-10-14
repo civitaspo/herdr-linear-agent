@@ -10,6 +10,7 @@ mod herdr;
 mod history;
 mod inbox;
 mod linear;
+mod merge_decision;
 mod names;
 mod outbox;
 mod paths;

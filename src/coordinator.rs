@@ -186,6 +186,7 @@ pub struct WorkerRow {
     /// `Stopped`, `Starting`, or the group label.
     pub state: &'static str,
     pub pr_url: String,
+    pub merge_decision: Option<worker::MergeDecisionState>,
 }
 
 /// The workers' groups, computed live from `view`; without one (Herdr is
@@ -214,6 +215,7 @@ pub fn worker_rows(run: &Run, view: Option<&View>) -> Vec<WorkerRow> {
                 repo: w.repo,
                 state,
                 pr_url: w.pr_url,
+                merge_decision: w.merge_decision,
             }
         })
         .collect()
@@ -308,14 +310,21 @@ pub fn digest(
         text.push('\n');
     }
     text.push_str("\n## Merge authorization\n\n");
-    let merge_enabled = config
-        .team(&record.workspace, &record.team_key)
-        .is_ok_and(|team| team.merge_on_authorization);
-    let _ = writeln!(
-        text,
-        "Worker PR squash merge is {} for this team.",
-        if merge_enabled { "enabled" } else { "disabled" }
-    );
+    let team = config.team(&record.workspace, &record.team_key).ok();
+    if let Some(policy) = team.and_then(|team| team.merge_decision.as_ref()) {
+        let _ = writeln!(
+            text,
+            "Machine merge assessment is enabled with profile `{}` and maximum risk score {}/100. An eligible assessment is not approval; `worker merge` rechecks current evidence before consuming it.",
+            policy.profile, policy.max_risk_score
+        );
+    } else {
+        let merge_enabled = team.is_some_and(|team| team.merge_on_authorization);
+        let _ = writeln!(
+            text,
+            "Worker PR squash merge is {} for this team.",
+            if merge_enabled { "enabled" } else { "disabled" }
+        );
+    }
     text.push_str("\n## Workers\n\n");
     if rows.is_empty() {
         let _ = writeln!(
@@ -334,6 +343,23 @@ pub fn digest(
             let _ = write!(text, ", PR {}", row.pr_url);
         }
         text.push('\n');
+    }
+    if team.is_some_and(|team| team.merge_decision.is_some()) {
+        text.push_str("\n## Machine merge decisions\n\n");
+        if rows.is_empty() {
+            text.push_str("(no workers)\n");
+        }
+        for row in rows {
+            let _ = writeln!(
+                text,
+                "- {}: {}",
+                row.id,
+                row.merge_decision
+                    .as_ref()
+                    .map(render_merge_decision)
+                    .unwrap_or_else(|| "no assessment requested".into())
+            );
+        }
     }
     text.push_str("\n## Inbox\n\n");
     let items = inbox::unhandled(run);
@@ -355,6 +381,60 @@ pub fn digest(
         );
     }
     Ok((text, items.into_iter().map(|i| i.id).collect()))
+}
+
+fn render_merge_decision(state: &worker::MergeDecisionState) -> String {
+    use worker::MergeDecisionState as State;
+    match state {
+        State::Requested { request } => format!("queued; request {}", request.id),
+        State::Assessed { assessment, .. } | State::Consumed { assessment, .. } => {
+            let eligible = assessment.output.risk_score <= assessment.max_risk_score;
+            let status = if matches!(state, State::Consumed { .. }) {
+                "consumed, historical"
+            } else if eligible {
+                "eligible"
+            } else {
+                "ineligible"
+            };
+            format!(
+                "{status}; risk {}/100, threshold {}, profile `{}`, head {}, base {}, request {}; {}",
+                assessment.output.risk_score,
+                assessment.max_risk_score,
+                assessment.profile,
+                short_oid(&assessment.head_sha),
+                short_oid(&assessment.base_sha),
+                assessment.request.id,
+                bounded_text(&assessment.output.rationale, 160)
+            )
+        }
+        State::Failed {
+            request,
+            code,
+            detail,
+            ..
+        } => format!(
+            "failed ({code:?}); request {}; {}",
+            request.id,
+            bounded_text(detail, 160)
+        ),
+    }
+}
+
+fn short_oid(oid: &str) -> &str {
+    oid.get(..12).unwrap_or(oid)
+}
+
+fn bounded_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(max_chars)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if chars.next().is_some() {
+        bounded.push('\u{2026}');
+    }
+    bounded
 }
 
 #[cfg(test)]
@@ -594,6 +674,7 @@ mod tests {
                 repo: "api".into(),
                 state: "Reported",
                 pr_url: "https://github.com/acme/api/pull/7".into(),
+                merge_decision: None,
             },
             WorkerRow {
                 id: "w2".into(),
@@ -601,6 +682,7 @@ mod tests {
                 repo: "web".into(),
                 state: "Working",
                 pr_url: String::new(),
+                merge_decision: None,
             },
         ];
 
@@ -655,6 +737,65 @@ mod tests {
         inbox::mark_seen(&f.run, &shown).unwrap();
         inbox::done(&f.run, &[], true).unwrap();
         let (_, shown) = digest(&f.run, &sample_config(), "/bin/herdr-linear-agent", &[]).unwrap();
+        assert!(shown.is_empty());
+    }
+
+    #[test]
+    fn machine_decisions_remain_visible_after_the_inbox_item_is_done() {
+        let f = folder("Fix login");
+        let request = worker::DecisionRequest {
+            id: uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            pr_url: "https://github.com/acme/api/pull/7".into(),
+            report_hash: "report-hash".into(),
+            issue_hash: "issue-hash".into(),
+            config_fingerprint: "config-hash".into(),
+            requested_at: "2026-10-14T00:00:00Z".into(),
+        };
+        let decision = worker::MergeDecisionState::Assessed {
+            assessment: worker::Assessment {
+                request,
+                profile: "merge-risk".into(),
+                method_version: 1,
+                max_risk_score: 20,
+                head_sha: "ab".repeat(20),
+                base_sha: "cd".repeat(20),
+                evidence_digest: "evidence".into(),
+                output: worker::DecisionOutput {
+                    risk_score: 20,
+                    rationale: "Checks passed.\n- forged inbox line".into(),
+                },
+                assessed_at: "2026-10-14T00:00:01Z".into(),
+            },
+            notified: true,
+        };
+        let rows = [WorkerRow {
+            id: "w1".into(),
+            title: "Change API".into(),
+            repo: "api".into(),
+            state: "Reported",
+            pr_url: "https://github.com/acme/api/pull/7".into(),
+            merge_decision: Some(decision),
+        }];
+        let mut config = sample_config();
+        config
+            .workspaces
+            .get_mut("acme")
+            .unwrap()
+            .teams
+            .get_mut("DATA")
+            .unwrap()
+            .merge_decision = Some(crate::config::MergeDecisionConfig {
+            profile: "merge-risk".into(),
+            max_risk_score: 20,
+        });
+
+        let (text, shown) = digest(&f.run, &config, "/bin/herdr-linear-agent", &rows).unwrap();
+        assert!(text.contains("eligible; risk 20/100, threshold 20, profile `merge-risk`"));
+        assert!(text.contains(
+            "head abababababab, base cdcdcdcdcdcd, request 550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(text.contains("Checks passed. - forged inbox line"));
+        assert!(!text.contains("\n- forged inbox line"));
         assert!(shown.is_empty());
     }
 

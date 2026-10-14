@@ -493,3 +493,86 @@ The second run, [CIV-19](https://linear.app/civitaspo/issue/CIV-19/verify-unlink
 The run required driver help with a scratch-directory permission, the test Git signing environment, a coordinator report path and replacing an auxiliary worker report with its canonical `report.md`. The check exercised the real plugin workflow with real agents and allowed-user replies. Deployment was represented by the merged README check; no production deployment ran. Postmortem generation and delivery were checked, but its prose was not independently graded. Unauthorized replies, stale selections, unknown write outcomes and failed postmortems remain regression-suite checks.
 
 The default Herdr session and installed ticker were left untouched. No Linear team settings or states were changed. Both scratch PRs were intentionally merged. The isolated session and ticker were stopped after the check.
+
+## Merge-decision evidence acquisition (2026-10-14)
+
+The installed GitHub CLI was `gh 2.102.0`. A read-only probe of the existing
+open PR #15 in `civitaspo/testing-herdr-linear-agent` confirmed that `gh pr view`
+returns the URL, PR number, state, draft flag, full head/base OIDs and refs,
+head repository and owner, mergeability, review decision, check rollup,
+reviews and merge timestamp used by the decision gate. The PR was open and
+not a draft; its checks were two `SUCCESS` and one `SKIPPED`, its review
+decision was empty, and GitHub reported `mergeable = UNKNOWN`. The feature
+therefore refuses this PR as assessment evidence.
+
+For head `7de04e8b16bfd85da61689cd6d1fe87a93a19a56` and base
+`541567387ea7e65029ac7e14fb03d4237e8e02d1`, the exact-SHA compare endpoint
+returned the same 944 diff bytes as `gh pr diff 15`: both SHA-256 hashes were
+`da94a26f985407372706e94c9dcf09045f3a57244a4e6f1c9b8eb88dab8fc00a`.
+This was a read-only GitHub compatibility check. No assessment model, agent
+CLI or Linear request was run, and no scratch PR or issue was changed. It does
+not verify a real machine assessment, merge, restart or performance lane.
+
+## Merge-decision transport and machine merge (2026-10-14)
+
+The feature build at `e818494` ran with Herdr 0.9.3 and Codex CLI 0.160.0
+(`gpt-6-luna`, low reasoning) in the isolated `mda151` session. A temporary
+configuration polled only the Personal workspace's CIV team and used the
+private `civitaspo/testing-herdr-linear-agent` repository, with a risk threshold
+of 100. No separate decision pane appeared.
+
+The worker's branch-bound PR, [testing-herdr-linear-agent#22](https://github.com/civitaspo/testing-herdr-linear-agent/pull/22), had
+head `08bd7a0e51fc578c6cdd1ff1553db8b8ad962ab0` and base
+`fc53e159f809a8498df2585f58caa1a36f2fdccc`. The `quick` and `slow` checks
+passed; `failing` was intentionally skipped. An initial assessment request
+against a PR on the wrong branch ended with `identity_mismatch`. The corrected
+PR was then rejected while its `slow` check was in progress. After all checks
+were terminal, a fresh request passed the strict output parser with a real risk
+score of 18/100. This confirms that a skipped check can coexist with successful
+checks and that a pending check blocks assessment.
+
+`worker merge` rechecked the evidence, submitted one squash merge bound to the
+recorded head SHA, and read back the merged PR. GitHub reported the merge at
+03:38:11Z; the worker record stored the matching head, decision ID and merged
+result. Linear moved CIV-21 to Done at 03:38:13Z. The isolated team did not
+have an In Deploy state, so its temporary configuration mapped deployment to
+Done; this did not exercise a multi-stage deployment or postmortem workflow.
+
+The worker CLI could not write the linked worktree's Git metadata in its
+sandbox. The coordinator therefore made the one-file fixture commit in the
+disposable clone and updated the worker report with the resulting PR receipt.
+The issue asked for the fixture line with a final period, but the committed
+line omitted it; the model noted the omission and still scored the documentation
+change at 18. This run verifies the real model transport, provenance, hard
+gates, head-bound merge and readback, not task correctness or risk-score
+calibration. It did not test restart recovery, concurrent assessments,
+in-flight evidence changes, ambiguous merge transport, or performance. The
+project PR remains open and unmerged.
+
+## Current main test baseline (2026-10-14)
+
+To separate the feature result from existing failures, I extracted the current
+`origin/main` snapshot at `46cf615` into `/private/tmp` and ran
+`cargo test --workspace --locked` with Rust 1.99.0. The result was 405 passed,
+6 failed and 1 ignored. The six failures were
+`a_failed_postmortem_is_logged_and_not_tried_again`,
+`a_routing_with_one_candidate_each_asks_no_routing_agent`,
+`deployment_finish_runs_workflow_postmortem_then_moves_to_done`,
+`pickup_in_another_started_state_does_not_suppress_a_later_started_transition`,
+`the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes`, and
+`workflow_state_changes_reach_the_coordinator_once_including_same_type_changes`.
+The failures shared a test-fixture issue: the scenarios pinned Linear's
+`updatedAt` to fixed midnight timestamps. Some preceded the real-time
+`World::now()` value or the saved issue cursor, so the poll correctly treated
+the fixture update as stale and ignored it. The scenarios now derive those
+timestamps from `World::now()`, retaining the intended newer, older, and later
+event ordering without depending on the calendar date. The full workspace
+suite on feature head `1d6d363` passes 443 tests with 1 ignored. GitHub CI run
+[38509891860](https://github.com/civitaspo/herdr-linear-agent/actions/runs/38509891860)
+also passes on macOS and Ubuntu. The earlier base and PR runs remain historical
+evidence. The PR's v0.2.12 Securefix policy check failed because the server
+received 403 posting its result comment to PR #151. Securefix v0.2.14 includes
+the repository-scoped comment-token fix; the server verified it against a real
+client PR in run
+[38511694306](https://github.com/civitaspo/securefix-server/actions/runs/38511694306).
+The workflows in this repository now pin v0.2.14.

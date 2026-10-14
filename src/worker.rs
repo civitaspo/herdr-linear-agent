@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::files::{self, write_atomic};
 use crate::herdr::{Agent, AgentStatus as HerdrStatus, Snapshot};
@@ -49,6 +50,7 @@ pub struct Worker {
     pub pr_url: String,
     pub merge_authorization: Option<MergeAuthorization>,
     pub merge_attempt: Option<MergeAttempt>,
+    pub merge_decision: Option<MergeDecisionState>,
     /// The "lost its pane before a report" error was sent.
     pub gone_reported: bool,
     /// The activity of the worker's own progress record last sent to
@@ -80,10 +82,115 @@ pub enum MergeAuthorization {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MergeAttempt {
-    Attempting { pr_url: String },
-    Merged { pr_url: String },
-    Unmerged { pr_url: String },
-    Unknown { pr_url: String },
+    Attempting {
+        pr_url: String,
+        #[serde(default)]
+        head_sha: Option<String>,
+        #[serde(default)]
+        decision_id: Option<String>,
+        #[serde(default)]
+        attempted_at: String,
+    },
+    Merged {
+        pr_url: String,
+        #[serde(default)]
+        head_sha: Option<String>,
+        #[serde(default)]
+        decision_id: Option<String>,
+        #[serde(default)]
+        attempted_at: String,
+    },
+    Unmerged {
+        pr_url: String,
+        #[serde(default)]
+        head_sha: Option<String>,
+        #[serde(default)]
+        decision_id: Option<String>,
+        #[serde(default)]
+        attempted_at: String,
+    },
+    Unknown {
+        pr_url: String,
+        #[serde(default)]
+        head_sha: Option<String>,
+        #[serde(default)]
+        decision_id: Option<String>,
+        #[serde(default)]
+        attempted_at: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRequest {
+    pub id: Uuid,
+    pub pr_url: String,
+    pub report_hash: String,
+    pub issue_hash: String,
+    pub config_fingerprint: String,
+    pub requested_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MergeDecisionState {
+    Requested {
+        request: DecisionRequest,
+    },
+    Assessed {
+        assessment: Assessment,
+        notified: bool,
+    },
+    Failed {
+        request: DecisionRequest,
+        code: FailureCode,
+        detail: String,
+        completed_at: String,
+        notified: bool,
+    },
+    Consumed {
+        assessment: Assessment,
+        notified: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Assessment {
+    pub request: DecisionRequest,
+    pub profile: String,
+    pub method_version: u32,
+    pub max_risk_score: u8,
+    pub head_sha: String,
+    pub base_sha: String,
+    pub evidence_digest: String,
+    pub output: DecisionOutput,
+    pub assessed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionOutput {
+    pub risk_score: u8,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCode {
+    UnavailableFacts,
+    IdentityMismatch,
+    HardGate,
+    InputLimit,
+    OutputLimit,
+    Timeout,
+    SpawnFailure,
+    ExitFailure,
+    InvalidOutput,
+    MalformedRecipe,
+    StaleEvidence,
+    StaleConfig,
+    Disabled,
+    IneligibleRun,
+    TaskFailure,
 }
 
 impl Worker {
@@ -1190,6 +1297,7 @@ last_group = "waiting"
         assert_eq!(worker.pr_url, "https://github.com/acme/api/pull/7");
         assert!(worker.merge_authorization.is_none());
         assert!(worker.merge_attempt.is_none());
+        assert!(worker.merge_decision.is_none());
         assert_eq!(worker.announced_report_hash, "");
         assert!(!worker.gone_reported);
         assert_eq!(worker.agent.status, AgentStatus::Open);
@@ -1200,6 +1308,135 @@ last_group = "waiting"
         let rewritten = update(&run, "w1", |w| w.agent.last_group = "working".into()).unwrap();
         assert_eq!(rewritten.created, "2026-05-01T08:00:00Z");
         assert_eq!(load(&run, "w1").unwrap(), rewritten);
+    }
+
+    #[test]
+    fn legacy_merge_attempt_toml_defaults_identity_and_round_trips() {
+        let url = "https://github.com/acme/api/pull/7";
+        for (status, attempt) in [
+            (
+                "attempting",
+                MergeAttempt::Attempting {
+                    pr_url: url.into(),
+                    head_sha: None,
+                    decision_id: None,
+                    attempted_at: String::new(),
+                },
+            ),
+            (
+                "merged",
+                MergeAttempt::Merged {
+                    pr_url: url.into(),
+                    head_sha: None,
+                    decision_id: None,
+                    attempted_at: String::new(),
+                },
+            ),
+            (
+                "unmerged",
+                MergeAttempt::Unmerged {
+                    pr_url: url.into(),
+                    head_sha: None,
+                    decision_id: None,
+                    attempted_at: String::new(),
+                },
+            ),
+            (
+                "unknown",
+                MergeAttempt::Unknown {
+                    pr_url: url.into(),
+                    head_sha: None,
+                    decision_id: None,
+                    attempted_at: String::new(),
+                },
+            ),
+        ] {
+            let old_toml = format!("status = \"{status}\"\npr_url = \"{url}\"\n");
+            let decoded: MergeAttempt = toml::from_str(&old_toml).unwrap();
+            assert_eq!(decoded, attempt);
+            let serialized = toml::to_string(&decoded).unwrap();
+            assert_eq!(
+                toml::from_str::<MergeAttempt>(&serialized).unwrap(),
+                attempt
+            );
+        }
+
+        let machine_attempt = MergeAttempt::Attempting {
+            pr_url: url.into(),
+            head_sha: Some("a".repeat(40)),
+            decision_id: Some("550e8400-e29b-41d4-a716-446655440000".into()),
+            attempted_at: String::new(),
+        };
+        let serialized = toml::to_string(&machine_attempt).unwrap();
+        assert_eq!(
+            toml::from_str::<MergeAttempt>(&serialized).unwrap(),
+            machine_attempt
+        );
+    }
+
+    #[test]
+    fn merge_decision_states_are_tagged_and_output_is_strict() {
+        let request = DecisionRequest {
+            id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            pr_url: "https://github.com/acme/api/pull/7".into(),
+            report_hash: "report".into(),
+            issue_hash: "issue".into(),
+            config_fingerprint: "config".into(),
+            requested_at: "2026-10-14T00:00:00Z".into(),
+        };
+        let assessment = Assessment {
+            request: request.clone(),
+            profile: "merge-risk".into(),
+            method_version: 1,
+            max_risk_score: 20,
+            head_sha: "a".repeat(40),
+            base_sha: "b".repeat(40),
+            evidence_digest: "evidence".into(),
+            output: DecisionOutput {
+                risk_score: 10,
+                rationale: "The change is narrow and covered.".into(),
+            },
+            assessed_at: "2026-10-14T00:01:00Z".into(),
+        };
+        let states = [
+            MergeDecisionState::Requested {
+                request: request.clone(),
+            },
+            MergeDecisionState::Assessed {
+                assessment: assessment.clone(),
+                notified: false,
+            },
+            MergeDecisionState::Failed {
+                request,
+                code: FailureCode::StaleEvidence,
+                detail: "the evidence changed".into(),
+                completed_at: "2026-10-14T00:01:00Z".into(),
+                notified: true,
+            },
+            MergeDecisionState::Consumed {
+                assessment,
+                notified: true,
+            },
+        ];
+        for (state, status) in
+            states
+                .into_iter()
+                .zip(["requested", "assessed", "failed", "consumed"])
+        {
+            let serialized = toml::to_string(&state).unwrap();
+            assert!(serialized.contains(&format!("status = \"{status}\"")));
+            assert_eq!(
+                toml::from_str::<MergeDecisionState>(&serialized).unwrap(),
+                state
+            );
+        }
+
+        assert!(
+            serde_json::from_str::<DecisionOutput>(
+                r#"{"risk_score":10,"rationale":"Looks safe.","eligible":true}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

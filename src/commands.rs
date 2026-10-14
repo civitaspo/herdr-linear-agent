@@ -16,7 +16,9 @@ use crate::outbox::{self, Op, StateTarget};
 use crate::paths::Ctx;
 use crate::process::{Cmd, Runner};
 use crate::run::{AgentStatus, Run, RunRecord, Status};
-use crate::worker::{self, Group, MergeAttempt, MergeAuthorization, Worker};
+use crate::worker::{
+    self, DecisionRequest, Group, MergeAttempt, MergeAuthorization, MergeDecisionState, Worker,
+};
 use crate::{files, inbox, names, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -691,8 +693,98 @@ pub async fn worker_prompt<H: Herdr>(
 
 /// Requests one-time authorization for the worker's recorded pull request.
 pub async fn worker_request_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
-    let (config, run, record) = load_active(ctx, key).await?;
+    let (_, run, record) = load_active(ctx, key).await?;
+    worker::validate_id(id)?;
+    let config_dir = ctx.config_dir();
+    let (config, fingerprint) = Config::load_stable(&config_dir)?;
     let team = config.team(&record.workspace, &record.team_key)?;
+    if team.merge_decision.is_some() {
+        let worker = worker::load(&run, id)?;
+        let issue = crate::merge_decision::read_local_text(&run.issue_md(), "issue")?;
+        let report = crate::merge_decision::read_local_text(
+            &worker::home_report_path(&run, id),
+            "worker report",
+        )?;
+        let issue_hash = files::sha256_hex(issue.as_bytes());
+        let report_hash = files::sha256_hex(report.as_bytes());
+        if worker.pr_url.is_empty()
+            || worker::pr_line(&report).as_deref() != Some(worker.pr_url.as_str())
+            || worker.report_hash != report_hash
+        {
+            bail!("worker {id} has no current copied report for its recorded GitHub pull request");
+        }
+        let request = DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            pr_url: worker.pr_url.clone(),
+            report_hash,
+            issue_hash,
+            config_fingerprint: Config::fingerprint_hex(&fingerprint),
+            requested_at: files::now(),
+        };
+        let lock = run.lock()?;
+        let current_record = run.record()?;
+        if current_record.status != Status::Active || current_record.stopped {
+            bail!("run {key} is closed or stopped; no merge assessment can be requested");
+        }
+        if current_record.workspace != record.workspace
+            || current_record.team_key != record.team_key
+        {
+            bail!(
+                "run {key}'s workspace or team changed; reload it before requesting an assessment"
+            );
+        }
+        if Config::fingerprint(&config_dir)? != fingerprint {
+            bail!("config changed while the merge assessment was being requested; try again");
+        }
+        let current = worker::load(&run, id)?;
+        match &current.merge_attempt {
+            Some(MergeAttempt::Attempting { .. } | MergeAttempt::Unknown { .. }) => {
+                bail!(
+                    "worker {id} has an unresolved merge attempt; run `worker merge` to read it back"
+                )
+            }
+            Some(MergeAttempt::Merged { .. }) => {
+                bail!("worker {id}'s pull request is already merged")
+            }
+            Some(MergeAttempt::Unmerged { .. }) | None => {}
+        }
+        if let Some(MergeDecisionState::Requested { request: existing }) = &current.merge_decision {
+            println!(
+                "Merge assessment already queued for {key}/{id} (request {}).",
+                existing.id
+            );
+            return Ok(());
+        }
+        let current_issue = crate::merge_decision::read_local_text(&run.issue_md(), "issue")?;
+        let current_report = crate::merge_decision::read_local_text(
+            &worker::home_report_path(&run, id),
+            "worker report",
+        )?;
+        if files::sha256_hex(current_issue.as_bytes()) != request.issue_hash
+            || files::sha256_hex(current_report.as_bytes()) != request.report_hash
+            || current.report_hash != request.report_hash
+            || current.pr_url != request.pr_url
+            || worker::pr_line(&current_report).as_deref() != Some(request.pr_url.as_str())
+        {
+            bail!(
+                "the issue or worker report changed while the assessment was being requested; try again"
+            );
+        }
+        worker::update_held(&run, &lock, id, |worker| {
+            worker.merge_authorization = None;
+            worker.merge_attempt = None;
+            worker.merge_decision = Some(MergeDecisionState::Requested {
+                request: request.clone(),
+            });
+        })?;
+        drop(lock);
+        ticker::poke(&ctx.state_dir());
+        println!(
+            "Merge assessment queued for {key}/{id} (request {}).",
+            request.id
+        );
+        return Ok(());
+    }
     if !team.merge_on_authorization {
         bail!(
             "merging on Linear authorization is disabled for team {}",
@@ -721,6 +813,7 @@ pub async fn worker_request_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<
             token: token.clone(),
             pr_url: url,
         });
+        w.merge_decision = None;
         w.merge_attempt = None;
     })?;
     outbox::push_held(
@@ -737,62 +830,31 @@ pub async fn worker_request_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<
 
 /// Consumes a one-use authorization before asking GitHub to merge the PR.
 pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
-    let (config, run, record) = load_active(ctx, key).await?;
-    let team = config.team(&record.workspace, &record.team_key)?;
-    if !team.merge_on_authorization {
-        bail!(
-            "merging on Linear authorization is disabled for team {}",
-            record.team_key
-        );
-    }
-    let (pr_url, should_merge) = {
-        let lock = run.lock()?;
-        let current = worker::load(&run, id)?;
-        if current.pr_url.is_empty()
-            || worker::pr_line(&format!("PR: {}", current.pr_url)).as_deref()
-                != Some(current.pr_url.as_str())
-        {
-            bail!("worker {id} has no recorded GitHub pull request");
-        }
-        match current.merge_authorization.clone() {
-            Some(MergeAuthorization::Authorized { pr_url, .. }) => {
-                if current.pr_url != pr_url {
-                    bail!("worker {id}'s authorized pull request is no longer current");
-                }
-                worker::update_held(&run, &lock, id, |w| {
-                    w.merge_authorization = None;
-                    w.merge_attempt = Some(MergeAttempt::Attempting {
-                        pr_url: pr_url.clone(),
-                    });
-                })?;
-                (pr_url, true)
-            }
-            _ => match current.merge_attempt.clone() {
-                Some(MergeAttempt::Attempting { pr_url })
-                | Some(MergeAttempt::Unknown { pr_url }) => {
-                    if current.pr_url != pr_url {
-                        bail!(
-                            "worker {id}'s unresolved merge attempt is for a different pull request"
-                        );
-                    }
-                    (pr_url, false)
-                }
-                Some(MergeAttempt::Merged { .. }) => {
-                    bail!("worker {id}'s pull request is already merged")
-                }
-                Some(MergeAttempt::Unmerged { .. }) => {
-                    bail!(
-                        "worker {id}'s last merge attempt did not merge; request fresh authorization"
-                    )
-                }
-                None => bail!("worker {id} has no unused merge authorization"),
-            },
-        }
-    };
+    worker::validate_id(id)?;
+    let run = Run::load(&ctx.runs_dir(), key)?;
+    let record = run.record()?;
+    let worker = worker::load(&run, id)?;
 
-    if !should_merge {
-        let outcome = read_merge_outcome(ctx, &pr_url).await;
-        record_merge_result(&run, id, &pr_url, outcome.clone())?;
+    if let Some(attempt @ (MergeAttempt::Attempting { .. } | MergeAttempt::Unknown { .. })) =
+        worker.merge_attempt.clone()
+    {
+        let (pr_url, head_sha, decision_id) = merge_attempt_identity(&attempt);
+        if worker.pr_url != pr_url {
+            bail!("worker {id}'s unresolved merge attempt is for a different pull request");
+        }
+        let outcome = match (head_sha, decision_id) {
+            (None, None) => read_merge_outcome(ctx, pr_url).await,
+            (Some(head_sha), Some(decision_id)) => {
+                read_machine_merge_outcome(ctx, pr_url, head_sha, decision_id).await
+            }
+            _ => MergeAttempt::Unknown {
+                pr_url: pr_url.to_string(),
+                head_sha: head_sha.map(str::to_string),
+                decision_id: decision_id.map(str::to_string),
+                attempted_at: merge_attempt_time(&attempt).to_string(),
+            },
+        };
+        record_merge_result(&run, id, &attempt, outcome.clone())?;
         if matches!(outcome, MergeAttempt::Merged { .. }) {
             ticker::poke(&ctx.state_dir());
         }
@@ -807,6 +869,79 @@ pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
         };
     }
 
+    ticker::start(ctx).await?;
+    if record.status != Status::Active || record.stopped {
+        bail!("run {key} is closed or stopped; no merge can be started");
+    }
+    let config = Config::load(&ctx.config_dir())?;
+    let team = config.team(&record.workspace, &record.team_key)?;
+    if team.merge_decision.is_some() {
+        return machine_worker_merge(ctx, &run, &record, &config, id).await;
+    }
+    if !team.merge_on_authorization {
+        bail!(
+            "merging on Linear authorization is disabled for team {}",
+            record.team_key
+        );
+    }
+    let attempt = {
+        let lock = run.lock()?;
+        let current = worker::load(&run, id)?;
+        if current.pr_url.is_empty()
+            || worker::pr_line(&format!("PR: {}", current.pr_url)).as_deref()
+                != Some(current.pr_url.as_str())
+        {
+            bail!("worker {id} has no recorded GitHub pull request");
+        }
+        match current.merge_authorization.clone() {
+            Some(MergeAuthorization::Authorized { pr_url, .. }) => {
+                if current.pr_url != pr_url {
+                    bail!("worker {id}'s authorized pull request is no longer current");
+                }
+                let attempted_at = files::now();
+                worker::update_held(&run, &lock, id, |w| {
+                    w.merge_authorization = None;
+                    w.merge_attempt = Some(MergeAttempt::Attempting {
+                        pr_url: pr_url.clone(),
+                        head_sha: None,
+                        decision_id: None,
+                        attempted_at: attempted_at.clone(),
+                    });
+                })?;
+                MergeAttempt::Attempting {
+                    pr_url,
+                    head_sha: None,
+                    decision_id: None,
+                    attempted_at,
+                }
+            }
+            _ => match current.merge_attempt.clone() {
+                Some(MergeAttempt::Attempting { pr_url, .. })
+                | Some(MergeAttempt::Unknown { pr_url, .. }) => {
+                    if current.pr_url != pr_url {
+                        bail!(
+                            "worker {id}'s unresolved merge attempt is for a different pull request"
+                        );
+                    }
+                    bail!(
+                        "worker {id} has an unresolved merge attempt; run `worker merge` to read it back"
+                    )
+                }
+                Some(MergeAttempt::Merged { .. }) => {
+                    bail!("worker {id}'s pull request is already merged")
+                }
+                Some(MergeAttempt::Unmerged { .. }) => {
+                    bail!(
+                        "worker {id}'s last merge attempt did not merge; request fresh authorization"
+                    )
+                }
+                None => bail!("worker {id} has no unused merge authorization"),
+            },
+        }
+    };
+    let (pr_url, _, _) = merge_attempt_identity(&attempt);
+    let pr_url = pr_url.to_string();
+
     let merge = Cmd::new("gh", FETCH_TIMEOUT)
         .arg("pr")
         .arg("merge")
@@ -817,9 +952,12 @@ pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
         record_merge_result(
             &run,
             id,
-            &pr_url,
+            &attempt,
             MergeAttempt::Merged {
                 pr_url: pr_url.clone(),
+                head_sha: None,
+                decision_id: None,
+                attempted_at: files::now(),
             },
         )?;
         ticker::poke(&ctx.state_dir());
@@ -828,7 +966,7 @@ pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
 
     let outcome = read_merge_outcome(ctx, &pr_url).await;
     let merged = matches!(outcome, MergeAttempt::Merged { .. });
-    record_merge_result(&run, id, &pr_url, outcome)?;
+    record_merge_result(&run, id, &attempt, outcome)?;
     if merged {
         ticker::poke(&ctx.state_dir());
         Ok(())
@@ -839,6 +977,294 @@ pub async fn worker_merge(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
         bail!(
             "gh pr merge did not complete ({detail}); authorization was consumed and will not be retried"
         )
+    }
+}
+
+async fn machine_worker_merge(
+    ctx: &Ctx<'_>,
+    run: &Run,
+    record: &RunRecord,
+    config: &Config,
+    id: &str,
+) -> Result<()> {
+    let team = config.team(&record.workspace, &record.team_key)?;
+    let policy = team
+        .merge_decision
+        .as_ref()
+        .context("machine merge assessment is disabled for this team")?;
+    let worker = worker::load(run, id)?;
+    let assessment = match worker.merge_decision.as_ref() {
+        Some(MergeDecisionState::Assessed { assessment, .. }) => assessment.clone(),
+        Some(MergeDecisionState::Failed { .. }) => {
+            bail!("worker {id}'s last assessment failed; request a fresh assessment")
+        }
+        Some(MergeDecisionState::Requested { .. }) => {
+            bail!("worker {id}'s merge assessment is still queued")
+        }
+        Some(MergeDecisionState::Consumed { .. }) => {
+            bail!("worker {id}'s assessment was already consumed by a merge attempt")
+        }
+        None => bail!("worker {id} has no merge assessment; request one first"),
+    };
+    if assessment.method_version != crate::merge_decision::METHOD_VERSION {
+        bail!(
+            "worker {id}'s assessment uses an unsupported method version; request a fresh assessment"
+        );
+    }
+    if assessment.output.risk_score > policy.max_risk_score {
+        bail!(
+            "worker {id}'s risk score {}/100 exceeds the configured threshold {}",
+            assessment.output.risk_score,
+            policy.max_risk_score
+        );
+    }
+
+    let config_dir = ctx.config_dir();
+    let (fresh_config, fingerprint) = Config::load_stable(&config_dir)?;
+    let fingerprint = Config::fingerprint_hex(&fingerprint);
+    let fresh_team = fresh_config.team(&record.workspace, &record.team_key)?;
+    let fresh_policy = fresh_team
+        .merge_decision
+        .as_ref()
+        .context("machine merge assessment was disabled; request a fresh assessment")?;
+    if fingerprint != assessment.request.config_fingerprint
+        || fresh_policy.profile != assessment.profile
+        || fresh_policy.max_risk_score != assessment.max_risk_score
+        || fresh_policy.max_risk_score != policy.max_risk_score
+    {
+        bail!("configuration changed after the assessment; request a fresh assessment");
+    }
+    let repository = fresh_config.repository(&worker.repo)?;
+    let issue = crate::merge_decision::read_local_text(&run.issue_md(), "issue")?;
+    let report = crate::merge_decision::read_local_text(
+        &worker::home_report_path(run, id),
+        "worker report",
+    )?;
+    if worker.pr_url != assessment.request.pr_url
+        || worker.report_hash != assessment.request.report_hash
+        || crate::files::sha256_hex(issue.as_bytes()) != assessment.request.issue_hash
+        || crate::files::sha256_hex(report.as_bytes()) != assessment.request.report_hash
+        || worker::pr_line(&report).as_deref() != Some(assessment.request.pr_url.as_str())
+    {
+        bail!("worker {id}'s issue, report, or pull request changed; request a fresh assessment");
+    }
+    let evidence = crate::merge_decision::acquire_evidence(
+        ctx.runner,
+        &crate::merge_decision::EvidenceInput {
+            run_key: &run.key,
+            worker: &worker,
+            requested_pr_url: &assessment.request.pr_url,
+            expected_repository_path: &repository.path,
+            issue: &issue,
+            report: &report,
+            profile_name: &fresh_policy.profile,
+            config_fingerprint: &fingerprint,
+            max_risk_score: fresh_policy.max_risk_score,
+        },
+    )
+    .await?;
+    if evidence.digest != assessment.evidence_digest
+        || evidence.head_sha != assessment.head_sha
+        || evidence.base_sha != assessment.base_sha
+    {
+        bail!("GitHub evidence changed after the assessment; request a fresh assessment");
+    }
+
+    let attempt = MergeAttempt::Attempting {
+        pr_url: assessment.request.pr_url.clone(),
+        head_sha: Some(assessment.head_sha.clone()),
+        decision_id: Some(assessment.request.id.to_string()),
+        attempted_at: files::now(),
+    };
+    {
+        let lock = run.lock()?;
+        let current_record = run.record()?;
+        if current_record.status != Status::Active
+            || current_record.stopped
+            || current_record.workspace != record.workspace
+            || current_record.team_key != record.team_key
+        {
+            bail!("run {} changed while the merge was being checked", run.key);
+        }
+        let (locked_config, locked_fingerprint) = Config::load_stable(&config_dir)?;
+        let locked_fingerprint = Config::fingerprint_hex(&locked_fingerprint);
+        let locked_policy = locked_config
+            .team(&current_record.workspace, &current_record.team_key)?
+            .merge_decision
+            .as_ref()
+            .context("machine merge assessment was disabled; request a fresh assessment")?;
+        let current = worker::load(run, id)?;
+        let assessment_still_current = matches!(
+            &current.merge_decision,
+            Some(MergeDecisionState::Assessed { assessment: current, .. })
+                if current == &assessment
+        );
+        if !assessment_still_current
+            || current.merge_attempt.is_some()
+            || current.pr_url != assessment.request.pr_url
+            || current.report_hash != assessment.request.report_hash
+            || locked_fingerprint != assessment.request.config_fingerprint
+            || locked_policy.profile != assessment.profile
+            || locked_policy.max_risk_score != assessment.max_risk_score
+            || assessment.output.risk_score > locked_policy.max_risk_score
+        {
+            bail!(
+                "worker {id}'s assessment or merge eligibility changed; request a fresh assessment"
+            );
+        }
+        let current_issue = crate::merge_decision::read_local_text(&run.issue_md(), "issue")?;
+        let current_report = crate::merge_decision::read_local_text(
+            &worker::home_report_path(run, id),
+            "worker report",
+        )?;
+        if crate::files::sha256_hex(current_issue.as_bytes()) != assessment.request.issue_hash
+            || crate::files::sha256_hex(current_report.as_bytes()) != assessment.request.report_hash
+            || worker::pr_line(&current_report).as_deref()
+                != Some(assessment.request.pr_url.as_str())
+        {
+            bail!("worker {id}'s issue or report changed; request a fresh assessment");
+        }
+        let state = match &current.merge_decision {
+            Some(MergeDecisionState::Assessed { notified, .. }) => *notified,
+            _ => unreachable!("the assessment was checked above"),
+        };
+        worker::update_held(run, &lock, id, |current| {
+            current.merge_decision = Some(MergeDecisionState::Consumed {
+                assessment: assessment.clone(),
+                notified: state,
+            });
+            current.merge_authorization = None;
+            current.merge_attempt = Some(attempt.clone());
+        })?;
+    }
+
+    let merge = Cmd::new("gh", FETCH_TIMEOUT)
+        .args([
+            "pr",
+            "merge",
+            assessment.request.pr_url.as_str(),
+            "--squash",
+            "--match-head-commit",
+            assessment.head_sha.as_str(),
+        ])
+        .max_output_bytes(64 * 1024);
+    let _ = ctx.runner.run(&merge).await;
+    let decision_id = assessment.request.id.to_string();
+    let readback = read_machine_merge_outcome(
+        ctx,
+        &assessment.request.pr_url,
+        &assessment.head_sha,
+        &decision_id,
+    )
+    .await;
+    let outcome = if matches!(readback, MergeAttempt::Merged { .. }) {
+        readback
+    } else {
+        MergeAttempt::Unknown {
+            pr_url: assessment.request.pr_url.clone(),
+            head_sha: Some(assessment.head_sha.clone()),
+            decision_id: Some(assessment.request.id.to_string()),
+            attempted_at: merge_attempt_time(&attempt).to_string(),
+        }
+    };
+    record_merge_result(run, id, &attempt, outcome.clone())?;
+    match outcome {
+        MergeAttempt::Merged { .. } => {
+            ticker::poke(&ctx.state_dir());
+            Ok(())
+        }
+        MergeAttempt::Unmerged { .. }
+        | MergeAttempt::Unknown { .. }
+        | MergeAttempt::Attempting { .. } => {
+            bail!("the machine merge outcome is unknown; read it back before any further action")
+        }
+    }
+}
+
+fn merge_attempt_identity(attempt: &MergeAttempt) -> (&str, Option<&str>, Option<&str>) {
+    match attempt {
+        MergeAttempt::Attempting {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        }
+        | MergeAttempt::Merged {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        }
+        | MergeAttempt::Unmerged {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        }
+        | MergeAttempt::Unknown {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        } => (pr_url, head_sha.as_deref(), decision_id.as_deref()),
+    }
+}
+
+fn merge_attempt_time(attempt: &MergeAttempt) -> &str {
+    match attempt {
+        MergeAttempt::Attempting { attempted_at, .. }
+        | MergeAttempt::Merged { attempted_at, .. }
+        | MergeAttempt::Unmerged { attempted_at, .. }
+        | MergeAttempt::Unknown { attempted_at, .. } => attempted_at,
+    }
+}
+
+fn with_merge_attempt_time(attempt: MergeAttempt, attempted_at: String) -> MergeAttempt {
+    match attempt {
+        MergeAttempt::Attempting {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        } => MergeAttempt::Attempting {
+            pr_url,
+            head_sha,
+            decision_id,
+            attempted_at,
+        },
+        MergeAttempt::Merged {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        } => MergeAttempt::Merged {
+            pr_url,
+            head_sha,
+            decision_id,
+            attempted_at,
+        },
+        MergeAttempt::Unmerged {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        } => MergeAttempt::Unmerged {
+            pr_url,
+            head_sha,
+            decision_id,
+            attempted_at,
+        },
+        MergeAttempt::Unknown {
+            pr_url,
+            head_sha,
+            decision_id,
+            ..
+        } => MergeAttempt::Unknown {
+            pr_url,
+            head_sha,
+            decision_id,
+            attempted_at,
+        },
     }
 }
 
@@ -858,52 +1284,173 @@ async fn read_merge_outcome(ctx: &Ctx<'_>, pr_url: &str) -> MergeAttempt {
                 Some(if state == "MERGED" || !merged_at.is_null() {
                     MergeAttempt::Merged {
                         pr_url: pr_url.to_string(),
+                        head_sha: None,
+                        decision_id: None,
+                        attempted_at: String::new(),
                     }
                 } else {
                     MergeAttempt::Unmerged {
                         pr_url: pr_url.to_string(),
+                        head_sha: None,
+                        decision_id: None,
+                        attempted_at: String::new(),
                     }
                 })
             })
             .unwrap_or_else(|| MergeAttempt::Unknown {
                 pr_url: pr_url.to_string(),
+                head_sha: None,
+                decision_id: None,
+                attempted_at: String::new(),
             }),
         _ => MergeAttempt::Unknown {
             pr_url: pr_url.to_string(),
+            head_sha: None,
+            decision_id: None,
+            attempted_at: String::new(),
         },
     }
 }
 
-fn record_merge_result(run: &Run, id: &str, pr_url: &str, outcome: MergeAttempt) -> Result<()> {
+async fn read_machine_merge_outcome(
+    ctx: &Ctx<'_>,
+    pr_url: &str,
+    head_sha: &str,
+    decision_id: &str,
+) -> MergeAttempt {
+    let unknown = || MergeAttempt::Unknown {
+        pr_url: pr_url.to_string(),
+        head_sha: Some(head_sha.to_string()),
+        decision_id: Some(decision_id.to_string()),
+        attempted_at: String::new(),
+    };
+    let view = Cmd::new("gh", FETCH_TIMEOUT)
+        .args(["pr", "view", pr_url, "--json", "state,mergedAt,headRefOid"])
+        .max_output_bytes(64 * 1024);
+    match ctx.runner.run(&view).await {
+        Ok(out) if out.success() => {
+            let value = serde_json::from_slice::<serde_json::Value>(out.raw_stdout()).ok();
+            let Some(value) = value else { return unknown() };
+            if value.get("headRefOid").and_then(serde_json::Value::as_str) != Some(head_sha) {
+                return unknown();
+            }
+            let Some(state) = value.get("state").and_then(serde_json::Value::as_str) else {
+                return unknown();
+            };
+            let Some(merged_at) = value.get("mergedAt") else {
+                return unknown();
+            };
+            let fields = (
+                pr_url.to_string(),
+                Some(head_sha.to_string()),
+                Some(decision_id.to_string()),
+            );
+            if state == "MERGED" || !merged_at.is_null() {
+                MergeAttempt::Merged {
+                    pr_url: fields.0,
+                    head_sha: fields.1,
+                    decision_id: fields.2,
+                    attempted_at: String::new(),
+                }
+            } else if state == "OPEN" {
+                MergeAttempt::Unmerged {
+                    pr_url: fields.0,
+                    head_sha: fields.1,
+                    decision_id: fields.2,
+                    attempted_at: String::new(),
+                }
+            } else {
+                unknown()
+            }
+        }
+        _ => unknown(),
+    }
+}
+
+fn record_merge_result(
+    run: &Run,
+    id: &str,
+    expected: &MergeAttempt,
+    outcome: MergeAttempt,
+) -> Result<()> {
     let lock = run.lock()?;
     let current = worker::load(run, id)?;
+    let (pr_url, head_sha, decision_id) = merge_attempt_identity(expected);
     let unresolved = current
         .merge_attempt
         .as_ref()
         .is_some_and(|attempt| match attempt {
-            MergeAttempt::Attempting { pr_url: current }
-            | MergeAttempt::Unknown { pr_url: current } => current == pr_url,
+            MergeAttempt::Attempting { .. } | MergeAttempt::Unknown { .. } => {
+                merge_attempt_identity(attempt) == (pr_url, head_sha, decision_id)
+            }
             _ => false,
         });
-    if current.pr_url != pr_url || !unresolved {
+    if current.pr_url != pr_url
+        || !unresolved
+        || merge_attempt_identity(&outcome) != (pr_url, head_sha, decision_id)
+    {
+        return Ok(());
+    }
+    let attempted_at = if merge_attempt_time(expected).is_empty() {
+        current.created.clone()
+    } else {
+        merge_attempt_time(expected).to_string()
+    };
+    let outcome = with_merge_attempt_time(outcome, attempted_at.clone());
+    if let Some(decision_id) = decision_id {
+        let consumed = matches!(
+            &current.merge_decision,
+            Some(MergeDecisionState::Consumed { assessment, .. })
+                if assessment.request.id.to_string() == decision_id
+                    && assessment.request.pr_url == pr_url
+                    && Some(assessment.head_sha.as_str()) == head_sha
+        );
+        if !consumed {
+            return Ok(());
+        }
+    } else if head_sha.is_some() {
         return Ok(());
     }
     let merged = matches!(&outcome, MergeAttempt::Merged { .. });
-    let active = run.record()?.status == Status::Active && !run.record()?.stopped;
+    let record = run.record()?;
+    let active = record.status == Status::Active && !record.stopped;
     if merged && active {
-        outbox::push_held(
+        let stage = crate::run::WorkflowStage::InDeploy;
+        let already_deploying = record.workflow.confirmed == Some(stage)
+            || record
+                .workflow
+                .pending_choice
+                .as_ref()
+                .is_some_and(|choice| choice.stage == stage)
+            || outbox::queued(run).iter().any(|request| match &request.op {
+                Op::IssueState {
+                    target: StateTarget::Workflow(queued),
+                }
+                | Op::IssueState {
+                    target: StateTarget::Selected { stage: queued, .. },
+                } => *queued == stage,
+                _ => false,
+            });
+        if !already_deploying {
+            outbox::push_held(
+                run,
+                &lock,
+                Op::IssueState {
+                    target: StateTarget::Workflow(stage),
+                },
+            )?;
+        }
+        let receipt_key = format!("{id}\n{pr_url}\n{attempted_at}");
+        inbox::write_once_held(
             run,
             &lock,
-            Op::IssueState {
-                target: StateTarget::Workflow(crate::run::WorkflowStage::InDeploy),
+            &inbox::Item {
+                id: format!("merge-{}", files::sha256_hex(receipt_key.as_bytes())),
+                kind: "merge".into(),
+                subject: id.to_string(),
+                created: attempted_at,
+                summary: "The worker pull request was merged; deployment work can continue.".into(),
             },
-        )?;
-        crate::inbox::write_held(
-            run,
-            &lock,
-            "merge",
-            id,
-            "The authorized worker pull request was merged; deployment work can continue.",
         )?;
         run.update_held(&lock, |record| {
             record.finished = false;
@@ -1186,12 +1733,15 @@ mod tests {
 
         let worker = worker::load(&setup.run(), "w1").unwrap();
         assert!(worker.merge_authorization.is_none());
-        assert_eq!(
+        assert!(matches!(
             worker.merge_attempt,
             Some(MergeAttempt::Merged {
-                pr_url: url.clone()
-            })
-        );
+                pr_url: actual,
+                head_sha: None,
+                decision_id: None,
+                attempted_at,
+            }) if actual == url && !attempted_at.is_empty()
+        ));
         assert_eq!(setup.runner.count("gh pr merge"), 1);
         let error = worker_merge(&setup.ctx(), "acme/DATA-1", "w1")
             .await
@@ -1226,10 +1776,15 @@ mod tests {
         assert!(error.contains("authorization was consumed"));
         let worker = worker::load(&setup.run(), "w1").unwrap();
         assert!(worker.merge_authorization.is_none());
-        assert_eq!(
+        assert!(matches!(
             worker.merge_attempt,
-            Some(MergeAttempt::Unmerged { pr_url: url })
-        );
+            Some(MergeAttempt::Unmerged {
+                pr_url: actual,
+                head_sha: None,
+                decision_id: None,
+                attempted_at,
+            }) if actual == url && !attempted_at.is_empty()
+        ));
         assert_eq!(setup.runner.count("gh pr merge"), 1);
     }
 
@@ -1240,6 +1795,9 @@ mod tests {
         worker::update(&setup.run(), "w1", |current| {
             current.merge_attempt = Some(MergeAttempt::Attempting {
                 pr_url: url.clone(),
+                head_sha: None,
+                decision_id: None,
+                attempted_at: files::now(),
             });
         })
         .unwrap();
@@ -1259,13 +1817,72 @@ mod tests {
             .await
             .unwrap();
         let worker = worker::load(&setup.run(), "w1").unwrap();
-        assert_eq!(
+        assert!(matches!(
             worker.merge_attempt,
-            Some(MergeAttempt::Merged { pr_url: url })
-        );
+            Some(MergeAttempt::Merged {
+                pr_url: actual,
+                head_sha: None,
+                decision_id: None,
+                attempted_at,
+            }) if actual == url && !attempted_at.is_empty()
+        ));
         assert!(worker.merge_authorization.is_none());
         assert_eq!(setup.runner.count("gh pr merge"), 0);
         assert_eq!(setup.runner.count("gh pr view"), 1);
+    }
+
+    #[tokio::test]
+    async fn merge_finalization_retries_do_not_duplicate_deploy_or_receipt() {
+        let setup = Setup::new(|c| c);
+        let url = worker_with_pr(&setup).await;
+        let attempted_at = "2026-10-14T02:00:00Z".to_string();
+        let attempt = MergeAttempt::Attempting {
+            pr_url: url.clone(),
+            head_sha: None,
+            decision_id: None,
+            attempted_at: attempted_at.clone(),
+        };
+        worker::update(&setup.run(), "w1", |worker| {
+            worker.merge_attempt = Some(attempt.clone());
+        })
+        .unwrap();
+
+        let inbox_path = setup.run().dir.join("inbox");
+        if inbox_path.is_dir() {
+            std::fs::remove_dir_all(&inbox_path).unwrap();
+        }
+        std::fs::write(&inbox_path, "blocks inbox creation").unwrap();
+        let merged = MergeAttempt::Merged {
+            pr_url: url.clone(),
+            head_sha: None,
+            decision_id: None,
+            attempted_at: String::new(),
+        };
+        assert!(record_merge_result(&setup.run(), "w1", &attempt, merged.clone()).is_err());
+        assert_eq!(outbox::queued(&setup.run()).len(), 1);
+        std::fs::remove_file(&inbox_path).unwrap();
+
+        record_merge_result(&setup.run(), "w1", &attempt, merged.clone()).unwrap();
+        record_merge_result(&setup.run(), "w1", &attempt, merged).unwrap();
+
+        let queued = outbox::queued(&setup.run());
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(
+            queued[0].op,
+            Op::IssueState {
+                target: StateTarget::Workflow(crate::run::WorkflowStage::InDeploy)
+            }
+        ));
+        let receipts: Vec<_> = inbox::unhandled(&setup.run())
+            .into_iter()
+            .filter(|item| item.kind == "merge")
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].created, attempted_at);
+        assert!(matches!(
+            worker::load(&setup.run(), "w1").unwrap().merge_attempt,
+            Some(MergeAttempt::Merged { .. })
+        ));
     }
 
     #[tokio::test]

@@ -16,14 +16,14 @@ Workspace labels put the ticket first. A coordinator is labeled `acme/DATA-1 · 
 - **One writer.** Only the plugin's background ticker writes to Linear. Agents call plugin subcommands that queue requests; they never hold a Linear token.
 - **Profiles, not flags.** Agent kind, model, effort and permission flags live in profiles you write in the config. Agents choose a profile by name and nothing else.
 - **Limits enforced by the binary.** Concurrent runs, workers per run and total agents are capped by the plugin, not by the agents.
-- **Merging is opt-in and requires an allowed Linear reply.** A team can enable one-time squash-merge authorization with `merge_on_authorization = true`; without it, the plugin never merges. The coordinator requests authorization for a worker's recorded PR, and a user in that team's `allowed_user_ids` must reply with the exact token shown in Linear. The coordinator then asks the plugin to make one `gh pr merge --squash` attempt. A confirmed merge moves the issue to deployment and resumes the coordinator for the remaining work. The plugin never force-pushes.
+- **Merging is opt-in.** A team can use one-time human authorization with `merge_on_authorization = true`, or a headless decision profile with `merge_decision = { profile = "merge-risk", max_risk_score = 20 }`. These modes are mutually exclusive. The machine score is a risk signal, not a user's approval: the coordinator must still invoke `worker merge`, and the plugin revalidates the PR and evidence before making one SHA-bound squash-merge attempt. Confirmed merges move the issue to deployment. The plugin never force-pushes.
 
 ## Requirements
 
 - macOS or Linux, and Herdr 0.9.1 or later
 - On Linux: a Secret Service provider (GNOME Keyring, KWallet) for the token, and `xdg-open`
 - The agent CLIs your profiles use (`claude`, `codex`, `cursor-agent`, ...) and `git`
-- `gh` on the ticker's `PATH` when any team enables `merge_on_authorization`
+- `gh` on the ticker's `PATH` when any team enables either merge mode
 - One or more Linear workspaces where you can install an OAuth application (workspace admin)
 
 ## Set up
@@ -57,10 +57,11 @@ allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
 # allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
 started_state = "In Progress"            # where issues move on pickup (default)
 review_state = "In Review"               # where the first `finish` moves the issue (default)
-# deploy_state = "In Deploy"             # after an authorized worker merge succeeds
+# deploy_state = "In Deploy"             # after a worker merge is confirmed
 # postmortem_state = "In Postmortem"     # when the coordinator finishes deployment work
 # done_state = "Done"                    # after a successful workflow postmortem
-# merge_on_authorization = false          # allow one-time worker PR squash merges after an allowed Linear reply
+# merge_on_authorization = false          # human mode: require an allowed Linear reply
+# merge_decision = { profile = "merge-risk", max_risk_score = 20 } # alternative headless assessment mode
 routing = "default"                      # the routing of this team's issues, a table under [routing] (required)
 
 [workspaces.acme.teams.OPS]              # each team has its own allowed users, review state and routing
@@ -118,7 +119,7 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 
 ### Postmortems
 
-To improve how the agents work run after run, a routing can list postmortem profiles. After an authorized merge, the coordinator completes deployment work and calls `finish`. The issue moves to its postmortem state, and a postmortem agent reads the run. The plugin posts the summary and labels, then moves the issue to its completed state only after that postmortem succeeds. Without a postmortem profile, or after a failed postmortem, the issue stays in its postmortem state for manual follow-up. Finishing into review does not run a postmortem.
+To improve how the agents work run after run, a routing can list postmortem profiles. After a worker PR merge is confirmed, the coordinator completes deployment work and calls `finish`. The issue moves to its postmortem state, and a postmortem agent reads the run. The plugin posts the summary and labels, then moves the issue to its completed state only after that postmortem succeeds. Without a postmortem profile, or after a failed postmortem, the issue stays in its postmortem state for manual follow-up. Finishing into review does not run a postmortem.
 
 An issue completed or canceled before a successful workflow postmortem gets a final postmortem when its run closes. A successful workflow postmortem prevents a duplicate final one. A postmortem profile is an ordinary profile: its `instructions.md` is the method, and says which labels to add. Edit it as often as you like; each comment names the profile and the method's version.
 
@@ -164,8 +165,11 @@ Profiles are not in `config.toml`. Each one is a folder next to it, named after 
     │   └── config.toml
     ├── standard/
     │   └── config.toml
-    └── deep/
-        └── config.toml
+    ├── deep/
+    │   └── config.toml
+    └── merge-risk/
+        ├── config.toml
+        └── instructions.md
 ```
 
 ```toml
@@ -215,7 +219,19 @@ args = ["-s", "workspace-write"]
 description = "Changes across modules, bugs with an unknown cause"
 ```
 
-A profile's `config.toml` takes `kind`, `model`, `effort`, `args`, `description`, `base` and, for routing and postmortem agents only, `env` and `timeout_seconds` (how long a call may take, 1 to 3600 seconds; the limits' default for the role when unset). Folders whose names start with `.` are skipped, other files inside a profile folder (a README, say) are left alone, and any other file directly in `profiles/` is refused. Profile names use letters, digits, `.`, `_` and `-`.
+```toml
+# profiles/merge-risk/config.toml: one supported headless kind
+kind = "codex"
+model = "gpt-6-sol"
+effort = "high"
+```
+
+```markdown
+<!-- profiles/merge-risk/instructions.md -->
+Assess the complete change and supplied evidence. Return a risk score from 0 to 100, where higher means more risk or uncertainty, and a concise evidence-based rationale.
+```
+
+A profile's `config.toml` takes `kind`, `model`, `effort`, `args`, `description`, `base` and, for routing, postmortem and merge decision agents only, `env` and `timeout_seconds` (how long a call may take, 1 to 3600 seconds; the limits' default for the role when unset). A merge decision profile must use a supported headless kind and have non-empty `instructions.md`. The plugin never reads or injects Linear OAuth credentials; it removes its config/state path variables and runs the CLI through the kind's headless recipe with no tools. The CLI keeps the current user's normal login and home context, as described under [Routing agent kinds](#routing-agent-kinds). Folders whose names start with `.` are skipped, other files inside a profile folder (a README, say) are left alone, and any other file directly in `profiles/` is refused. Profile names use letters, digits, `.`, `_` and `-`.
 
 **Profile inheritance.** `base = "<profile name>"` makes a profile start from another one, so shared settings live in one place and a profile keeps only what differs. A base may have a base of its own (`a` → `b` → `c`), but a profile has one base; a profile that only serves as a base is an ordinary profile. Over the chain, from the root to the profile:
 
@@ -375,7 +391,7 @@ Other kinds are not registered.
 4. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. If a worker is still working, it says what it is waiting for and ends its turn. Once all workers have reported, `herdr-linear-agent wait` can end a completed turn while keeping the issue active; `finish` moves work ready for review. Each worker gets a worktree created by `herdr worktree create` on a branch `herdr-linear-agent/<workspace>/<issue-key>/<id>-<title>`.
 5. Workers report what they are doing (`herdr-linear-agent report --activity`) and write a report (`PR: <url>`, `## Report`, `## Next`). The ticker shows each new activity in the session, posts a worker that waits on someone, its report and its pull requests, copies the report into the run folder, and tells the coordinator through its inbox. After 10 quiet minutes it posts what each worker is doing and for how long.
 6. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. Changes to the issue's Linear workflow state create inbox items for the coordinator. A stop signal interrupts the run's agents.
-7. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported. An authorized worker merge moves the issue to deployment and resumes the coordinator. After deployment work, a later `finish` moves the issue to its postmortem state. A successful workflow postmortem advances it to the completed state.
+7. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported. A confirmed worker merge moves the issue to deployment and resumes the coordinator. After deployment work, a later `finish` moves the issue to its postmortem state. A successful workflow postmortem advances it to the completed state.
 8. When the issue is completed or canceled, the ticker stops the agents, closes their workspaces and ends the session with a short response. Checkouts and branches are kept.
 
 If Linear removes the delegate or archives/dismisses the run's session, the ticker pauses the run, interrupts its agents and keeps its worktrees and history. It posts an ordinary issue comment with an incident-specific code. To authorize restoration, add an issue comment containing exactly `resume <code>`; `stop <code>` declines that request and leaves the run paused. The author must be a human in both the team's `allowed_user_ids` and `allowed_delegator_ids` (which defaults to `allowed_user_ids`). Restoring the delegate in the UI does not bypass a pending comment request.
@@ -386,7 +402,7 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 
 If an agent process exits while its Herdr pane remains open, the ticker confirms the pane is still empty for 30 seconds, then can resume that agent in the same pane and native session. It waits 15, 30 and 60 seconds before up to three automatic resume starts (in addition to the original launch); the attempt budget survives successful resumes and ticker restarts. A pane occupied by another agent is left alone. A missing native session or exhausted budget marks recovery stale; the coordinator receives an explicit `resume` action, and a worker's coordinator inbox gets a manual restart item.
 
-When `merge_on_authorization = true`, the coordinator runs `worker request-merge <KEY> <id>` for a worker's recorded pull request. An allowed user's exact `merge <token>` reply authorizes one `worker merge <KEY> <id>` attempt. If the command result is unknown, the plugin checks the PR with `gh pr view` before allowing a new authorization. It never retries a merge with the consumed token.
+With `merge_on_authorization = true`, the coordinator requests one-time authorization for the worker's recorded PR; an allowed user's exact `merge <token>` reply is required before `worker merge` can make one attempt. With `merge_decision` configured, `worker request-merge` instead queues an asynchronous assessment. `context` shows its durable status and score even after the inbox notice is handled. A score at or below the configured threshold is eligible, but it is not approval: the coordinator explicitly invokes `worker merge`, which reacquires and validates GitHub facts, issue/report contents and the complete diff, then consumes the receipt and merges only with the assessed head SHA. Open, draft, mergeability, review, check, repository identity or evidence failures block assessment or merge. A successful or ambiguous merge is always read back; unknown results are never retried. A fresh request can replace a terminal assessment, so the coordinator should have a concrete reason to reassess rather than rerolling for a lower score.
 
 For this workflow, set the Linear team's **Workflows & automations → On PR merge, move to…** to the configured deployment state, or to **No action**. If the GitHub integration moves the issue directly to `Done`, the plugin closes the run and writes its final postmortem. Deployment work and the workflow postmortem do not run. Queued workflow transitions leave completed and canceled issues alone.
 

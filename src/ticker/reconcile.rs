@@ -11,8 +11,9 @@
 //! 3. intake from the latest delegated list
 //! 4. apply the results of effect tasks (placements, starts) and routing
 //!    agents; they are facts and are applied even without a snapshot
-//! 5. per active run: watch the coordinator and the workers, launch, nudge
-//!    (with a snapshot), then the heartbeat and inbox pruning
+//! 5. per active run: watch the coordinator and workers, launch, heartbeat,
+//!    and inbox pruning; then reconcile headless merge decisions; then nudge
+//!    active runs with the same snapshot
 //! 6. the write-failure notice, and progress records of gone panes
 //!
 //! Record writes are field-level read-modify-writes under the run lock, on a
@@ -231,6 +232,11 @@ pub struct Reconciler {
             tokio::task::JoinHandle<super::postmortems::Written>,
         ),
     >,
+    pub(super) decision_task: Option<super::merge_decisions::DecisionTask>,
+    pub(super) decision_notification_retry_at:
+        BTreeMap<super::merge_decisions::DecisionKey, Timestamp>,
+    #[cfg(test)]
+    pub(super) decision_test_replies: super::merge_decisions::TestReplies,
 }
 
 pub(super) async fn blocking<T: Send + 'static>(
@@ -369,16 +375,20 @@ impl Reconciler {
             declined: BTreeMap::new(),
             keeping: Vec::new(),
             writing: BTreeMap::new(),
+            decision_task: None,
+            decision_notification_retry_at: BTreeMap::new(),
+            #[cfg(test)]
+            decision_test_replies: super::merge_decisions::TestReplies::default(),
         })
     }
 
-    /// Whether an effect task or a routing agent is still running.
     #[cfg(test)]
     pub fn busy(&self) -> bool {
         !self.in_flight.is_empty()
             || !self.routing.is_empty()
             || !self.keeping.is_empty()
             || !self.writing.is_empty()
+            || self.decision_task.is_some()
     }
 
     /// Waits for the transcript copies and postmortems still running.
@@ -553,9 +563,6 @@ impl Reconciler {
                 if let Err(error) = self.launch(d, snapshot, &run, now).await {
                     d.fail(&run.key, &error);
                 }
-                if let Err(error) = self.nudge(d, snapshot, &run, now).await {
-                    d.fail(&run.key, &error);
-                }
             }
             if let Err(error) = self.heartbeat(d, whole, &run, now).await {
                 d.fail(&run.key, &error);
@@ -569,6 +576,17 @@ impl Reconciler {
                     "{}: moved inbox/{name} to inbox/done: not an inbox item of this build",
                     run.key
                 ));
+            }
+        }
+        self.merge_decisions(d, now).await;
+        if let Some(snapshot) = snap {
+            for run in Run::list(&d.ctx.runs_dir()) {
+                if !run.record().is_ok_and(|r| r.status == Status::Active) {
+                    continue;
+                }
+                if let Err(error) = self.nudge(d, snapshot, &run, now).await {
+                    d.fail(&run.key, &error);
+                }
             }
         }
         self.write_failure_notice(d, now).await;
@@ -750,6 +768,7 @@ impl Reconciler {
         times.extend(self.not_sent.values().map(|at| *at + LAUNCH_SPACING));
         times.extend(self.missing_since.values().map(|at| *at + PANE_GRACE));
         times.extend(self.reported.values().map(|(_, at)| *at + METADATA_REFRESH));
+        times.extend(self.decision_deadline(now));
         if !self.failure_notified {
             times.extend(self.failing.values().map(|at| *at + WRITE_FAILURE_NOTICE));
         }
