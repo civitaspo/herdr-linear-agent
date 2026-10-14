@@ -12,7 +12,7 @@ use crate::herdr::{Herdr, PaneId, Snapshot};
 use crate::linear::api::{Activity, Content, ExternalUrl};
 use crate::outbox::{self, Op};
 use crate::run::{AgentRecord, AgentStatus, Recovery, Run, WaitReason};
-use crate::worker::{self, Group, Live, Worker};
+use crate::worker::{self, FailureCode, Group, Live, MergeDecisionState, Worker};
 use crate::{coordinator, files, inbox, transcript};
 
 /// Why a worker waits on a person, for its inbox item.
@@ -476,6 +476,7 @@ impl Reconciler {
         if let Some(hash) = worker::report_hash(w).filter(|h| *h != w.report_hash) {
             worker::copy_report_home(run, w)?;
             next.report_hash = hash;
+            next.merge_decision = invalidate_decision_for_report_change(next.merge_decision.take());
             let report =
                 std::fs::read_to_string(worker::home_report_path(run, &w.id)).unwrap_or_default();
             if let Some(url) = worker::pr_line(&report).filter(|url| *url != w.pr_url) {
@@ -546,6 +547,7 @@ impl Reconciler {
                     changed!(pr_url);
                     changed!(merge_authorization);
                     changed!(merge_attempt);
+                    changed!(merge_decision);
                     changed!(gone_reported);
                     changed!(activity);
                     changed!(activity_since);
@@ -920,4 +922,22 @@ impl Reconciler {
         }
         Ok(())
     }
+}
+
+fn invalidate_decision_for_report_change(
+    state: Option<MergeDecisionState>,
+) -> Option<MergeDecisionState> {
+    let request = match state? {
+        MergeDecisionState::Requested { request } => request,
+        MergeDecisionState::Assessed { assessment, .. } => assessment.request,
+        consumed @ MergeDecisionState::Consumed { .. } => return Some(consumed),
+        failed @ MergeDecisionState::Failed { .. } => return Some(failed),
+    };
+    Some(MergeDecisionState::Failed {
+        request,
+        code: FailureCode::StaleEvidence,
+        detail: "the worker report changed; request a fresh assessment".into(),
+        completed_at: files::now(),
+        notified: false,
+    })
 }

@@ -8,6 +8,7 @@
 //! else (a timeout, an answer outside the schema, a name outside the list)
 //! falls back to the first candidate.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -581,6 +582,8 @@ pub async fn choose(
         path_var,
         parent,
         role: "routing",
+        max_output_bytes: None,
+        remove_plugin_dirs: false,
     };
     let picked = match ask(&call).await {
         Ok(Ok(answer)) => picked(&answer, pick, candidates).map_err(Fallback::Invalid),
@@ -614,6 +617,10 @@ pub struct Ask<'a> {
     pub parent: &'a Path,
     /// Names the agent in errors and its folder, `herdr-linear-agent-<role>-…`.
     pub role: &'a str,
+    /// Optional cap for combined child stdout/stderr and answer-file bytes.
+    pub max_output_bytes: Option<usize>,
+    /// Remove the plugin's config/state path variables from this child.
+    pub remove_plugin_dirs: bool,
 }
 
 /// Runs the call once with the kind's recipe, in a fresh folder removed
@@ -655,31 +662,45 @@ pub async fn ask(call: &Ask<'_>) -> Result<Result<Value, Fallback>> {
     for (key, value) in call_env(profile, &invocation) {
         cmd.env(key, value);
     }
+    if call.remove_plugin_dirs {
+        cmd.env_remove("HERDR_PLUGIN_CONFIG_DIR");
+        cmd.env_remove("HERDR_PLUGIN_STATE_DIR");
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("could not start the {role} agent `{}`", invocation.program))?;
-    // A child past the timeout is dropped with the future and so killed.
-    let finished = tokio::time::timeout(call.timeout, async {
-        if let Some(mut stdin) = child.stdin.take() {
-            // A child that exits early closes the pipe; its answer then decides.
-            let _ = stdin.write_all(call.input.as_bytes()).await;
-        }
-        child.wait_with_output().await
-    })
-    .await;
-    let Ok(output) = finished else {
-        return Ok(Err(Fallback::TimedOut));
+    // Keep stdin within the same wall-clock budget as the child collection.
+    // A child that exits early closes the pipe; its answer then decides.
+    let deadline = tokio::time::Instant::now() + call.timeout;
+    let write_finished = if let Some(mut stdin) = child.stdin.take() {
+        tokio::time::timeout_at(deadline, stdin.write_all(call.input.as_bytes())).await
+    } else {
+        Ok(Ok(()))
     };
-    let output = output.with_context(|| format!("could not wait for the {role} agent"))?;
-    if !output.status.success() {
+    if write_finished.is_err() {
+        return Ok(Err(Fallback::TimedOut));
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let output = crate::process::collect_child(child, remaining, call.max_output_bytes)
+        .await
+        .with_context(|| format!("could not wait for the {role} agent"))?;
+    if output.timed_out {
+        return Ok(Err(Fallback::TimedOut));
+    }
+    if !output.success() {
         return Ok(Err(Fallback::Failed(format!(
             "it exited with {}",
-            output.status
+            output
+                .code
+                .map_or_else(|| "a signal".into(), |code| format!("code {code}"))
         ))));
     }
     let text = match &invocation.answer_file {
-        Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
-        None => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Some(path) => match call.max_output_bytes {
+            Some(max_bytes) => read_answer_file(path, max_bytes)?,
+            None => std::fs::read_to_string(path).unwrap_or_default(),
+        },
+        None => output.stdout,
     };
     if let Some(args) = (recipe.cleanup)(&text) {
         let mut cleanup = Command::new(&invocation.program);
@@ -698,6 +719,22 @@ pub async fn ask(call: &Ask<'_>) -> Result<Result<Value, Fallback>> {
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup.status()).await;
     }
     Ok((recipe.answer)(&text).ok_or_else(|| Fallback::Invalid("no JSON answer".into())))
+}
+
+fn read_answer_file(path: &Path, max_bytes: usize) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("could not read agent answer {}", path.display()))?;
+    let max_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if file.metadata()?.len() > max_u64 {
+        anyhow::bail!("agent answer exceeded the configured byte limit");
+    }
+    let read_limit = max_u64.saturating_add(1);
+    let mut bytes = Vec::new();
+    file.by_ref().take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("agent answer exceeded the configured byte limit");
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -945,6 +982,74 @@ mod tests {
                 "{kind}: nothing is left in the parent"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ask_can_remove_plugin_paths_and_bounds_stdout_and_answer_files() {
+        let stdout_fake = Fake::new("claude", PICKS_DOCS);
+        let mut p = profile("claude");
+        p.env.insert(
+            "HERDR_PLUGIN_CONFIG_DIR".into(),
+            "/should/not/reach/agent".into(),
+        );
+        p.env.insert(
+            "HERDR_PLUGIN_STATE_DIR".into(),
+            "/should/not/reach/agent".into(),
+        );
+        let candidates = two();
+        let schema = schema(Pick::Coordinator, &candidates);
+        let instructions = instructions(Pick::Coordinator, &candidates);
+        let stdout_path = stdout_fake.path();
+        let stdout_parent = stdout_fake.parent();
+        let call = Ask {
+            profile: &p,
+            schema: &schema,
+            instructions: &instructions,
+            input: "bounded input",
+            timeout: Duration::from_secs(10),
+            path_var: Some(&stdout_path),
+            parent: &stdout_parent,
+            role: "merge-decision",
+            max_output_bytes: Some(8),
+            remove_plugin_dirs: true,
+        };
+        let error = ask(&call).await.unwrap_err();
+        assert!(format!("{error:#}").contains("configured byte limit"));
+        let env = stdout_fake.seen("env");
+        assert!(!env.contains("HERDR_PLUGIN_CONFIG_DIR"), "{env}");
+        assert!(!env.contains("HERDR_PLUGIN_STATE_DIR"), "{env}");
+
+        let answer_fake = Fake::new("codex", r#"{"risk_score":10,"rationale":"safe"}"#);
+        let p = profile("codex");
+        let answer_path = answer_fake.path();
+        let answer_parent = answer_fake.parent();
+        let call = Ask {
+            profile: &p,
+            schema: &schema,
+            instructions: &instructions,
+            input: "bounded input",
+            timeout: Duration::from_secs(10),
+            path_var: Some(&answer_path),
+            parent: &answer_parent,
+            role: "merge-decision",
+            max_output_bytes: Some(16),
+            remove_plugin_dirs: true,
+        };
+        let error = ask(&call).await.unwrap_err();
+        assert!(format!("{error:#}").contains("configured byte limit"));
+    }
+
+    #[test]
+    fn bounded_answer_file_read_detects_growth_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("answer.json");
+        std::fs::write(&path, b"1234").unwrap();
+        assert_eq!(read_answer_file(&path, 4).unwrap(), "1234");
+        std::fs::write(&path, b"12345").unwrap();
+        assert!(
+            format!("{:#}", read_answer_file(&path, 4).unwrap_err())
+                .contains("configured byte limit")
+        );
     }
 
     #[tokio::test]

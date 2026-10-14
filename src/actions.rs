@@ -468,7 +468,7 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
             .workspaces
             .values()
             .flat_map(|workspace| workspace.teams.values())
-            .any(|team| team.merge_on_authorization)
+            .any(|team| team.merge_on_authorization || team.merge_decision.is_some())
         {
             kinds.push("gh");
         }

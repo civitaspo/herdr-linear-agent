@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,6 +21,9 @@ pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
     pub timeout: Duration,
+    /// Optional combined stdout/stderr byte cap. Output at or below the cap
+    /// is retained; exceeding it kills and reaps the child.
+    pub max_output_bytes: Option<usize>,
 }
 
 impl Cmd {
@@ -28,6 +32,7 @@ impl Cmd {
             program: program.into(),
             args: Vec::new(),
             timeout,
+            max_output_bytes: None,
         }
     }
 
@@ -38,6 +43,11 @@ impl Cmd {
 
     pub fn args<S: Into<String>>(mut self, args: impl IntoIterator<Item = S>) -> Self {
         self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn max_output_bytes(mut self, max: usize) -> Self {
+        self.max_output_bytes = Some(max);
         self
     }
 
@@ -56,6 +66,10 @@ pub struct Output {
     /// The exit code; `None` when the child was killed.
     pub code: Option<i32>,
     pub stdout: String,
+    /// Original captured stdout bytes when a caller requested a cap. This
+    /// preserves binary diff bytes without retaining raw output for ordinary
+    /// commands.
+    pub capped_stdout_bytes: Option<Vec<u8>>,
     pub stderr: String,
     pub timed_out: bool,
 }
@@ -78,10 +92,19 @@ impl Output {
             },
         }
     }
+
+    pub fn raw_stdout(&self) -> &[u8] {
+        self.capped_stdout_bytes
+            .as_deref()
+            .unwrap_or(self.stdout.as_bytes())
+    }
 }
 
 pub trait Runner: Send + Sync {
     fn run<'a>(&'a self, cmd: &'a Cmd) -> BoxFuture<'a, Result<Output>>;
+
+    /// An owned handle for work that must outlive the borrowing command.
+    fn shared(&self) -> Arc<dyn Runner>;
 }
 
 pub struct RealRunner;
@@ -90,10 +113,14 @@ impl Runner for RealRunner {
     fn run<'a>(&'a self, cmd: &'a Cmd) -> BoxFuture<'a, Result<Output>> {
         Box::pin(run(cmd))
     }
+
+    fn shared(&self) -> Arc<dyn Runner> {
+        Arc::new(RealRunner)
+    }
 }
 
 async fn run(cmd: &Cmd) -> Result<Output> {
-    let mut child = tokio::process::Command::new(&cmd.program)
+    let child = tokio::process::Command::new(&cmd.program)
         .args(&cmd.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -101,24 +128,54 @@ async fn run(cmd: &Cmd) -> Result<Output> {
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("could not run `{}`", cmd.program))?;
-    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        anyhow::bail!("`{}` has no output pipes", cmd.program);
-    };
-    let mut deadline = Instant::now() + cmd.timeout;
+    collect_child(child, cmd.timeout, cmd.max_output_bytes).await
+}
+
+/// Drains a child's output without retaining more than `max_output_bytes`.
+/// Routing shares this loop so headless calls have the same kill/reap and
+/// drain behavior as runner-backed commands.
+pub(crate) async fn collect_child(
+    mut child: tokio::process::Child,
+    timeout: Duration,
+    max_output_bytes: Option<usize>,
+) -> Result<Output> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    if stdout.is_none() && stderr.is_none() {
+        anyhow::bail!("child has no output pipes");
+    }
+    let mut deadline = Instant::now() + timeout;
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let (mut out_buf, mut err_buf) = ([0u8; 8192], [0u8; 8192]);
-    let (mut out_open, mut err_open) = (true, true);
+    let (mut out_open, mut err_open) = (stdout.is_some(), stderr.is_some());
     let mut status = None;
+    let mut exceeded = false;
     // Both pipes are drained while waiting, so a chatty child cannot fill a
     // pipe and stall before its deadline.
     while status.is_none() || out_open || err_open {
         tokio::select! {
-            read = stdout.read(&mut out_buf), if out_open => match read {
-                Ok(n) if n > 0 => out.extend_from_slice(&out_buf[..n]),
+            read = async { stdout.as_mut().expect("open stdout").read(&mut out_buf).await }, if out_open => match read {
+                Ok(n) if n > 0 => {
+                    if max_output_bytes.is_some_and(|max| {
+                        out.len().saturating_add(err.len()).saturating_add(n) > max
+                    }) {
+                        exceeded = true;
+                    } else {
+                        out.extend_from_slice(&out_buf[..n]);
+                    }
+                }
                 _ => out_open = false,
             },
-            read = stderr.read(&mut err_buf), if err_open => match read {
-                Ok(n) if n > 0 => err.extend_from_slice(&err_buf[..n]),
+            read = async { stderr.as_mut().expect("open stderr").read(&mut err_buf).await }, if err_open => match read {
+                Ok(n) if n > 0 => {
+                    if max_output_bytes.is_some_and(|max| {
+                        out.len().saturating_add(err.len()).saturating_add(n) > max
+                    }) {
+                        exceeded = true;
+                    } else {
+                        err.extend_from_slice(&err_buf[..n]);
+                    }
+                }
                 _ => err_open = false,
             },
             waited = child.wait(), if status.is_none() => {
@@ -130,35 +187,49 @@ async fn run(cmd: &Cmd) -> Result<Output> {
             () = sleep_until(deadline), if status.is_none() => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+                let (stdout, capped_stdout_bytes) = captured_stdout(out, max_output_bytes.is_some());
                 return Ok(Output {
                     code: None,
-                    stdout: String::from_utf8_lossy(&out).into_owned(),
+                    stdout,
+                    capped_stdout_bytes,
                     stderr: String::from_utf8_lossy(&err).into_owned(),
                     timed_out: true,
                 });
             }
         }
+        if exceeded {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            anyhow::bail!("child output exceeded the configured byte limit");
+        }
     }
+    let (stdout, capped_stdout_bytes) = captured_stdout(out, max_output_bytes.is_some());
     Ok(Output {
         code: status.and_then(|s| s.code()),
-        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stdout,
+        capped_stdout_bytes,
         stderr: String::from_utf8_lossy(&err).into_owned(),
         timed_out: false,
     })
 }
 
+fn captured_stdout(bytes: Vec<u8>, keep_raw: bool) -> (String, Option<Vec<u8>>) {
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    (text, keep_raw.then_some(bytes))
+}
+
 #[cfg(test)]
 pub mod fake {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
     /// Answers each command with the last rule whose needle its display line
     /// contains, so a test can override a default. Every command is recorded.
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     pub struct FakeRunner {
-        rules: Mutex<Vec<(String, Output)>>,
-        pub calls: Mutex<Vec<Cmd>>,
+        rules: Arc<Mutex<Vec<(String, Output)>>>,
+        pub calls: Arc<Mutex<Vec<Cmd>>>,
     }
 
     impl FakeRunner {
@@ -217,6 +288,10 @@ pub mod fake {
                 .ok_or_else(|| anyhow::anyhow!("FakeRunner: no rule for `{line}`"));
             Box::pin(std::future::ready(answer))
         }
+
+        fn shared(&self) -> Arc<dyn Runner> {
+            Arc::new(self.clone())
+        }
     }
 }
 
@@ -248,6 +323,7 @@ mod tests {
             Output {
                 code: Some(3),
                 stdout: "on stdout".into(),
+                capped_stdout_bytes: None,
                 stderr: "on stderr".into(),
                 timed_out: false,
             }
@@ -257,6 +333,36 @@ mod tests {
 
         let (result, _) = timed(sh("true", PROMPT)).await;
         assert!(result.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn combined_output_cap_accepts_the_limit_and_rejects_the_next_byte() {
+        let exact = sh("printf '1234'; printf '5678' >&2", PROMPT).max_output_bytes(8);
+        let output = RealRunner.run(&exact).await.unwrap();
+        assert!(output.success());
+        assert_eq!(output.stdout.len() + output.stderr.len(), 8);
+
+        let over = sh("printf '1234'; printf '5678' >&2", PROMPT).max_output_bytes(7);
+        let error = RealRunner.run(&over).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("child output exceeded the configured byte limit"),
+            "{error:#}"
+        );
+
+        let flood = Cmd::new("yes", PROMPT).arg("flood").max_output_bytes(64);
+        let (result, took) = timed(flood).await;
+        assert!(result.unwrap_err().to_string().contains("output exceeded"));
+        assert!(took < PROMPT, "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn capped_stdout_preserves_original_binary_bytes() {
+        let output = RealRunner
+            .run(&sh("printf '\\377'", PROMPT).max_output_bytes(8))
+            .await
+            .unwrap();
+        assert_eq!(output.raw_stdout(), [0xff]);
+        assert!(output.stdout.contains('�'));
     }
 
     #[test]

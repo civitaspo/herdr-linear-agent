@@ -16,6 +16,7 @@ use crate::{inbox, worker};
 
 const KEY: &str = "acme/DATA-1";
 const PR: &str = "https://github.com/acme/api/pull/7";
+const PR_WEB: &str = "https://github.com/acme/web/pull/8";
 const LAUNCH: &str = "[herdr-linear-agent ticker] Start acme/DATA-1. Follow AGENTS.md.";
 const RESUMED_WITH: [&str; 2] = ["--resume", "sess-acme-data-1-coordinator"];
 
@@ -31,6 +32,87 @@ fn request(repo: &str, profile: &str, title: &str) -> WorkerStart {
 fn limit(key: &str, value: u64) -> impl FnOnce(String) -> String {
     let table = format!("[limits]\n{key} = {value}\n\n[herdr]");
     move |config| config.replace("[herdr]", &table)
+}
+
+fn decision_metadata(pr: &str, repository: &str, number: u64, w: &worker::Worker) -> String {
+    let (owner, _) = repository
+        .split_once('/')
+        .expect("test repository has an owner and name");
+    json!({
+        "url": pr,
+        "number": number,
+        "title": "Protect account recovery",
+        "body": "The login challenge used to expire too early.",
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefOid": "a3".repeat(20),
+        "baseRefOid": "b4".repeat(20),
+        "headRefName": w.branch,
+        "baseRefName": w.base,
+        "headRepository": {"nameWithOwner": repository},
+        "headRepositoryOwner": {"login": owner},
+        "mergeable": "MERGEABLE",
+        "mergedAt": null,
+        "reviewDecision": "",
+        "statusCheckRollup": [{
+            "__typename": "CheckRun",
+            "name": "rust",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "workflowName": "CI"
+        }],
+        "reviews": []
+    })
+    .to_string()
+}
+
+fn fake_decision_github(world: &World, w: &worker::Worker, pr: &str, number: u64) {
+    let repository = format!("acme/{}", w.repo);
+    let metadata = decision_metadata(pr, &repository, number, w);
+    world
+        .runner
+        .on(
+            &format!("-C {} remote get-url origin", w.repo_path),
+            crate::process::fake::ok(&format!("git@github.com:{repository}.git\n")),
+        )
+        .on(
+            &format!("gh pr view {pr}"),
+            crate::process::fake::ok(&metadata),
+        )
+        .on(
+            &format!("gh api repos/{repository}/compare/"),
+            crate::process::fake::ok("diff --git a/src/auth.rs b/src/auth.rs\n+safe change\n"),
+        );
+}
+
+async fn machine_world() -> (World, worker::Worker) {
+    let mut world = World::sample();
+    world.merge_decision_mode(20);
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.report(&w, &format!("PR: {PR}\n## Report\nReady to review.\n"));
+    world.settle().await;
+    let w = world.worker(KEY, "w1");
+    fake_decision_github(&world, &w, PR, 7);
+    (world, w)
+}
+
+async fn assessed_machine_world() -> World {
+    let (mut world, _) = machine_world().await;
+    add_workflow_states(&world);
+    commands::finish(&world.ctx(), &world.session(), KEY, "Ready for deployment.")
+        .await
+        .unwrap();
+    world.settle().await;
+    world.decision_answer(json!({
+        "risk_score": 20,
+        "rationale": "The diff is narrow and the current checks pass."
+    }));
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.settle().await;
+    world
 }
 
 fn to(world: &World, pane: &str) -> Vec<String> {
@@ -1173,10 +1255,17 @@ async fn a_merge_needs_an_exact_allowed_reply_and_the_plugin_consumes_it_once() 
         .await
         .unwrap();
     assert_eq!(world.runner.count("gh pr merge"), 1);
-    assert_eq!(
-        worker::load(&world.run(KEY), "w1").unwrap().merge_attempt,
-        Some(worker::MergeAttempt::Merged { pr_url: PR.into() })
-    );
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1")
+            .unwrap()
+            .merge_attempt,
+        Some(worker::MergeAttempt::Merged {
+            pr_url,
+            head_sha: None,
+            decision_id: None,
+            attempted_at,
+        }) if pr_url == PR && !attempted_at.is_empty()
+    ));
     world.settle().await;
     assert_eq!(world.issue_state(KEY), "In Deploy");
     assert!(!world.record(KEY).finished);
@@ -1197,6 +1286,539 @@ async fn a_merge_needs_an_exact_allowed_reply_and_the_plugin_consumes_it_once() 
     assert_eq!(updated.pr_url, "https://github.com/acme/api/pull/8");
     assert!(updated.merge_authorization.is_none());
     assert!(updated.merge_attempt.is_none());
+}
+
+#[tokio::test]
+async fn a_machine_merge_request_is_durable_deduplicated_and_assessed_once() {
+    let (mut world, worker) = machine_world().await;
+    world.decision_answer(json!({
+        "risk_score": 20,
+        "rationale": "The diff is narrow and the current checks pass."
+    }));
+
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    let Some(crate::worker::MergeDecisionState::Requested { request }) =
+        world.worker(KEY, "w1").merge_decision
+    else {
+        panic!("machine request was not persisted before assessment");
+    };
+    assert_eq!(request.id.get_version_num(), 4);
+    assert_eq!(world.decision_calls(), 0);
+    assert_eq!(world.runner.count("gh "), 0);
+
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    let Some(crate::worker::MergeDecisionState::Requested { request: duplicate }) =
+        world.worker(KEY, "w1").merge_decision
+    else {
+        panic!("duplicate request replaced the durable request");
+    };
+    assert_eq!(duplicate.id, request.id);
+    world.settle().await;
+
+    let assessed_worker = world.worker(KEY, "w1");
+    let Some(crate::worker::MergeDecisionState::Assessed {
+        assessment,
+        notified,
+    }) = assessed_worker.merge_decision
+    else {
+        panic!("the assessment did not reach a terminal state");
+    };
+    assert_eq!(assessment.request.id, request.id);
+    assert_eq!(assessment.output.risk_score, 20);
+    assert_eq!(assessment.max_risk_score, 20);
+    assert!(notified);
+    assert_eq!(world.decision_calls(), 1);
+    assert_eq!(world.runner.count("gh pr view"), 3);
+    assert_eq!(world.runner.count("gh api repos/acme/api/compare/"), 1);
+    assert_eq!(world.runner.count("gh pr merge"), 0);
+    assert_eq!(world.issue_state(KEY), "In Progress");
+    assert_eq!(
+        inbox::unhandled(&world.run(KEY))
+            .into_iter()
+            .filter(|item| item.kind == "merge-decision")
+            .count(),
+        1
+    );
+
+    world.report(
+        &worker,
+        &format!("PR: {PR}\n## Report\nThe tests were rerun.\n"),
+    );
+    world.later(1);
+    world.settle().await;
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(crate::worker::MergeDecisionState::Failed {
+            code: crate::worker::FailureCode::StaleEvidence,
+            ..
+        })
+    ));
+    assert_eq!(
+        world.decision_calls(),
+        1,
+        "report changes do not rerun a model"
+    );
+}
+
+#[tokio::test]
+async fn switching_to_human_merge_mode_clears_unused_machine_state() {
+    let (mut world, _) = machine_world().await;
+    world.decision_answer(json!({
+        "risk_score": 10,
+        "rationale": "The current evidence is narrow and complete."
+    }));
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(worker::MergeDecisionState::Assessed { .. })
+    ));
+
+    let config_path = world.env.config_dir().join(crate::config::FILE_NAME);
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    let config = config.replace(
+        "merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }",
+        "merge_on_authorization = true\n# merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }",
+    );
+    std::fs::write(config_path, config).unwrap();
+    world.reload_config();
+
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    let worker = world.worker(KEY, "w1");
+    assert!(worker.merge_decision.is_none());
+    assert!(matches!(
+        worker.merge_authorization,
+        Some(worker::MergeAuthorization::Pending { .. })
+    ));
+    assert_eq!(crate::outbox::pending(&world.run(KEY)).len(), 1);
+}
+
+#[tokio::test]
+async fn a_report_change_cancels_a_held_assessment_and_notifies_stale_evidence() {
+    let (mut world, worker) = machine_world().await;
+    let (started, release) = world.hold_decision(json!({
+        "risk_score": 10,
+        "rationale": "The diff is narrow and the current checks pass."
+    }));
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.once().await;
+    started.await.unwrap();
+    assert_eq!(world.decision_calls(), 1);
+
+    world.report(
+        &worker,
+        &format!("PR: {PR}\n## Report\nNew tests were added.\n"),
+    );
+    world.later(1);
+    world.settle().await;
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(crate::worker::MergeDecisionState::Failed {
+            code: crate::worker::FailureCode::StaleEvidence,
+            ..
+        })
+    ));
+    assert!(release.send(()).is_err(), "the stale task was aborted");
+    assert_eq!(world.decision_calls(), 1);
+}
+
+#[tokio::test]
+async fn an_issue_change_during_assessment_cannot_persist_an_eligible_receipt() {
+    let (mut world, _) = machine_world().await;
+    let (started, release) = world.hold_decision(json!({
+        "risk_score": 5,
+        "rationale": "The unchanged report supports this low score."
+    }));
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.once().await;
+    started.await.unwrap();
+
+    let issue = world.run(KEY).issue_md();
+    let current = std::fs::read_to_string(&issue).unwrap();
+    std::fs::write(
+        &issue,
+        format!("{current}\nThe acceptance criteria changed.\n"),
+    )
+    .unwrap();
+    release.send(()).unwrap();
+    world.settle().await;
+
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(crate::worker::MergeDecisionState::Failed {
+            code: crate::worker::FailureCode::StaleEvidence,
+            ..
+        })
+    ));
+    assert_eq!(world.decision_calls(), 1);
+    assert_eq!(world.runner.count("gh pr merge"), 0);
+}
+
+#[tokio::test]
+async fn a_machine_score_above_the_threshold_is_persisted_but_cannot_be_consumed() {
+    let (mut world, _) = machine_world().await;
+    world.decision_answer(json!({
+        "risk_score": 21,
+        "rationale": "The change has material deployment uncertainty."
+    }));
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.settle().await;
+
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(crate::worker::MergeDecisionState::Assessed { ref assessment, .. })
+            if assessment.output.risk_score == 21
+    ));
+    let error = commands::worker_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exceeds the configured threshold"),
+        "{error}"
+    );
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(crate::worker::MergeDecisionState::Assessed { .. })
+    ));
+    assert_eq!(world.runner.count("gh pr merge"), 0);
+}
+
+#[tokio::test]
+async fn one_global_assessor_serializes_workers_and_hard_gates_the_next_request() {
+    let (mut world, _first) = machine_world().await;
+    let second = world.start_worker("web").await;
+    world.report(
+        &second,
+        &format!("PR: {PR_WEB}\n## Report\nReady to review.\n"),
+    );
+    world.settle().await;
+    let second = world.worker(KEY, "w2");
+    fake_decision_github(&world, &second, PR_WEB, 8);
+
+    let second_metadata = json!({
+        "url": PR_WEB,
+        "number": 8,
+        "title": "Review a web change",
+        "body": "A second request in the same run.",
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefOid": "c5".repeat(20),
+        "baseRefOid": "d6".repeat(20),
+        "headRefName": second.branch,
+        "baseRefName": second.base,
+        "headRepository": {"nameWithOwner": "acme/web"},
+        "headRepositoryOwner": {"login": "acme"},
+        "mergeable": "MERGEABLE",
+        "mergedAt": null,
+        "reviewDecision": "CHANGES_REQUESTED",
+        "statusCheckRollup": [{
+            "__typename": "CheckRun",
+            "name": "web-ci",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "workflowName": "CI"
+        }],
+        "reviews": []
+    })
+    .to_string();
+    world.runner.on(
+        &format!("gh pr view {PR_WEB}"),
+        crate::process::fake::ok(&second_metadata),
+    );
+    let (started, release) = world.hold_decision(json!({
+        "risk_score": 10,
+        "rationale": "The first request has complete evidence."
+    }));
+    world.decision_answer(json!({
+        "risk_score": 5,
+        "rationale": "This reply must not override the blocking review gate."
+    }));
+
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    commands::worker_request_merge(&world.ctx(), KEY, "w2")
+        .await
+        .unwrap();
+    world.once().await;
+    started.await.unwrap();
+    assert_eq!(
+        world.decision_calls(),
+        1,
+        "the second request waits in durable state"
+    );
+    assert!(matches!(
+        world.worker(KEY, "w2").merge_decision,
+        Some(crate::worker::MergeDecisionState::Requested { .. })
+    ));
+
+    release.send(()).unwrap();
+    world.settle().await;
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(crate::worker::MergeDecisionState::Assessed { .. })
+    ));
+    assert!(matches!(
+        world.worker(KEY, "w2").merge_decision,
+        Some(crate::worker::MergeDecisionState::Failed {
+            code: crate::worker::FailureCode::HardGate,
+            ..
+        })
+    ));
+    assert_eq!(world.decision_calls(), 2);
+    assert_eq!(world.runner.count("gh pr view "), 4);
+    assert_eq!(world.runner.count("gh pr merge"), 0);
+}
+
+#[tokio::test]
+async fn a_decision_failure_is_persisted_and_notified_without_merge_authority() {
+    let (mut world, _) = machine_world().await;
+    world.decision_failure(
+        crate::worker::FailureCode::InvalidOutput,
+        "the test injected malformed structured output",
+    );
+    commands::worker_request_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_decision,
+        Some(crate::worker::MergeDecisionState::Failed {
+            code: crate::worker::FailureCode::InvalidOutput,
+            notified: true,
+            ..
+        })
+    ));
+    assert_eq!(world.decision_calls(), 1);
+    assert_eq!(world.runner.count("gh pr merge"), 0);
+    assert_eq!(
+        inbox::unhandled(&world.run(KEY))
+            .into_iter()
+            .filter(|item| item.kind == "merge-decision")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn machine_merge_consumes_the_receipt_with_a_head_guard_and_confirms_deployment() {
+    let mut world = assessed_machine_world().await;
+    let head = "a3".repeat(20);
+    world
+        .runner
+        .on("gh pr merge", crate::process::fake::ok(""))
+        .on(
+            &format!("gh pr view {PR} --json state,mergedAt,headRefOid"),
+            crate::process::fake::ok(
+                &json!({
+                    "state": "MERGED",
+                    "mergedAt": "2026-10-14T00:00:00Z",
+                    "headRefOid": head
+                })
+                .to_string(),
+            ),
+        );
+
+    commands::worker_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    let worker = world.worker(KEY, "w1");
+    let decision_id = match &worker.merge_decision {
+        Some(crate::worker::MergeDecisionState::Consumed { assessment, .. }) => {
+            assessment.request.id
+        }
+        other => panic!("machine authority was not consumed: {other:?}"),
+    };
+    assert!(matches!(
+        worker.merge_attempt,
+        Some(crate::worker::MergeAttempt::Merged {
+            pr_url,
+            head_sha: Some(head_sha),
+            decision_id: Some(actual_id),
+            attempted_at,
+        }) if pr_url == PR
+            && head_sha == "a3".repeat(20)
+            && actual_id == decision_id.to_string()
+            && !attempted_at.is_empty()
+    ));
+    let merge_call = world.runner.lines("gh pr merge").pop().unwrap();
+    assert!(
+        merge_call.ends_with(&format!("--match-head-commit {}", "a3".repeat(20))),
+        "{merge_call}"
+    );
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+    assert_eq!(world.issue_state(KEY), "In Review");
+
+    world.settle().await;
+    assert_eq!(world.issue_state(KEY), "In Deploy");
+    assert!(
+        commands::worker_merge(&world.ctx(), KEY, "w1")
+            .await
+            .is_err()
+    );
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+}
+
+#[tokio::test]
+async fn a_successful_machine_merge_command_stays_unknown_until_readback_confirms_it() {
+    let mut world = assessed_machine_world().await;
+    let head = "a3".repeat(20);
+    world
+        .runner
+        .on("gh pr merge", crate::process::fake::ok(""))
+        .on(
+            &format!("gh pr view {PR} --json state,mergedAt,headRefOid"),
+            crate::process::fake::ok(
+                &json!({
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "headRefOid": head
+                })
+                .to_string(),
+            ),
+        );
+    let error = commands::worker_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("outcome is unknown"), "{error}");
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_attempt,
+        Some(crate::worker::MergeAttempt::Unknown {
+            head_sha: Some(ref sha),
+            ..
+        }) if sha == &"a3".repeat(20)
+    ));
+    assert_eq!(world.issue_state(KEY), "In Review");
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+
+    let config_path = world.env.config_dir().join(crate::config::FILE_NAME);
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    let config = config.replace(
+        "merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }",
+        "# merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }",
+    );
+    std::fs::write(config_path, config).unwrap();
+    world.reload_config();
+    world
+        .run(KEY)
+        .update(|record| {
+            record.status = Status::Closed;
+            record.stopped = true;
+        })
+        .unwrap();
+    world.runner.on(
+        &format!("gh pr view {PR} --json state,mergedAt,headRefOid"),
+        crate::process::fake::ok(
+            &json!({
+                "state": "MERGED",
+                "mergedAt": "2026-10-14T00:00:00Z",
+                "headRefOid": head
+            })
+            .to_string(),
+        ),
+    );
+
+    commands::worker_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap();
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_attempt,
+        Some(crate::worker::MergeAttempt::Merged { .. })
+    ));
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+    assert_eq!(
+        world.issue_state(KEY),
+        "In Review",
+        "closed runs get no deployment write"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_machine_merge_command_with_an_open_pr_stays_unknown() {
+    let world = assessed_machine_world().await;
+    world
+        .runner
+        .on(
+            "gh pr merge",
+            crate::process::fake::fail(1, "merge request timed out"),
+        )
+        .on(
+            &format!("gh pr view {PR} --json state,mergedAt,headRefOid"),
+            crate::process::fake::ok(
+                &json!({
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "headRefOid": "a3".repeat(20)
+                })
+                .to_string(),
+            ),
+        );
+
+    assert!(
+        commands::worker_merge(&world.ctx(), KEY, "w1")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("outcome is unknown")
+    );
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_attempt,
+        Some(crate::worker::MergeAttempt::Unknown { .. })
+    ));
+    assert_eq!(world.runner.count("gh pr merge"), 1);
+    assert_eq!(world.issue_state(KEY), "In Review");
+}
+
+#[tokio::test]
+async fn a_machine_merge_with_a_mismatched_readback_head_stays_unknown() {
+    let mut world = assessed_machine_world().await;
+    let head = "a3".repeat(20);
+    world
+        .runner
+        .on("gh pr merge", crate::process::fake::ok(""))
+        .on(
+            &format!("gh pr view {PR} --json state,mergedAt,headRefOid"),
+            crate::process::fake::ok(
+                &json!({
+                    "state": "MERGED",
+                    "mergedAt": "2026-10-14T00:00:00Z",
+                    "headRefOid": "b4".repeat(20)
+                })
+                .to_string(),
+            ),
+        );
+
+    let error = commands::worker_merge(&world.ctx(), KEY, "w1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("outcome is unknown"), "{error}");
+    assert!(matches!(
+        world.worker(KEY, "w1").merge_attempt,
+        Some(crate::worker::MergeAttempt::Unknown {
+            head_sha: Some(ref sha),
+            ..
+        }) if sha == &head
+    ));
+    world.settle().await;
+    assert_eq!(world.issue_state(KEY), "In Review");
+    assert_eq!(world.runner.count("gh pr merge"), 1);
 }
 
 #[tokio::test]

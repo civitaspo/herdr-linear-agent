@@ -493,3 +493,22 @@ The second run, [CIV-19](https://linear.app/civitaspo/issue/CIV-19/verify-unlink
 The run required driver help with a scratch-directory permission, the test Git signing environment, a coordinator report path and replacing an auxiliary worker report with its canonical `report.md`. The check exercised the real plugin workflow with real agents and allowed-user replies. Deployment was represented by the merged README check; no production deployment ran. Postmortem generation and delivery were checked, but its prose was not independently graded. Unauthorized replies, stale selections, unknown write outcomes and failed postmortems remain regression-suite checks.
 
 The default Herdr session and installed ticker were left untouched. No Linear team settings or states were changed. Both scratch PRs were intentionally merged. The isolated session and ticker were stopped after the check.
+
+## Merge-decision evidence acquisition (2026-10-14)
+
+The installed GitHub CLI was `gh 2.102.0`. A read-only probe of the existing
+open PR #15 in `civitaspo/testing-herdr-linear-agent` confirmed that `gh pr view`
+returns the URL, PR number, state, draft flag, full head/base OIDs and refs,
+head repository and owner, mergeability, review decision, check rollup,
+reviews and merge timestamp used by the decision gate. The PR was open and
+not a draft; its checks were two `SUCCESS` and one `SKIPPED`, its review
+decision was empty, and GitHub reported `mergeable = UNKNOWN`. The feature
+therefore refuses this PR as assessment evidence.
+
+For head `7de04e8b16bfd85da61689cd6d1fe87a93a19a56` and base
+`541567387ea7e65029ac7e14fb03d4237e8e02d1`, the exact-SHA compare endpoint
+returned the same 944 diff bytes as `gh pr diff 15`: both SHA-256 hashes were
+`da94a26f985407372706e94c9dcf09045f3a57244a4e6f1c9b8eb88dab8fc00a`.
+This was a read-only GitHub compatibility check. No assessment model, agent
+CLI or Linear request was run, and no scratch PR or issue was changed. It does
+not verify a real machine assessment, merge, restart or performance lane.

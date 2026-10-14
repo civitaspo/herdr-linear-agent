@@ -207,7 +207,11 @@ impl World {
 
     /// The same World after a ticker restart: nothing kept in memory.
     pub fn restart_ticker(&mut self) {
-        let (reconciler, effects, routing) = channels();
+        let (mut reconciler, effects, routing) = channels();
+        #[cfg(test)]
+        {
+            reconciler.decision_test_replies = self.reconciler.decision_test_replies.clone();
+        }
         self.reconciler = reconciler;
         self.effects = effects;
         self.routing = routing;
@@ -223,6 +227,20 @@ impl World {
     pub fn reload_config(&mut self) {
         self.config = Config::load(&self.env.config_dir()).unwrap();
         self.restart_ticker();
+    }
+
+    pub fn merge_decision_mode(&mut self, max_risk_score: u8) {
+        let path = self.env.config_dir().join(crate::config::FILE_NAME);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replacen(
+            "# merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }",
+            &format!(
+                "merge_decision = {{ profile = \"merge-risk\", max_risk_score = {max_risk_score} }}"
+            ),
+            1,
+        );
+        std::fs::write(path, text).unwrap();
+        self.reload_config();
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
@@ -242,6 +260,53 @@ impl World {
 
     pub fn now(&self) -> Timestamp {
         self.now
+    }
+
+    /// Queues a strict JSON answer at the merge-decision model-call boundary.
+    /// Evidence acquisition and output validation still use production code.
+    pub fn decision_answer(&mut self, value: Value) {
+        self.reconciler
+            .decision_test_replies
+            .push(super::merge_decisions::TestReply {
+                response: Ok(value),
+                started: None,
+                release: None,
+            });
+    }
+
+    /// Queues an answer held until released, returning start and release
+    /// barriers for stale-result and cancellation scenarios without a CLI.
+    pub fn hold_decision(
+        &mut self,
+        value: Value,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        self.reconciler
+            .decision_test_replies
+            .push(super::merge_decisions::TestReply {
+                response: Ok(value),
+                started: Some(started),
+                release: Some(wait),
+            });
+        (ready, release)
+    }
+
+    pub fn decision_failure(&mut self, code: crate::worker::FailureCode, detail: &str) {
+        self.reconciler
+            .decision_test_replies
+            .push(super::merge_decisions::TestReply {
+                response: Err((code, detail.into())),
+                started: None,
+                release: None,
+            });
+    }
+
+    pub fn decision_calls(&self) -> usize {
+        self.reconciler.decision_test_replies.calls()
     }
 
     pub fn later(&mut self, seconds: i64) {

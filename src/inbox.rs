@@ -133,6 +133,38 @@ pub fn write_held(
     Ok(item.id)
 }
 
+/// Writes a terminal decision receipt at its deterministic id. A matching
+/// item in either inbox directory is already delivered; conflicting content
+/// is surfaced and never overwritten.
+pub fn write_once_held(run: &Run, _lock: &crate::run::RunLock, item: &Item) -> Result<()> {
+    check_id(&item.id)?;
+    for dir in [&inbox_dir(run), &done_dir(run)] {
+        let path = item_path(dir, &item.id);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    bail!("{} is not a regular inbox item", path.display());
+                }
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("could not read {}", path.display()))?;
+                let existing = parse(&text)
+                    .with_context(|| format!("{} is not a valid inbox item", path.display()))?;
+                if existing != *item {
+                    bail!("{} conflicts with the decision receipt", path.display());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not inspect {}", path.display()));
+            }
+        }
+    }
+    std::fs::create_dir_all(inbox_dir(run))?;
+    let text = render(item)?;
+    files::write_atomic(&item_path(&inbox_dir(run), &item.id), text.as_bytes())
+}
+
 /// The items in `dir` that parse, oldest first, and the names of the files
 /// that do not.
 fn read_items(dir: &Path) -> (Vec<Item>, Vec<String>) {
