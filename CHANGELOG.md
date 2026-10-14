@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update Securefix caller workflows to v0.2.14 (#152)
 - update rust crate tokio to v1.53.3 (#150)
 - update dependency jdx/mise to v2026.10.9 (#149)
 - update actions/create-github-app-token action to v3.3.0 (#148)
