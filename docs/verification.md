@@ -561,6 +561,12 @@ To separate the feature result from existing failures, I extracted the current
 `pickup_in_another_started_state_does_not_suppress_a_later_started_transition`,
 `the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes`, and
 `workflow_state_changes_reach_the_coordinator_once_including_same_type_changes`.
-These are the same six tests failing in PR #151 on macOS and Linux. This
-reproduces the current CI blocker on the base commit without the feature; it
-does not make the feature PR's CI green or resolve the failures.
+The failures shared a test-fixture issue: the scenarios pinned Linear's
+`updatedAt` to fixed midnight timestamps. Some preceded the real-time
+`World::now()` value or the saved issue cursor, so the poll correctly treated
+the fixture update as stale and ignored it. The scenarios now derive those
+timestamps from `World::now()`, retaining the intended newer, older, and later
+event ordering without depending on the calendar date. The full workspace
+suite on the updated feature branch passes 443 tests with 1 ignored. The earlier
+base and PR runs remain historical evidence; CI for the updated branch is
+pending.

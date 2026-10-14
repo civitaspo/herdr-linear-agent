@@ -34,6 +34,11 @@ fn limit(key: &str, value: u64) -> impl FnOnce(String) -> String {
     move |config| config.replace("[herdr]", &table)
 }
 
+fn set_issue_updated_at_after(world: &mut World, seconds: i64) {
+    let updated_at = json!((world.now() + jiff::SignedDuration::from_secs(seconds)).to_string());
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = updated_at;
+}
+
 fn decision_metadata(pr: &str, repository: &str, number: u64, w: &worker::Worker) -> String {
     let (owner, _) = repository
         .split_once('/')
@@ -236,7 +241,7 @@ async fn workflow_state_changes_reach_the_coordinator_once_including_same_type_c
     world.settle().await;
 
     world.move_issue(KEY, "In Review");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.settle().await;
     assert_eq!(
         world
@@ -262,7 +267,7 @@ async fn workflow_state_changes_reach_the_coordinator_once_including_same_type_c
     );
 
     world.move_issue(KEY, "In Progress");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-13T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 1_800);
     world.settle().await;
     assert_eq!(world.record(KEY).issue_state.unwrap().name, "In Review");
     assert_eq!(
@@ -276,7 +281,7 @@ async fn workflow_state_changes_reach_the_coordinator_once_including_same_type_c
     );
 
     world.move_issue(KEY, "In Progress");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 7_200);
     world.settle().await;
     assert_eq!(
         world
@@ -350,7 +355,7 @@ async fn selecting_a_started_state_for_initial_pickup_is_silent_and_keeps_later_
     );
 
     world.move_issue(KEY, "In Progress");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.settle().await;
     assert_eq!(
         world
@@ -382,12 +387,12 @@ async fn pickup_in_another_started_state_does_not_suppress_a_later_started_trans
     let mut world = World::sample();
     world.delegate(KEY, "Fix the login", Some(2.0));
     world.move_issue(KEY, "In Review");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.settle().await;
     assert!(!mentions(&world.inbox(KEY), "moved to"));
 
     world.move_issue(KEY, "In Progress");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-15T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 7_200);
     world.settle().await;
     assert_eq!(
         world
@@ -2570,7 +2575,7 @@ async fn deployment_finish_runs_workflow_postmortem_then_moves_to_done() {
 
     add_workflow_states(&world);
     world.move_issue(KEY, "In Deploy");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.later(5);
     world.settle().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Deployment complete.")
@@ -2606,7 +2611,7 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
     );
 
     world.move_issue(KEY, "Canceled");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.later(5);
     world.settle().await;
     world.later(5);
@@ -2662,7 +2667,7 @@ async fn a_routing_with_one_candidate_each_asks_no_routing_agent() {
     );
     add_workflow_states(&world);
     world.move_issue(KEY, "In Deploy");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.later(5);
     world.settle().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
@@ -2685,7 +2690,7 @@ async fn the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes()
     world.running_issue().await;
     add_workflow_states(&world);
     world.move_issue(KEY, "In Deploy");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.later(5);
     world.settle().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
@@ -2715,7 +2720,7 @@ async fn a_failed_postmortem_is_logged_and_not_tried_again() {
     world.running_issue().await;
     add_workflow_states(&world);
     world.move_issue(KEY, "In Deploy");
-    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2026-10-14T00:00:00.000Z");
+    set_issue_updated_at_after(&mut world, 3_600);
     world.later(5);
     world.settle().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
