@@ -548,3 +548,19 @@ gates, head-bound merge and readback, not task correctness or risk-score
 calibration. It did not test restart recovery, concurrent assessments,
 in-flight evidence changes, ambiguous merge transport, or performance. The
 project PR remains open and unmerged.
+
+## Current main test baseline (2026-10-14)
+
+To separate the feature result from existing failures, I extracted the current
+`origin/main` snapshot at `46cf615` into `/private/tmp` and ran
+`cargo test --workspace --locked` with Rust 1.99.0. The result was 405 passed,
+6 failed and 1 ignored. The six failures were
+`a_failed_postmortem_is_logged_and_not_tried_again`,
+`a_routing_with_one_candidate_each_asks_no_routing_agent`,
+`deployment_finish_runs_workflow_postmortem_then_moves_to_done`,
+`pickup_in_another_started_state_does_not_suppress_a_later_started_transition`,
+`the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes`, and
+`workflow_state_changes_reach_the_coordinator_once_including_same_type_changes`.
+These are the same six tests failing in PR #151 on macOS and Linux. This
+reproduces the current CI blocker on the base commit without the feature; it
+does not make the feature PR's CI green or resolve the failures.
