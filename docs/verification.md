@@ -570,6 +570,9 @@ event ordering without depending on the calendar date. The full workspace
 suite on feature head `1d6d363` passes 443 tests with 1 ignored. GitHub CI run
 [38509891860](https://github.com/civitaspo/herdr-linear-agent/actions/runs/38509891860)
 also passes on macOS and Ubuntu. The earlier base and PR runs remain historical
-evidence. The required Securefix check failed at run
-[38509931848](https://github.com/civitaspo/securefix-server/actions/runs/38509931848)
-when the service received 403 Forbidden posting a comment to PR #151.
+evidence. The PR's v0.2.12 Securefix policy check failed because the server
+received 403 posting its result comment to PR #151. Securefix v0.2.14 includes
+the repository-scoped comment-token fix; the server verified it against a real
+client PR in run
+[38511694306](https://github.com/civitaspo/securefix-server/actions/runs/38511694306).
+The workflows in this repository now pin v0.2.14.
