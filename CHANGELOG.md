@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update dependency rust to v1.99.1 (#162)
 - update dependency jdx/mise to v2026.10.11 (#160)
 - update Securefix caller workflows to v0.2.18 (#159)
 - update Securefix caller workflows to v0.2.17 (#158)
