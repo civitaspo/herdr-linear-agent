@@ -91,19 +91,18 @@ fn manager_pane<'a>(
     record: &SupervisorRecord,
     cwd: &str,
 ) -> Option<&'a Pane> {
+    let matches_cwd = |pane: &Pane| {
+        pane.cwd.as_deref() == Some(cwd) || pane.foreground_cwd.as_deref() == Some(cwd)
+    };
     let recorded = (!record.pane_id.is_empty())
         .then(|| snapshot.panes.get(&PaneId(record.pane_id.clone())))
         .flatten()
-        .filter(|pane| {
-            pane.workspace.0 == record.workspace_id
-                && pane.label.as_deref() == Some(LABEL)
-                && (pane.cwd.as_deref() == Some(cwd) || pane.foreground_cwd.as_deref() == Some(cwd))
-        });
+        .filter(|pane| pane.workspace.0 == record.workspace_id && matches_cwd(pane));
     recorded.or_else(|| {
         snapshot.panes.values().find(|pane| {
             (record.workspace_id.is_empty() || pane.workspace.0 == record.workspace_id)
                 && pane.label.as_deref() == Some(LABEL)
-                && (pane.cwd.as_deref() == Some(cwd) || pane.foreground_cwd.as_deref() == Some(cwd))
+                && matches_cwd(pane)
         })
     })
 }

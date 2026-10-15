@@ -4782,6 +4782,36 @@ async fn supervisor_starts_once_adopts_on_restart_and_replaces_a_changed_profile
 }
 
 #[tokio::test]
+async fn supervisor_adopts_its_saved_workspace_when_snapshot_omits_the_label() {
+    let mut world =
+        World::with(|config| format!("{config}\n\n[supervisor]\nprofile = \"router\"\n"));
+    world.settle().await;
+
+    let store = crate::supervisor::SupervisorStore::new(world.ctx().supervisor_dir());
+    let original = store.record().unwrap();
+    assert_eq!(original.status, crate::supervisor::SupervisorStatus::Idle);
+
+    world.herdr.omit_workspace_labels_in_snapshot();
+    world.restart_ticker();
+    world.settle().await;
+
+    let adopted = store.record().unwrap();
+    assert_eq!(adopted.status, crate::supervisor::SupervisorStatus::Idle);
+    assert_eq!(adopted.workspace_id, original.workspace_id);
+    assert_eq!(adopted.pane_id, original.pane_id);
+    assert_eq!(world.herdr.starts().len(), 1);
+    assert_eq!(
+        world
+            .herdr
+            .requests()
+            .iter()
+            .filter(|request| request.as_str() == "workspace.create")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn supervisor_reserves_an_agent_slot_from_issue_intake() {
     let mut world = World::with(|config| {
         format!(

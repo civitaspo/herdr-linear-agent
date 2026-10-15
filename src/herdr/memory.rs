@@ -81,6 +81,8 @@ struct Model {
     unparsed: Vec<PaneId>,
     /// Panes whose agent entry alone does not parse.
     unparsed_agents: Vec<PaneId>,
+    /// Herdr 0.9.3 snapshots omit workspace labels from panes.
+    omit_workspace_labels: bool,
 }
 
 #[derive(Clone)]
@@ -166,8 +168,10 @@ impl Model {
             .filter(|(id, _)| !hidden.contains(id))
             .map(|(id, pane)| (id.clone(), pane.clone()))
             .collect();
-        for pane in panes.values_mut() {
-            pane.label = self.labels.get(&pane.workspace).cloned();
+        if !self.omit_workspace_labels {
+            for pane in panes.values_mut() {
+                pane.label = self.labels.get(&pane.workspace).cloned();
+            }
         }
         agents.retain(|a| !hidden.contains(&a.pane));
         let mut skipped = 0;
@@ -267,6 +271,10 @@ impl FakeHerdr {
             .labels
             .get(&WorkspaceId(workspace.into()))
             .cloned()
+    }
+
+    pub fn omit_workspace_labels_in_snapshot(&self) {
+        self.model().omit_workspace_labels = true;
     }
 
     pub fn panes(&self) -> Vec<Pane> {
