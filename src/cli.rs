@@ -19,6 +19,9 @@ use crate::{progress, ticker};
 #[derive(Parser)]
 #[command(name = "herdr-linear-agent", version = crate::VERSION, about = "Run a coordinator and per-repository workers for Linear issues delegated to this plugin's Linear app user")]
 struct Cli {
+    /// Enable development commands. Also enabled by config or HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true.
+    #[arg(long, global = true)]
+    development_mode: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -84,20 +87,20 @@ enum Command {
     },
     /// Report a worker's progress from its own pane.
     Report(ReportArgs),
-    /// Tools for checking the plugin against a real Herdr.
+    /// Tools for development checks. Requires development mode.
     #[command(hide = true)]
-    Debug {
+    Development {
         #[command(subcommand)]
-        command: DebugCommand,
+        command: DevelopmentCommand,
     },
 }
 
 #[derive(Subcommand)]
-enum DebugCommand {
+enum DevelopmentCommand {
     /// Run development commands with isolated config, state and a dedicated session.
     Harness {
         #[command(subcommand)]
-        command: crate::dev_harness::Command,
+        command: crate::development_harness::Command,
     },
     /// Start one real coordinator without prompting it, then remove its workspace.
     AgentSmoke(crate::agent_smoke::Options),
@@ -275,17 +278,24 @@ fn parse_option(text: &str) -> Result<(String, String), String> {
 }
 
 pub async fn run() -> Result<()> {
-    let command = Cli::parse().command;
+    let cli = Cli::parse();
     let env = Env::from_process()?;
-    // This opt-in check must never inspect or chmod the ordinary state folder,
-    // start the ticker, or enter any credential-loading path.
-    let command = match command {
-        Command::Debug {
-            command: DebugCommand::AgentSmoke(options),
-        } => return crate::agent_smoke::run(&env, options).await,
-        Command::Debug {
-            command: DebugCommand::Harness { command },
-        } => return crate::dev_harness::run(&env, command),
+    let command = match cli.command {
+        Command::Development { command } => {
+            anyhow::ensure!(
+                development_enabled(&env, cli.development_mode)?,
+                "development commands require --development-mode, HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true, or development_mode = true in config.toml"
+            );
+            return match command {
+                DevelopmentCommand::AgentSmoke(options) => {
+                    crate::agent_smoke::run(&env, options).await
+                }
+                DevelopmentCommand::Harness { command } => {
+                    crate::development_harness::run(&env, command)
+                }
+                DevelopmentCommand::HerdrWatch { socket } => herdr_watch(socket).await,
+            };
+        }
         command => command,
     };
     let runner = RealRunner;
@@ -309,12 +319,7 @@ pub async fn run() -> Result<()> {
     }
 
     match command {
-        Command::Debug {
-            command: DebugCommand::AgentSmoke(_) | DebugCommand::Harness { .. },
-        } => unreachable!("handled before ordinary state initialization"),
-        Command::Debug {
-            command: DebugCommand::HerdrWatch { socket },
-        } => herdr_watch(socket).await,
+        Command::Development { .. } => unreachable!("handled before ordinary state initialization"),
         Command::Startup => ticker::start(&ctx).await,
         Command::History => {
             let (env, runs) = (env.clone(), ctx.runs_dir());
@@ -450,6 +455,22 @@ async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
     }
 }
 
+fn development_enabled(env: &Env, flag: bool) -> Result<bool> {
+    if flag {
+        return Ok(true);
+    }
+    if env
+        .var("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE")
+        .map(str::parse::<bool>)
+        .transpose()
+        .context("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE must be true or false")?
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    Config::development_mode(&env.config_dir())
+}
+
 async fn herdr_watch(socket: Option<PathBuf>) -> Result<()> {
     let socket = match socket {
         Some(socket) => socket,
@@ -497,8 +518,60 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn development_mode_requires_one_explicit_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        assert!(!development_enabled(&env, false).unwrap());
+        assert!(development_enabled(&env, true).unwrap());
+        assert!(!env.state_dir().exists());
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let env = Env::for_test(
+                temp.path(),
+                &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", value)],
+            );
+            assert_eq!(development_enabled(&env, false).unwrap(), enabled);
+        }
+        let invalid = Env::for_test(
+            temp.path(),
+            &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", "typo")],
+        );
+        assert!(development_enabled(&invalid, false).is_err());
+        assert!(development_enabled(&invalid, true).unwrap());
+        std::fs::create_dir_all(env.config_dir()).unwrap();
+        std::fs::write(Config::path(&env.config_dir()), "development_mode = true\n").unwrap();
+        let disabled_env = Env::for_test(
+            temp.path(),
+            &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", "false")],
+        );
+        assert!(development_enabled(&disabled_env, false).unwrap());
+        std::fs::write(Config::path(&env.config_dir()), "broken [\n").unwrap();
+        assert!(development_enabled(&env, false).is_err());
+        let enabled_env = Env::for_test(
+            temp.path(),
+            &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", "true")],
+        );
+        assert!(development_enabled(&enabled_env, false).unwrap());
+        assert!(development_enabled(&env, true).unwrap());
+        assert!(!env.state_dir().exists());
+        assert!(
+            Cli::try_parse_from([
+                "herdr-linear-agent",
+                "--development-mode",
+                "development",
+                "harness",
+                "init",
+                "/tmp/hla-development",
+                "--session",
+                "hla-development"
+            ])
+            .unwrap()
+            .development_mode
+        );
+    }
+
+    #[test]
     fn agent_smoke_requires_an_explicit_session_and_exactly_one_target() {
-        let prefix = ["herdr-linear-agent", "debug", "agent-smoke"];
+        let prefix = ["herdr-linear-agent", "development", "agent-smoke"];
         for args in [
             vec![],
             vec!["--kind", "codex"],
@@ -583,7 +656,7 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "herdr-linear-agent",
-                "debug",
+                "development",
                 "herdr-watch",
                 "--socket",
                 "/s"

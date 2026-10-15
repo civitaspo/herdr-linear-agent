@@ -6,7 +6,7 @@ mod cli;
 mod commands;
 mod config;
 mod coordinator;
-mod dev_harness;
+mod development_harness;
 mod files;
 mod herdr;
 mod history;

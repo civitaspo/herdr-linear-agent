@@ -527,7 +527,7 @@ apply. Running lint or tests alone does not need a signing identity either.
 
 ```bash
 export HLA_SIGN_IDENTITY="Apple Development: YOUR_ACCOUNT (IDENTITY_SUFFIX)"
-mise run build-dev
+mise run build-development
 ```
 
 This builds and signs `target/release/herdr-linear-agent`, the path used by the

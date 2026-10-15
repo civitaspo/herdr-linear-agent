@@ -25,6 +25,8 @@ pub const DEFAULT_CALLBACK_PORT: u16 = 43871;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub development_mode: bool,
     /// The Linear workspaces, by the name runs use for them.
     pub workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
@@ -333,6 +335,25 @@ impl GeneratedPolicy {
 }
 
 impl Config {
+    pub fn development_mode(config_dir: &Path) -> Result<bool> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Mode {
+            development_mode: bool,
+        }
+        let path = Self::path(config_dir);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+        let mode: Mode = toml::from_str(&text)
+            .with_context(|| format!("could not read development_mode from {}", path.display()))?;
+        Ok(mode.development_mode)
+    }
+
     pub fn path(config_dir: &Path) -> PathBuf {
         config_dir.join(FILE_NAME)
     }
@@ -1125,8 +1146,27 @@ workers = ["standard", "deep"]
     }
 
     #[test]
+    fn development_mode_loads_before_workspace_and_profile_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!Config::development_mode(temp.path()).unwrap());
+        for (text, enabled) in [
+            ("", false),
+            ("development_mode = false\n", false),
+            ("development_mode = true\n", true),
+        ] {
+            std::fs::write(Config::path(temp.path()), text).unwrap();
+            assert_eq!(Config::development_mode(temp.path()).unwrap(), enabled);
+        }
+        std::fs::write(Config::path(temp.path()), "development_mode = 'true'\n").unwrap();
+        assert!(Config::development_mode(temp.path()).is_err());
+        let configured = load_with(&format!("development_mode = true\n{SAMPLE}"), &[]).unwrap();
+        assert!(configured.development_mode);
+    }
+
+    #[test]
     fn the_sample_parses_with_defaults() {
         let config = sample();
+        assert!(!config.development_mode);
         let acme = config.workspace("acme").unwrap();
         assert_eq!(acme.callback_port, DEFAULT_CALLBACK_PORT);
         assert_eq!(

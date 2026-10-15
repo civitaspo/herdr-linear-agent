@@ -78,7 +78,7 @@ cargo test --workspace --locked <test_name_or_module>
 cargo fmt --all
 ```
 
-For local macOS builds that access real Linear credentials, follow [docs/development-signing.md](docs/development-signing.md). With `HLA_SIGN_IDENTITY` set, `mise run build-dev` builds and signs `target/release/herdr-linear-agent`, the executable used by `herdr-plugin.toml`. Ordinary lint, test, and debug-build checks do not need a signing identity.
+For local macOS builds that access real Linear credentials, follow [docs/development-signing.md](docs/development-signing.md). With `HLA_SIGN_IDENTITY` set, `mise run build-development` builds and signs `target/release/herdr-linear-agent`, the executable used by `herdr-plugin.toml`. Ordinary lint, test, and debug-build checks do not need a signing identity.
 
 ## Test and document changes
 

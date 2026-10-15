@@ -20,24 +20,33 @@ restore that exact installed binary afterward.
 
 Run the commands below from the repository root.
 
-Build with `cargo build --workspace --locked`, then use the Rust `debug harness`
-commands in `src/dev_harness.rs`. Choose a new root under an existing parent,
+Build with `cargo build --workspace --locked`, then use the Rust `development harness`
+commands in `src/development_harness.rs`. Choose a new root under an existing parent,
 outside ordinary plugin paths:
 
+Development commands are disabled by default. Enable them with the global
+`--development-mode` flag, `HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true`, or the
+top-level `development_mode = true` setting in the effective plugin config.
+Any one enables the mode. The environment variable accepts `true` or `false`;
+`false` does not override another opt-in. CLI or environment opt-in works without
+a configured workspace or profiles. Initialization enables the setting in the
+isolated root's config.
+
 ```bash
-target/debug/herdr-linear-agent debug harness init /tmp/hla-dev --session hla-dev
+export HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true
+target/debug/herdr-linear-agent development harness init /tmp/hla-development --session hla-development
 # Configure only scratch Linear teams, repository clones and profiles under
-# /tmp/hla-dev/config/herdr-linear-agent. Keep its explicit Herdr session.
-target/debug/herdr-linear-agent debug harness herdr /tmp/hla-dev
+# /tmp/hla-development/config/herdr-linear-agent. Keep its explicit Herdr session.
+target/debug/herdr-linear-agent development harness herdr /tmp/hla-development
 # In another terminal, after the dedicated session is running:
-target/debug/herdr-linear-agent debug harness plugin /tmp/hla-dev action doctor
-target/debug/herdr-linear-agent debug harness plugin /tmp/hla-dev ticker start
-target/debug/herdr-linear-agent debug harness plugin /tmp/hla-dev ticker status
+target/debug/herdr-linear-agent development harness plugin /tmp/hla-development action doctor
+target/debug/herdr-linear-agent development harness plugin /tmp/hla-development ticker start
+target/debug/herdr-linear-agent development harness plugin /tmp/hla-development ticker status
 # Stop only these processes; retain their files as evidence:
-target/debug/herdr-linear-agent debug harness stop /tmp/hla-dev
+target/debug/herdr-linear-agent development harness stop /tmp/hla-development
 ```
 
-For real macOS credential access, build with `mise run build-dev` and invoke
+For real macOS credential access, build with `mise run build-development` and invoke
 `target/release/herdr-linear-agent` for every command instead. `plugin` runs the
 same executable used to invoke the harness. `HERDR_BIN_PATH` can select an
 installed Herdr executable. The harness sets `XDG_CONFIG_HOME`
@@ -45,7 +54,7 @@ and `XDG_STATE_HOME`, clears inherited plugin and Herdr location overrides,
 and places Herdr worktrees under the harness root. Agent panes inherit these
 XDG paths, so their plugin subcommands use the same isolated state. Commands
 run from the root to avoid loading an unrelated checkout's mise configuration.
-Use `debug harness exec ROOT /absolute/command ARGS...` for other tools. Configure
+Use `development harness exec ROOT /absolute/command ARGS...` for other tools. Configure
 mise versions in `ROOT/config/mise/config.toml` if using shims. Initialization
 creates no credentials and starts no processes. Stop retains evidence.
 
@@ -91,7 +100,7 @@ Offline Rust checks do not start Herdr, a ticker, agents or Linear requests.
 Run:
 
 ```bash
-cargo test --workspace --locked dev_harness
+cargo test --workspace --locked development
 git diff --check
 ```
 

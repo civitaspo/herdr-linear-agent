@@ -11,7 +11,7 @@ use clap::{Args, Subcommand};
 use crate::files::write_atomic;
 use crate::paths::{self, Env};
 
-const MARKER: &str = ".hla-dev-session";
+const MARKER: &str = ".hla-development-session";
 const REMOVED_VARS: &[&str] = &[
     "HERDR_PLUGIN_CONFIG_DIR",
     "HERDR_PLUGIN_STATE_DIR",
@@ -119,7 +119,7 @@ impl Harness {
         write_atomic(&root.join(MARKER), format!("{session}\n").as_bytes())?;
         write_atomic(
             &root.join("config/herdr-linear-agent/config.toml"),
-            format!("[herdr]\nsession = \"{session}\"\n").as_bytes(),
+            format!("development_mode = true\n\n[herdr]\nsession = \"{session}\"\n").as_bytes(),
         )?;
         let directory = root.join("worktrees");
         let directory = directory.to_str().context("root must be UTF-8")?;

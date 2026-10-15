@@ -17,9 +17,9 @@ provide the required tool versions in that test environment.
 cargo build --workspace --locked
 herdr --session agent-start-smoke
 # Attach to this test session in another terminal if running headless.
-herdr-linear-agent debug agent-smoke --session agent-start-smoke --profile coordinator-codex
+herdr-linear-agent --development-mode development agent-smoke --session agent-start-smoke --profile coordinator-codex
 # Or use default interactive arguments without reading plugin configuration:
-herdr-linear-agent debug agent-smoke --session agent-start-smoke --kind opencode --timeout-seconds 30
+herdr-linear-agent --development-mode development agent-smoke --session agent-start-smoke --kind opencode --timeout-seconds 30
 ```
 
 Use `target/debug/herdr-linear-agent` for a local build. `--config-dir <directory>`
@@ -49,12 +49,15 @@ Both checks sent no prompt and verified removal of their agent and workspace.
 For isolated live development checks, follow the repository-local
 [integration-harness skill](../.agents/skills/integration-harness/SKILL.md).
 
-The Rust `debug harness` replacement was checked offline with a temporary root:
+The Rust `development harness` replacement was checked offline with a temporary root:
 initialization, plugin re-execution, child environment and working directory,
 and session arguments to a stand-in Herdr executable. With damaged TOML and a
 failed stop, cleanup still attempted deletion of the same dedicated session and
 retained its files. These checks contacted no agents or Linear. The complete
 workflow below was checked with the previous launcher before the Rust migration.
+Default refusal and each development-mode opt-in were also exercised through
+the CLI, including config-only activation before workspace/profile setup.
+The ordinary state directory retained its original permissions.
 
 ## Isolated Codex workflow and supervisor persistence (2026-10-15)
 
@@ -166,7 +169,7 @@ not valid identities. Adding Apple's official WWDR G3 intermediate certificate
 to the login Keychain made it valid without changing trust overrides.
 
 The first signing operation and the first credential reads required the user
-to choose **Always Allow**. After that, `mise run build-dev` signed a release
+to choose **Always Allow**. After that, `mise run build-development` signed a release
 binary, and `action doctor` read both configured workspaces' credentials and
 queried their Linear viewer budgets without another authorization prompt.
 Touching `build.rs` and running the task again generated a different build ID
