@@ -94,6 +94,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DebugCommand {
+    /// Run development commands with isolated config, state and a dedicated session.
+    Harness {
+        #[command(subcommand)]
+        command: crate::dev_harness::Command,
+    },
     /// Start one real coordinator without prompting it, then remove its workspace.
     AgentSmoke(crate::agent_smoke::Options),
     /// Follow the Herdr session and print one JSON line per wake.
@@ -278,6 +283,9 @@ pub async fn run() -> Result<()> {
         Command::Debug {
             command: DebugCommand::AgentSmoke(options),
         } => return crate::agent_smoke::run(&env, options).await,
+        Command::Debug {
+            command: DebugCommand::Harness { command },
+        } => return crate::dev_harness::run(&env, command),
         command => command,
     };
     let runner = RealRunner;
@@ -302,7 +310,7 @@ pub async fn run() -> Result<()> {
 
     match command {
         Command::Debug {
-            command: DebugCommand::AgentSmoke(_),
+            command: DebugCommand::AgentSmoke(_) | DebugCommand::Harness { .. },
         } => unreachable!("handled before ordinary state initialization"),
         Command::Debug {
             command: DebugCommand::HerdrWatch { socket },

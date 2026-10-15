@@ -20,30 +20,32 @@ restore that exact installed binary afterward.
 
 Run the commands below from the repository root.
 
-Use `.agents/skills/integration-harness/scripts/dev-harness.sh` for development that starts real processes. It
-requires Python 3.11 or newer and a new root outside ordinary plugin paths:
+Build with `cargo build --workspace --locked`, then use the Rust `debug harness`
+commands in `src/dev_harness.rs`. Choose a new root under an existing parent,
+outside ordinary plugin paths:
 
 ```bash
-.agents/skills/integration-harness/scripts/dev-harness.sh init /tmp/hla-dev hla-dev
+target/debug/herdr-linear-agent debug harness init /tmp/hla-dev --session hla-dev
 # Configure only scratch Linear teams, repository clones and profiles under
 # /tmp/hla-dev/config/herdr-linear-agent. Keep its explicit Herdr session.
-.agents/skills/integration-harness/scripts/dev-harness.sh /tmp/hla-dev herdr
+target/debug/herdr-linear-agent debug harness herdr /tmp/hla-dev
 # In another terminal, after the dedicated session is running:
-.agents/skills/integration-harness/scripts/dev-harness.sh /tmp/hla-dev plugin action doctor
-.agents/skills/integration-harness/scripts/dev-harness.sh /tmp/hla-dev plugin ticker start
-.agents/skills/integration-harness/scripts/dev-harness.sh /tmp/hla-dev plugin ticker status
+target/debug/herdr-linear-agent debug harness plugin /tmp/hla-dev action doctor
+target/debug/herdr-linear-agent debug harness plugin /tmp/hla-dev ticker start
+target/debug/herdr-linear-agent debug harness plugin /tmp/hla-dev ticker status
 # Stop only these processes; retain their files as evidence:
-.agents/skills/integration-harness/scripts/dev-harness.sh /tmp/hla-dev stop
+target/debug/herdr-linear-agent debug harness stop /tmp/hla-dev
 ```
 
-The default binary is `target/debug/herdr-linear-agent`; set `HLA_DEV_BINARY`
-to the signed release binary for real macOS credential access. `HERDR_BIN_PATH`
-can select an installed Herdr executable. The wrapper sets `XDG_CONFIG_HOME`
+For real macOS credential access, build with `mise run build-dev` and invoke
+`target/release/herdr-linear-agent` for every command instead. `plugin` runs the
+same executable used to invoke the harness. `HERDR_BIN_PATH` can select an
+installed Herdr executable. The harness sets `XDG_CONFIG_HOME`
 and `XDG_STATE_HOME`, clears inherited plugin and Herdr location overrides,
 and places Herdr worktrees under the harness root. Agent panes inherit these
 XDG paths, so their plugin subcommands use the same isolated state. Commands
 run from the root to avoid loading an unrelated checkout's mise configuration.
-Use absolute paths for commands passed through `exec`. Configure
+Use `debug harness exec ROOT /absolute/command ARGS...` for other tools. Configure
 mise versions in `ROOT/config/mise/config.toml` if using shims. Initialization
 creates no credentials and starts no processes. Stop retains evidence.
 
@@ -62,8 +64,7 @@ copy production run or supervisor state into the harness. Its plugin config
 must keep the explicit test session; default sessions and symlinked location
 files are rejected. A harness is filesystem separation, not an OS sandbox.
 
-Run `python3 .agents/skills/integration-harness/scripts/test-dev-harness.py` for offline wrapper checks. This
-does not start Herdr, a ticker, agents or Linear requests.
+Offline Rust checks do not start Herdr, a ticker, agents or Linear requests.
 
 
 ## Evidence and cleanup
@@ -87,10 +88,10 @@ does not start Herdr, a ticker, agents or Linear requests.
 
 ## Check changes to this skill
 
-Run the offline script listed above and:
+Run:
 
 ```bash
-shellcheck .agents/skills/integration-harness/scripts/dev-harness.sh
+cargo test --workspace --locked dev_harness
 git diff --check
 ```
 

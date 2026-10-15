@@ -49,6 +49,13 @@ Both checks sent no prompt and verified removal of their agent and workspace.
 For isolated live development checks, follow the repository-local
 [integration-harness skill](../.agents/skills/integration-harness/SKILL.md).
 
+The Rust `debug harness` replacement was checked offline with a temporary root:
+initialization, plugin re-execution, child environment and working directory,
+and session arguments to a stand-in Herdr executable. With damaged TOML and a
+failed stop, cleanup still attempted deletion of the same dedicated session and
+retained its files. These checks contacted no agents or Linear. The complete
+workflow below was checked with the previous launcher before the Rust migration.
+
 ## Isolated Codex workflow and supervisor persistence (2026-10-15)
 
 Using the integration harness, Herdr 0.9.3 and Codex 0.160.0 with `gpt-6-luna`,
