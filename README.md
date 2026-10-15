@@ -46,6 +46,8 @@ Workspace labels put the ticket first. A coordinator is labeled `acme/DATA-1 · 
 ## Configuration
 
 ```toml
+# development_mode = false               # opt in to development commands; see Development mode
+
 [workspaces.acme]                        # a name for the workspace: lower-case letters, digits and `-`
 client_id = "your-oauth-client-id"       # the OAuth application of this workspace
 # callback_port = 43871                  # the port of the callback URL you registered
@@ -152,7 +154,21 @@ Then list it in the routing: `postmortems = ["postmortem"]`. Each postmortem, wo
 
 The optional supervisor reviews saved postmortem outcomes and keeps local, workspace/team/routing-scoped knowledge for future decisions. It does not read Linear credentials or write to Linear. The plugin remains the only Linear writer. The supervisor's model, kind, arguments and method come from an ordinary profile you own. Its managed Herdr space uses the exact label `herdr-linear-agent-supervisor`; one agent slot is reserved while it is enabled. Its durable reports, decisions, Markdown knowledge and rebuildable SQLite search index live under the plugin state directory.
 
-Enable it with `[supervisor]` and give each routing an explicit list of allowed manual bases under `[routing.<name>.generated]`. These lists default to empty. A generated profile can change its description and instruction file, and can inherit from another listed base for its role. It cannot change kind, model, effort, arguments, environment or timeout. Publishing a new revision changes future candidate lists after the supervisor's decision, while an already pinned run keeps its resolved profile. Removing a role or base from config blocks new starts and resumes that depend on it. Retiring a variant removes it from future runs while preserving existing pins.
+To enable it:
+
+1. Create `profiles/supervisor/config.toml` and `instructions.md`, as below. The supervisor runs interactively in Herdr and needs permission to invoke the plugin's local supervisor commands.
+2. Add `[supervisor]` to `config.toml` and set `profile = "supervisor"`. Keep `limits.max_agents` at least 3, including the supervisor's reserved slot.
+3. Optionally allow generated profiles with `[routing.<name>.generated]`, then run **herdr-linear-agent: reload the config**. The ticker starts and manages the supervisor in the configured Herdr session. Development mode is independent of this feature.
+
+| Setting | Meaning |
+| --- | --- |
+| `supervisor.profile` | Required name of the ordinary profile used for the supervisor agent. Omitting `[supervisor]` disables the feature. |
+| `supervisor.max_generated_profiles_per_routing` | Maximum active generated variants per workspace/team/routing scope, across roles. Defaults to 5; accepts 1–20. |
+| `routing.<name>.generated.coordinators` | Manual bases allowed for generated coordinators; defaults to `[]`. Each must also appear in that routing's `coordinators`. |
+| `routing.<name>.generated.workers` | Manual bases allowed for generated workers; defaults to `[]`. Each must also appear in that routing's `workers`. |
+| `routing.<name>.generated.postmortems` | Manual bases allowed for generated postmortem agents; defaults to `[]`. Each must also appear in that routing's `postmortems`. |
+
+Empty generated lists keep the supervisor limited to knowledge updates. Nonempty generated coordinator or postmortem lists require a routing `agent`, even with one manual candidate. A generated profile can change its description and instruction file, and can inherit from another listed base for its role. It cannot change kind, model, effort, arguments, environment or timeout. Publishing a new revision changes future candidate lists after the supervisor's decision, while an already pinned run keeps its resolved profile. Removing a role or base from config blocks new starts and resumes that depend on it. Retiring a variant removes it from future runs while preserving existing pins. Editing a manual base makes its old generated variants ineligible for new runs until republished against that base.
 
 The supervisor receives bounded batches of saved reports and commits a decision and portable memory checkpoint before those reports are acknowledged. A decision may update knowledge, publish or retire one variant, or record no change. Legacy postmortems without saved routing attribution are preserved for inspection but excluded from decisions. The derived search index can be rebuilt from the committed Markdown and JSON files; it is not the source of truth.
 
@@ -172,17 +188,27 @@ Record a durable decision with `supervisor decide --generation <generation> --de
 Use report and topic handles for evidence. Do not infer success from issue state or labels.
 ```
 
-Operator commands use the same local state and authorization scopes:
+**Inspect and manage it.** **herdr-linear-agent: status** (`action status`) shows its lifecycle status, generation, memory/catalog versions, unacknowledged reports and recovery details. **herdr-linear-agent: check setup** (`action doctor`) also reports supervisor or catalog problems. `ticker status` checks only the ticker process.
 
-```text
-herdr-linear-agent supervisor profiles list
-herdr-linear-agent supervisor profiles show <id> [--revision <revision>]
-herdr-linear-agent supervisor profiles retire <id> --expected-revision <revision> --reason <text> --source-report <report-id>
-herdr-linear-agent supervisor profiles rollback <id> --revision <revision> --reason <text>
-herdr-linear-agent supervisor profiles export <id> --revision <revision> --name <manual-name> --output <new-directory>
-```
+All commands below start with `herdr-linear-agent supervisor`. They use local state and the workspace/team/routing scopes currently allowed by the config, require `[supervisor]`, and print JSON except for the export confirmation.
+
+| Command suffix | Purpose |
+| --- | --- |
+| `context --generation <n>` | Issues or resumes a bounded report batch, with evidence, checkpoint, knowledge and profile policies. Used by the supervisor with the generation in its ticker prompt; this changes batch state. |
+| `decide --generation <n> --decision-file <path>` | Validates and commits a decision JSON file, acknowledges the batch and prints a durable receipt. Use `-` to read standard input. |
+| `memory search "<query>"` | Searches committed knowledge in the current scopes; rebuilds a missing or stale search index. |
+| `show <handle>` | Reads `report:<id>`, `decision:<id>` or `topic:<id>[@<revision>]`. Use IDs returned by context, search or a receipt. |
+| `profiles list` | Lists committed generated revisions and marks each current catalog entry. |
+| `profiles show <id> [--revision <n>]` | Reads one revision; defaults to the highest committed revision for that ID. |
+| `profiles retire <id> --expected-revision <n> --reason "<text>" --source-report <id>` | Creates a retired revision, removing the variant from future candidates. Supply one to five source reports; repeat `--source-report` for additional evidence. |
+| `profiles rollback <id> --revision <n> --reason "<text>"` | Republishes retained content as a new revision of an active variant, subject to current base permissions. |
+| `profiles export <id> --revision <n> --name <manual-name> --output <new-directory>` | Writes an ordinary profile to a new directory after validating its base and resolved behavior. |
 
 Retirement and rollback create new immutable catalog revisions through the same commit path as supervisor decisions. Export writes `config.toml`, `instructions.md` and a short `README.md` directly into a new destination directory; it does not activate the exported profile or change routing. Review and deploy that ordinary profile through your existing config process, then retire the generated variant separately if wanted. Local filesystem access is the operator boundary; command allow-lists are not an operating-system sandbox.
+
+**Reload or disable it.** Changing the supervisor profile drains an issued batch for up to two minutes before replacing the managed workspace and native agent session. Changing the Herdr session fences outstanding decisions and closes the previous workspace before replacement. To disable the supervisor, remove `[supervisor]` and every `[routing.<name>.generated]` section, then reload. The ticker closes its managed workspace when Herdr is reachable and retains durable evidence. Supervisor commands require the feature to be configured, so inspect or export needed revisions before disabling it.
+
+See the [supervisor command and decision reference](docs/supervisor.md) for the JSON format, receipts, stale-generation handling and recovery details.
 
 ### Finding user IDs
 
@@ -485,6 +511,7 @@ The screens use only the terminal's 16 ANSI colors, so they follow the Herdr the
 | `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` | Your config |
 | `$XDG_STATE_HOME/herdr-linear-agent/runs/<workspace>/<ISSUE-KEY>/` | A run: `issue.md`, `conversation.md`, worker records and reports, the coordinator's inbox, the outbox |
 | `$XDG_STATE_HOME/herdr-linear-agent/ticker.log` | The ticker's log |
+| `$XDG_STATE_HOME/herdr-linear-agent/supervisor/` | Supervisor lifecycle, reports, decisions, checkpoints, generated catalog and knowledge; `memory/index.sqlite3` is a rebuildable search index |
 | `<worktree>/.herdr-linear-agent/<workspace>-<ISSUE-KEY>-<id>/` | A worker's brief and report (see below) |
 
 `$XDG_STATE_HOME` defaults to `~/.local/state` on Linux and macOS alike.
@@ -532,6 +559,70 @@ mise run build-development
 
 This builds and signs `target/release/herdr-linear-agent`, the path used by the
 plugin manifest. Use it after each source change in your development checkout.
+
+### Development mode
+
+Development mode enables contributor tools for isolated integration checks,
+agent startup checks and Herdr event inspection. It defaults to `false` and
+permits the `development` commands below. Enabling it alone starts no processes;
+ordinary commands keep their usual configuration, state and lifecycle behavior.
+The supervisor is enabled separately through `[supervisor]`.
+
+Choose any one of these opt-ins:
+
+```toml
+# At the top of config.toml, before any [table]:
+development_mode = true
+```
+
+```bash
+herdr-linear-agent --development-mode development harness --help
+HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true herdr-linear-agent development harness --help
+```
+
+The setting is read from `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml`
+(default `~/.config/herdr-linear-agent/config.toml`) for each development command.
+Any one opt-in enables the commands; the environment accepts literal `true` or
+`false`, and `false` does not override a config or CLI opt-in. The flag or
+environment variable lets you initialize a harness before configuring
+workspaces or profiles. Use `herdr-linear-agent development --help` for help;
+the group is hidden from the top-level command list.
+
+| Command after `herdr-linear-agent development` | Effect |
+| --- | --- |
+| `harness init ROOT --session NAME` | Creates a new private root, isolated plugin/Herdr config and state paths, a session marker and config with development mode enabled. Starts no processes. The parent must exist and the root must be outside ordinary plugin paths. |
+| `harness herdr ROOT [ARGS...]` | Starts or attaches Herdr using the dedicated non-default session. `HERDR_BIN_PATH` can select the executable. |
+| `harness plugin ROOT ARGS...` | Runs the same plugin executable with isolated XDG paths and the root as its working directory. |
+| `harness exec ROOT /absolute/command [ARGS...]` | Runs another tool in that same environment. |
+| `harness stop ROOT` | Attempts to stop the isolated ticker, stop and delete its session, and retains all files as evidence. Attempts all cleanup steps even if one fails. |
+| `agent-smoke --session NAME --kind KIND` | Starts a real agent in a temporary coordinator workspace in an already running non-default test session, checks interactive readiness without sending a prompt, then removes the workspace. Accepts `codex`, `claude`, `cursor` and `opencode`. |
+| `agent-smoke --session NAME --profile PROFILE [--config-dir DIR]` | Checks a configured profile with inherited instructions and arguments. Defaults to the ordinary config directory; refuses arguments not audited for prompt-free startup. Both smoke forms accept `--timeout-seconds 5..300` (default 30). |
+| `herdr-watch [--socket PATH]` | Follows the given socket or configured Herdr session and prints connection, wake count and agent snapshots as JSON until interrupted. |
+
+For an isolated check from a source checkout:
+
+```bash
+export HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true
+target/debug/herdr-linear-agent development harness init /tmp/hla-development --session hla-development
+# Configure scratch workspaces, repositories and profiles in
+# /tmp/hla-development/config/herdr-linear-agent before starting the ticker.
+target/debug/herdr-linear-agent development harness herdr /tmp/hla-development
+# In another terminal with the same opt-in:
+target/debug/herdr-linear-agent development harness plugin /tmp/hla-development action doctor
+target/debug/herdr-linear-agent development harness plugin /tmp/hla-development ticker start
+# When finished:
+target/debug/herdr-linear-agent development harness stop /tmp/hla-development
+```
+
+Use the signed `target/release/herdr-linear-agent` from `build-development` for
+real macOS credential access. Harness commands isolate config, state and Herdr
+worktrees and clear inherited plugin/Herdr location overrides. Agent panes
+inherit those XDG paths. `HOME`, native agent data, OS credentials and GitHub
+authentication remain shared; profile permissions control the agent sandbox.
+Use scratch teams and repositories, and retain the dedicated session settings.
+See the [integration-harness skill](.agents/skills/integration-harness/SKILL.md)
+for live-check procedures and cleanup, and [verification](docs/verification.md)
+for the evidence and limits of existing checks.
 
 ## License
 

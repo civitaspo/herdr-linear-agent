@@ -87,6 +87,7 @@ For local macOS builds that access real Linear credentials, follow [docs/develop
 - For retry and recovery changes, check observable Herdr requests, Linear writes, and persisted records. Exercise repeated reconciliation and relevant delayed or reordered events with the existing `World` controls.
 - The ignored `routing_live` test calls real agent CLIs and needs their logins. Run it only when the task calls for live routing verification. Use a scratch Linear team and scratch Herdr session for real lifecycle checks described in `docs/verification.md`.
 - When changing config or profiles, update validation tests and the shared sample in `src/config.rs` as needed. Update the README examples for user-facing changes.
+- Document user-facing settings, CLI options, environment variables and commands in the README, including development interfaces useful to contributors. Link detailed references from there; agent skills do not replace user documentation.
 - When changing agent-facing commands, keep `assets/COORDINATOR.md`, `assets/WORKER.md`, and the generated priming and command allow-lists in `src/coordinator.rs` consistent.
 - When changing lifecycle or persistence behavior, update the relevant section of `docs/behavior.md`. Record new real integration evidence in `docs/verification.md` with its limits.
 - For documentation-only changes, verify referenced paths and commands and run `git diff --check`. If opening a pull request, also run the required checks above.

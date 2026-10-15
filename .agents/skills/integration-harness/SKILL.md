@@ -16,32 +16,8 @@ Reuse authorization already given in the conversation. If an ordinary ticker
 also watches the scratch team, arrange its temporary stop before delegation and
 restore that exact installed binary afterward.
 
-## Development mode
-
-Development commands are disabled by default. Enable them with the global
-`--development-mode` flag, `HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true`, or the
-top-level `development_mode = true` setting in the effective plugin config.
-Any one enables the mode. The environment variable accepts `true` or `false`;
-`false` does not override another opt-in. CLI or environment opt-in works without
-a configured workspace or profiles. Initialization enables the setting in the
-isolated root's config.
-
-Enabling the mode permits the following `development` commands. Processes and
-filesystem changes begin only when a command is invoked:
-
-| Command | Effect when invoked |
-| --- | --- |
-| `development harness init ROOT --session NAME` | Creates private config and state directories, a session marker and initial config with `development_mode = true`. Starts no processes. |
-| `development harness herdr ROOT` | Starts or attaches Herdr using the root's dedicated session and isolated environment. |
-| `development harness plugin ROOT ARGS...` / `exec ROOT COMMAND ARGS...` | Runs this plugin binary or another command with isolated XDG paths and working directory. The supplied command determines further actions. |
-| `development harness stop ROOT` | Attempts to stop the isolated ticker, stop its Herdr session and delete that session; retains files as evidence. |
-| `development agent-smoke --session NAME --kind KIND` / `--profile PROFILE` | Creates a temporary coordinator workspace in an already running test session, starts a real agent without sending a prompt, checks startup and removes the workspace. |
-| `development herdr-watch [--socket PATH]` | Subscribes to Herdr events and prints connection, wake count and agent snapshots as JSON until interrupted. |
-
-Ordinary commands retain their normal configuration, state, polling and
-reconciliation behavior. Filesystem isolation applies when explicitly running
-`development harness` commands; enabling development mode alone starts no ticker
-or agent and changes no sandbox permissions or credentials.
+Read [Development mode in the README](../../../README.md#development-mode)
+for activation methods, command effects and the isolation boundary.
 
 ## Run an isolated check
 
