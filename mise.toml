@@ -24,7 +24,7 @@ run = "cargo test --workspace --locked"
 description = "Build the Rust workspace"
 run = "cargo build --workspace --locked"
 
-[tasks.build-dev]
+[tasks.build-development]
 description = "Build and sign the release binary for local macOS development"
 run = """
 set -eu

@@ -19,6 +19,9 @@ use crate::{progress, ticker};
 #[derive(Parser)]
 #[command(name = "herdr-linear-agent", version = crate::VERSION, about = "Run a coordinator and per-repository workers for Linear issues delegated to this plugin's Linear app user")]
 struct Cli {
+    /// Enable development commands. Also enabled by config or HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true.
+    #[arg(long, global = true)]
+    development_mode: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -77,18 +80,30 @@ enum Command {
         #[command(subcommand)]
         command: WorkerCommand,
     },
+    /// Manage the local supervisor's reports and portable memory.
+    Supervisor {
+        #[command(subcommand)]
+        command: SupervisorCommand,
+    },
     /// Report a worker's progress from its own pane.
     Report(ReportArgs),
-    /// Tools for checking the plugin against a real Herdr.
+    /// Tools for development checks. Requires development mode.
     #[command(hide = true)]
-    Debug {
+    Development {
         #[command(subcommand)]
-        command: DebugCommand,
+        command: DevelopmentCommand,
     },
 }
 
 #[derive(Subcommand)]
-enum DebugCommand {
+enum DevelopmentCommand {
+    /// Run development commands with isolated config, state and a dedicated session.
+    Harness {
+        #[command(subcommand)]
+        command: crate::development_harness::Command,
+    },
+    /// Start one real coordinator without prompting it, then remove its workspace.
+    AgentSmoke(crate::agent_smoke::Options),
     /// Follow the Herdr session and print one JSON line per wake.
     HerdrWatch {
         /// The socket to watch; the configured session's by default.
@@ -172,6 +187,79 @@ enum WorkerCommand {
     Merge { key: String, id: String },
 }
 
+#[derive(Subcommand)]
+enum SupervisorCommand {
+    /// Read or resume the current bounded report batch.
+    Context {
+        #[arg(long)]
+        generation: u64,
+    },
+    /// Commit a decision and its portable memory delta.
+    Decide {
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        decision_file: String,
+    },
+    /// Search committed knowledge in the current authorization scope.
+    Memory {
+        #[command(subcommand)]
+        command: SupervisorMemoryCommand,
+    },
+    /// Read a plugin-issued report, decision or topic handle.
+    Show { handle: String },
+    /// Inspect and maintain the committed generated-profile catalog.
+    Profiles {
+        #[command(subcommand)]
+        command: SupervisorProfilesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SupervisorProfilesCommand {
+    /// List authorized generated revisions and mark each current catalog entry.
+    List,
+    /// Show one exact committed generated revision.
+    Show {
+        id: String,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    /// Retire the expected active revision for future runs.
+    Retire {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "source-report")]
+        source_report_ids: Vec<String>,
+    },
+    /// Publish a new revision using the content of a retained revision.
+    Rollback {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Export a revision as ordinary profile files into a new exact directory.
+    Export {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SupervisorMemoryCommand {
+    Search { query: String },
+}
+
 #[derive(Args)]
 struct ReportArgs {
     /// Rough progress of the whole task, 0 to 100.
@@ -190,8 +278,26 @@ fn parse_option(text: &str) -> Result<(String, String), String> {
 }
 
 pub async fn run() -> Result<()> {
-    let command = Cli::parse().command;
+    let cli = Cli::parse();
     let env = Env::from_process()?;
+    let command = match cli.command {
+        Command::Development { command } => {
+            anyhow::ensure!(
+                development_enabled(&env, cli.development_mode)?,
+                "development commands require --development-mode, HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true, or development_mode = true in config.toml"
+            );
+            return match command {
+                DevelopmentCommand::AgentSmoke(options) => {
+                    crate::agent_smoke::run(&env, options).await
+                }
+                DevelopmentCommand::Harness { command } => {
+                    crate::development_harness::run(&env, command)
+                }
+                DevelopmentCommand::HerdrWatch { socket } => herdr_watch(socket).await,
+            };
+        }
+        command => command,
+    };
     let runner = RealRunner;
     let ctx = Ctx {
         env: &env,
@@ -213,9 +319,7 @@ pub async fn run() -> Result<()> {
     }
 
     match command {
-        Command::Debug {
-            command: DebugCommand::HerdrWatch { socket },
-        } => herdr_watch(socket).await,
+        Command::Development { .. } => unreachable!("handled before ordinary state initialization"),
         Command::Startup => ticker::start(&ctx).await,
         Command::History => {
             let (env, runs) = (env.clone(), ctx.runs_dir());
@@ -265,6 +369,48 @@ pub async fn run() -> Result<()> {
             commands::finish(&ctx, &session, &args.key, &text).await
         }
         Command::Worker { command } => worker(&ctx, command).await,
+        Command::Supervisor { command } => match command {
+            SupervisorCommand::Context { generation } => {
+                commands::supervisor_context(&ctx, generation)
+            }
+            SupervisorCommand::Decide {
+                generation,
+                decision_file,
+            } => commands::supervisor_decide(&ctx, generation, &read_text_arg(&decision_file)?),
+            SupervisorCommand::Memory {
+                command: SupervisorMemoryCommand::Search { query },
+            } => commands::supervisor_memory_search(&ctx, &query),
+            SupervisorCommand::Show { handle } => commands::supervisor_show(&ctx, &handle),
+            SupervisorCommand::Profiles { command } => match command {
+                SupervisorProfilesCommand::List => commands::supervisor_profiles_list(&ctx),
+                SupervisorProfilesCommand::Show { id, revision } => {
+                    commands::supervisor_profiles_show(&ctx, &id, revision)
+                }
+                SupervisorProfilesCommand::Retire {
+                    id,
+                    expected_revision,
+                    reason,
+                    source_report_ids,
+                } => commands::supervisor_profiles_retire(
+                    &ctx,
+                    &id,
+                    expected_revision,
+                    &reason,
+                    &source_report_ids,
+                ),
+                SupervisorProfilesCommand::Rollback {
+                    id,
+                    revision,
+                    reason,
+                } => commands::supervisor_profiles_rollback(&ctx, &id, revision, &reason),
+                SupervisorProfilesCommand::Export {
+                    id,
+                    revision,
+                    name,
+                    output,
+                } => commands::supervisor_profiles_export(&ctx, &id, revision, &name, &output),
+            },
+        },
         Command::Report(args) => {
             progress::report(&env, args.percent.filter(|_| !args.unknown), &args.activity).await
         }
@@ -307,6 +453,22 @@ async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
         }
         WorkerCommand::Merge { key, id } => commands::worker_merge(ctx, &key, &id).await,
     }
+}
+
+fn development_enabled(env: &Env, flag: bool) -> Result<bool> {
+    if flag {
+        return Ok(true);
+    }
+    if env
+        .var("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE")
+        .map(str::parse::<bool>)
+        .transpose()
+        .context("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE must be true or false")?
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    Config::development_mode(&env.config_dir())
 }
 
 async fn herdr_watch(socket: Option<PathBuf>) -> Result<()> {
@@ -354,6 +516,79 @@ async fn herdr_watch(socket: Option<PathBuf>) -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn development_mode_requires_one_explicit_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::for_test(temp.path(), &[]);
+        assert!(!development_enabled(&env, false).unwrap());
+        assert!(development_enabled(&env, true).unwrap());
+        assert!(!env.state_dir().exists());
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let env = Env::for_test(
+                temp.path(),
+                &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", value)],
+            );
+            assert_eq!(development_enabled(&env, false).unwrap(), enabled);
+        }
+        let invalid = Env::for_test(
+            temp.path(),
+            &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", "typo")],
+        );
+        assert!(development_enabled(&invalid, false).is_err());
+        assert!(development_enabled(&invalid, true).unwrap());
+        std::fs::create_dir_all(env.config_dir()).unwrap();
+        std::fs::write(Config::path(&env.config_dir()), "development_mode = true\n").unwrap();
+        let disabled_env = Env::for_test(
+            temp.path(),
+            &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", "false")],
+        );
+        assert!(development_enabled(&disabled_env, false).unwrap());
+        std::fs::write(Config::path(&env.config_dir()), "broken [\n").unwrap();
+        assert!(development_enabled(&env, false).is_err());
+        let enabled_env = Env::for_test(
+            temp.path(),
+            &[("HERDR_LINEAR_AGENT_DEVELOPMENT_MODE", "true")],
+        );
+        assert!(development_enabled(&enabled_env, false).unwrap());
+        assert!(development_enabled(&env, true).unwrap());
+        assert!(!env.state_dir().exists());
+        assert!(
+            Cli::try_parse_from([
+                "herdr-linear-agent",
+                "--development-mode",
+                "development",
+                "harness",
+                "init",
+                "/tmp/hla-development",
+                "--session",
+                "hla-development"
+            ])
+            .unwrap()
+            .development_mode
+        );
+    }
+
+    #[test]
+    fn agent_smoke_requires_an_explicit_session_and_exactly_one_target() {
+        let prefix = ["herdr-linear-agent", "development", "agent-smoke"];
+        for args in [
+            vec![],
+            vec!["--kind", "codex"],
+            vec!["--session", "test"],
+            vec!["--session", "test", "--kind", "codex", "--profile", "deep"],
+        ] {
+            assert!(Cli::try_parse_from(prefix.into_iter().chain(args)).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(
+                prefix
+                    .into_iter()
+                    .chain(["--session", "test", "--kind", "codex"])
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn the_manifest_names_only_existing_actions() {
@@ -421,7 +656,7 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "herdr-linear-agent",
-                "debug",
+                "development",
                 "herdr-watch",
                 "--socket",
                 "/s"
@@ -445,5 +680,60 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn supervisor_profile_operator_commands_parse() {
+        for argv in [
+            vec!["herdr-linear-agent", "supervisor", "profiles", "list"],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "show",
+                "p-example",
+                "--revision",
+                "2",
+            ],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "retire",
+                "p-example",
+                "--expected-revision",
+                "2",
+                "--reason",
+                "Adopt manual profile",
+                "--source-report",
+                "r-00000000000000000000000000000000",
+            ],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "rollback",
+                "p-example",
+                "--revision",
+                "1",
+                "--reason",
+                "Restore prior instructions",
+            ],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "export",
+                "p-example",
+                "--revision",
+                "1",
+                "--name",
+                "manual-example",
+                "--output",
+                "/tmp/profile",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv.clone()).is_ok(), "{argv:?}");
+        }
     }
 }

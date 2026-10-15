@@ -444,12 +444,12 @@ impl Reconciler {
                             && !r.workflow.postmortem_succeeded
                             && r.postmortem_due.is_none()
                         {
-                            r.postmortem_due = Some(crate::postmortem::Stage::Workflow);
+                            crate::postmortem::begin_attempt(r, crate::postmortem::Stage::Workflow);
                         }
                         if observed_stage != Some(crate::run::WorkflowStage::InPostmortem)
                             && r.postmortem_due == Some(crate::postmortem::Stage::Workflow)
                         {
-                            r.postmortem_due = None;
+                            crate::postmortem::clear_attempt(r);
                         }
                     }
                     if state_changed
@@ -936,7 +936,7 @@ impl Reconciler {
             r.closed_state = closed_state;
             r.coordinator.status = AgentStatus::Stopped;
             if !r.workflow.postmortem_succeeded {
-                r.postmortem_due = Some(crate::postmortem::Stage::Final);
+                crate::postmortem::begin_attempt(r, crate::postmortem::Stage::Final);
             }
             if state_type == "completed" && r.workflow.postmortem_succeeded {
                 r.workflow.confirmed = Some(crate::run::WorkflowStage::Done);
@@ -1222,8 +1222,9 @@ impl Reconciler {
                 .iter()
                 .filter(|r| r.record().is_ok_and(|r| r.status == Status::Active))
                 .count();
+            let reserved = usize::from(d.config.supervisor.is_some());
             if active >= d.config.limits.max_runs as usize
-                || worker::agent_count(&runs) + 1 > d.config.limits.max_agents as usize
+                || worker::agent_count(&runs) + 1 + reserved > d.config.limits.max_agents as usize
             {
                 break;
             }
@@ -1403,12 +1404,18 @@ impl Reconciler {
     ) -> Result<()> {
         let record = run.record()?;
         let routing = d.config.routing_of(&record.workspace, &record.team_key)?;
-        if let [only] = &routing.coordinators[..] {
+        let names = d.config.profile_candidates_for(
+            &record.workspace,
+            &record.team_key,
+            crate::config::GeneratedRole::Coordinator,
+            &routing.coordinators,
+        );
+        if let [only] = &names[..] {
             return self
                 .decide(d, run, &routing::Choice::Only(only.clone()))
                 .await;
         }
-        let coordinators = routing::candidates(d.config, &routing.coordinators);
+        let coordinators = routing::candidates(d.config, &names);
         let agent = routing
             .agent
             .as_deref()

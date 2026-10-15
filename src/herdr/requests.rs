@@ -11,9 +11,6 @@ use super::{Client, HerdrError, Pane, PaneId, Snapshot, WorkspaceId};
 
 /// Herdr waits this long for a started agent to become ready.
 const AGENT_START_TIMEOUT_MS: u64 = 30_000;
-/// `agent.start` answers only after the agent is ready, so the client waits
-/// longer than Herdr does.
-const AGENT_START_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 /// A worktree checkout can take a while on a large repository.
 const WORKTREE_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -31,6 +28,16 @@ pub struct Placed {
 
 pub trait Herdr: Send + Sync {
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, HerdrError>> + Send;
+
+    /// A client for a previously recorded session socket, when the
+    /// implementation can open one. The reconciler uses it only to close a
+    /// managed workspace left in the old session after an explicit switch.
+    fn for_socket(&self, _socket: &str) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 
     fn workspace_create(
         &self,
@@ -143,6 +150,23 @@ impl PlacedAnswer {
 }
 
 impl Client {
+    pub async fn agent_start_with_timeout(
+        &self,
+        name: &str,
+        kind: &str,
+        pane: &PaneId,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        let params = json!({
+            "name": name, "kind": kind, "pane_id": pane, "args": args,
+            "timeout_ms": timeout.as_millis() as u64,
+        });
+        self.call_with_timeout::<Value>("agent.start", params, timeout + Duration::from_secs(5))
+            .await
+            .map(|_| ())
+    }
+
     async fn ok(&self, method: &str, params: Value) -> Result<(), HerdrError> {
         self.call::<Value>(method, params).await.map(|_| ())
     }
@@ -151,6 +175,10 @@ impl Client {
 impl Herdr for Client {
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, HerdrError>> + Send {
         Client::snapshot(self)
+    }
+
+    fn for_socket(&self, socket: &str) -> Option<Self> {
+        Some(Client::new(socket))
     }
 
     async fn workspace_create(&self, cwd: &str, label: &str) -> Result<Placed, HerdrError> {
@@ -192,13 +220,14 @@ impl Herdr for Client {
         pane: &PaneId,
         args: &[String],
     ) -> Result<(), HerdrError> {
-        let params = json!({
-            "name": name, "kind": kind, "pane_id": pane, "args": args,
-            "timeout_ms": AGENT_START_TIMEOUT_MS,
-        });
-        self.call_with_timeout::<Value>("agent.start", params, AGENT_START_CLIENT_TIMEOUT)
-            .await
-            .map(|_| ())
+        self.agent_start_with_timeout(
+            name,
+            kind,
+            pane,
+            args,
+            Duration::from_millis(AGENT_START_TIMEOUT_MS),
+        )
+        .await
     }
 
     async fn agent_prompt(&self, pane: &PaneId, text: &str) -> Result<(), HerdrError> {

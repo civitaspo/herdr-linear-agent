@@ -4,6 +4,122 @@ The test suite runs the ticker and the coordinator's commands against a fake Her
 
 The first integration test ran on 2026-09-26 and 2026-09-27 with Herdr 0.9.1 and Claude Code 2.1.280 on macOS, in a scratch Linear team and a scratch Herdr session, with a sandbox GitHub repository. The second ran on 2026-09-28 with the same versions, after the rewrite on tokio (the event-driven ticker on the Herdr socket and the Linear task with its rate-limit budget).
 
+## Explicit agent startup smoke test
+
+Use an installed Herdr (0.9.1 or newer) and an already running, dedicated,
+non-default test session. Install and log in to the selected agent CLI first.
+Disable native startup hooks or automation that could submit work automatically.
+The pane shell must resolve the CLI, including its mise version selection when
+using shims. An isolated `XDG_CONFIG_HOME` also hides global mise configuration;
+provide the required tool versions in that test environment.
+
+```bash
+cargo build --workspace --locked
+herdr --session agent-start-smoke
+# Attach to this test session in another terminal if running headless.
+herdr-linear-agent --development-mode development agent-smoke --session agent-start-smoke --profile coordinator-codex
+# Or use default interactive arguments without reading plugin configuration:
+herdr-linear-agent --development-mode development agent-smoke --session agent-start-smoke --kind opencode --timeout-seconds 30
+```
+
+Use `target/debug/herdr-linear-agent` for a local build. `--config-dir <directory>`
+optionally selects a separate profile configuration. The command reads profiles
+but does not change plugin configuration or state, start a ticker, access Linear
+credentials, or connect to Linear. It creates temporary coordinator priming,
+uses the production startup arguments and `agent.start`, then checks the exact
+pane, agent kind, name and interactive readiness in snapshots. It sends no
+`agent.prompt`. Prompt-bearing profile arguments and kinds without an audited
+prompt-free launch are refused before execution. Currently supported kinds are
+Codex, Claude Code, Cursor Agent and OpenCode; trust dialogs may prevent readiness.
+
+Output distinguishes `launch_failure`, `execution_permission` and
+`detection_timeout`, includes pane diagnostics on failure, and reports the CLI
+version when obtainable in the caller environment. Missing CLIs fail instead of
+being skipped. Success, failure and handled interrupts close the test workspace
+and verify agent removal. If cleanup cannot be verified, the command fails and
+retains its temporary files for recovery. Stop the dedicated session afterward.
+This command is excluded from ordinary tests and CI. It checks startup only;
+instruction comprehension, model calls and complete issue workflows remain
+outside its scope.
+
+On 2026-10-15, Herdr 0.9.3 detected Codex 0.160.0 with a coordinator profile and
+OpenCode 2.0.24 by kind as interactively ready in their primed coordinator panes.
+Both checks sent no prompt and verified removal of their agent and workspace.
+
+For isolated live development checks, follow the repository-local
+[integration-harness skill](../.agents/skills/integration-harness/SKILL.md).
+
+The Rust `development harness` replacement was checked offline with a temporary root:
+initialization, plugin re-execution, child environment and working directory,
+and session arguments to a stand-in Herdr executable. With damaged TOML and a
+failed stop, cleanup still attempted deletion of the same dedicated session and
+retained its files. These checks contacted no agents or Linear. The complete
+workflow below was checked with the previous launcher before the Rust migration.
+Default refusal and each development-mode opt-in were also exercised through
+the CLI, including config-only activation before workspace/profile setup.
+The ordinary state directory retained its original permissions.
+
+## Isolated Codex workflow and supervisor persistence (2026-10-15)
+
+Using the integration harness, Herdr 0.9.3 and Codex 0.160.0 with `gpt-6-luna`,
+scratch issue [THLA-36](https://linear.app/civitaspo/issue/THLA-36/complete-isolated-codex-workflow-and-persist-supervisor-decision)
+completed intake, a worker PR/report, review, plugin-controlled squash merge,
+documentation deployment verification, workflow postmortem and Done.
+[PR #23](https://github.com/civitaspo/testing-herdr-linear-agent/pull/23)
+added one 13-line checklist. Required `quick` and `slow` checks passed; the
+conditional `failing` check was skipped. A fresh merge assessment scored 18
+against the unchanged maximum 20. Merge readback confirmed head
+`8f952f16da2a85e90043ed17c2141b5867c94f54`; the coordinator then verified the
+document on `origin/main` at `65f8aa812070500f6d70d7794969620d608b5916`.
+
+The saved workflow postmortem attempt `9435cfc9-0ca7-4b84-b6d5-8142c3bc025f`
+produced report `r-fa0dedd1e4a91d22c38a375e74ccdb87`. The live supervisor
+consumed that report through `supervisor context` and committed decision
+`0d9c3f72-8a41-4b65-ae20-71c5d4f6b308` through `supervisor decide`, with actor
+`agent`, sequence 3, memory generation 3 and a new scoped knowledge topic.
+The decision hash was
+`8561c8f99ddd46c26c3f90922024f9d006003ccc2d7cbe1429bba4abaec39e09`.
+After restarting the ticker, `supervisor show decision:<id>` read it back;
+the current commit, receipt, decision, checkpoint and topic files retained
+their hashes. No reports or committed supervisor state were seeded manually.
+
+This run exposed a reconciler bug: `finish` into review prevented a later
+machine-decision notification from prompting the coordinator. After the fix,
+the real coordinator resumed, handled a stale assessment caused by the state
+transition, and requested a fresh assessment against the settled evidence.
+The regression scenario and Rust suite passed (474 passed, one ignored).
+
+Limits and operator assistance:
+
+- Two setup attempts, THLA-34 and THLA-35, were canceled before the completed
+  workflow. Their real final reports produced the first two decisions.
+- The operator configured scratch sandbox write/network access and relayed
+  commit-method guidance through Linear. The worker used GitHub's signed
+  `createCommitOnBranch` because local Git metadata/signing access failed.
+  The head signature was valid and its trailer was exactly
+  `Co-Authored-By: Codex <noreply@openai.com>`. GitHub's squash result was also
+  signed, but normalized the trailer to `Co-authored-by`; exact trailer case
+  was not preserved in that merge. The merged commit was not rewritten.
+- The operator reviewed the full diff and posted a GitHub COMMENTED review.
+  The initial score 23 was ineligible; new review evidence was supplied
+  before reassessment. This does not demonstrate an unattended workflow.
+- Plain issue comments did not advance `Issue.updatedAt` or wake this run.
+  A genuine issue-description update delivered the operator's instruction.
+  Agent Session replies are the intended interactive channel.
+- The postmortem describes evidence captured before its own completion;
+  the supervisor conservatively retained that timing limit in its topic.
+  Durable persistence was checked separately after completion.
+
+All plugin state and worktrees were under
+`/private/tmp/hla-live-supervisor-20261015`. Hashes of 707 ordinary plugin
+configuration, run and supervisor files were unchanged. Evidence remains in
+that root, including `supervisor-restart-comparison.json` and
+`production-state-comparison.json`. Native CLI data and credentials were
+shared as described above; generated-profile replacement and long-running
+supervisor behavior were not exercised. The harness ticker was stopped and
+its Herdr session deleted afterward. The unchanged installed 0.7.0 ticker
+was restored and reported running.
+
 ## Open questions
 
 | # | Question | Result |
@@ -53,7 +169,7 @@ not valid identities. Adding Apple's official WWDR G3 intermediate certificate
 to the login Keychain made it valid without changing trust overrides.
 
 The first signing operation and the first credential reads required the user
-to choose **Always Allow**. After that, `mise run build-dev` signed a release
+to choose **Always Allow**. After that, `mise run build-development` signed a release
 binary, and `action doctor` read both configured workspaces' credentials and
 queried their Linear viewer budgets without another authorization prompt.
 Touching `build.rs` and running the task again generated a different build ID
@@ -456,7 +572,7 @@ This check establishes postmortem generation and delivery, not independent
 assessment of external test evidence. Unknown write outcomes, unauthorized
 authors, vetoes and reordered reads remain regression-suite checks rather than
 live fault injection. The isolated ticker was stopped afterwards; the installed
-ticker and LayerX issues were not changed.
+ticker and unrelated Linear issues were not changed.
 
 ## State notices and merge authorization (2026-10-12)
 
@@ -576,3 +692,11 @@ the repository-scoped comment-token fix; the server verified it against a real
 client PR in run
 [38511694306](https://github.com/civitaspo/securefix-server/actions/runs/38511694306).
 The workflows in this repository now pin v0.2.14.
+
+## Local postmortem supervisor checks (2026-10-15)
+
+The implementation was verified against the repository's fake Herdr, fake Linear and fake agent runners. `cargo test --workspace --locked` passed 467 tests; `routing_live` was ignored. The regression scenario `ticker::scenarios::a_saved_workflow_postmortem_retries_its_supervisor_feed_after_restart` leaves the feed malformed while the issue comment and Done state are delivered, confirms the run keeps its due marker, then repairs the feed and restarts the ticker. Replay materializes one report and clears the marker without repeating Linear writes. The outbox regression `outbox::tests::a_replayed_postmortem_comment_keeps_its_identity_across_queue_and_marker_gaps` covers a repeated queue, an uncertain response and replay after queue removal. `cargo check --workspace --locked`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo build --workspace --locked`, `cargo fmt --all -- --check`, and `git diff --check` passed after the fix. Direct runs of `shellcheck scripts/*.sh`, `ghalint run`, and `pinact run --check --verify-comment` passed.
+
+The `mise run lint`, `mise run test`, and `mise run build` wrappers could not start because mise attempted to install `aqua:DataDog/pup@latest` and the environment returned `Operation not permitted`. The locked Rust checks and shell/workflow lint commands listed above were run directly.
+
+An isolated live attempt used Herdr 0.9.3 and the supervisor build against one private scratch Linear issue and repository. The single read-only worker completed and the issue reached Done. The final postmortem attempt exited with code 1. The supervisor pane remained `launch_pending`: its shell resolved `opencode` through a mise shim with no version selected in the temporary workspace. The failed postmortem artifact was saved, but no supervisor decision was committed. The test session was stopped and deleted, and the installed ticker was restored. This attempt does not verify successful final-postmortem generation or live supervisor report consumption and decision persistence. Re-run those checks with an OpenCode CLI path available to the isolated Herdr session before treating the feature as live-verified. Profile replacement, long-idle behavior, and performance targets also remain unverified against live services; no throughput measurements were taken.

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use crate::{agents, routing};
@@ -25,6 +25,8 @@ pub const DEFAULT_CALLBACK_PORT: u16 = 43871;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub development_mode: bool,
     /// The Linear workspaces, by the name runs use for them.
     pub workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
@@ -36,10 +38,21 @@ pub struct Config {
     #[serde(default)]
     pub claude: Claude,
     #[serde(default)]
+    pub supervisor: Option<SupervisorConfig>,
+    #[serde(default)]
     pub repositories: BTreeMap<String, Repository>,
     /// Read from the profile folders, never from `config.toml`.
     #[serde(skip)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Catalog candidates are generated from the current supervisor commit.
+    #[serde(skip)]
+    pub generated_candidates: BTreeMap<GeneratedCandidateKey, Vec<String>>,
+    /// Last catalog generation whose profile snapshot was loaded.
+    #[serde(skip)]
+    pub generated_catalog_generation: Option<u64>,
+    /// A damaged generated catalog is reported without making manual profiles unusable.
+    #[serde(skip)]
+    pub generated_catalog_error: Option<String>,
     /// The routings teams use, by name.
     pub routing: BTreeMap<String, Routing>,
 }
@@ -193,6 +206,21 @@ pub struct Claude {
     pub auto_accept_trust_dialog: bool,
 }
 
+/// The optional, long-lived agent that reviews saved postmortems.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorConfig {
+    /// An ordinary profile controlling the supervisor agent's CLI and model.
+    pub profile: String,
+    /// Maximum active generated variants per routing, defaults to five.
+    #[serde(default = "default_generated_limit")]
+    pub max_generated_profiles_per_routing: u32,
+}
+
+fn default_generated_limit() -> u32 {
+    5
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Repository {
@@ -206,7 +234,8 @@ pub struct Repository {
 
 /// A profile with its base chain resolved: what launch, routing and validation
 /// see.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     pub kind: String,
     pub model: Option<String>,
@@ -229,7 +258,8 @@ pub struct Profile {
 }
 
 /// One layer of a profile's instructions: whose `instructions.md` it is.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Instructions {
     pub profile: String,
     pub text: String,
@@ -266,9 +296,64 @@ pub struct Routing {
 
     /// The profiles a coordinator may start workers with.
     pub workers: Vec<String>,
+    /// Human-approved manual bases for generated profile variants.
+    #[serde(default)]
+    pub generated: GeneratedPolicy,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedPolicy {
+    #[serde(default)]
+    pub coordinators: Vec<String>,
+    #[serde(default)]
+    pub workers: Vec<String>,
+    #[serde(default)]
+    pub postmortems: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedRole {
+    Coordinator,
+    Worker,
+    Postmortem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GeneratedCandidateKey {
+    pub workspace: String,
+    pub team: String,
+    pub routing: String,
+    pub role: GeneratedRole,
+}
+
+impl GeneratedPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.coordinators.is_empty() && self.workers.is_empty() && self.postmortems.is_empty()
+    }
 }
 
 impl Config {
+    pub fn development_mode(config_dir: &Path) -> Result<bool> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Mode {
+            development_mode: bool,
+        }
+        let path = Self::path(config_dir);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+        let mode: Mode = toml::from_str(&text)
+            .with_context(|| format!("could not read development_mode from {}", path.display()))?;
+        Ok(mode.development_mode)
+    }
+
     pub fn path(config_dir: &Path) -> PathBuf {
         config_dir.join(FILE_NAME)
     }
@@ -297,6 +382,82 @@ impl Config {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    /// Loads manual config and profile snapshots from the committed generated catalog.
+    /// Catalog damage disables generated selection but leaves ordinary config usable.
+    pub fn load_with_state_dir(config_dir: &Path, state_dir: &Path) -> Result<Config> {
+        let mut config = Self::load(config_dir)?;
+        let store = crate::supervisor::SupervisorStore::new(state_dir.join("supervisor"));
+        if !store.root().join("current.json").exists() {
+            return Ok(config);
+        }
+        let current = match store.current() {
+            Ok(current) => current,
+            Err(error) => {
+                config.generated_catalog_error = Some(format!("{error:#}"));
+                return Ok(config);
+            }
+        };
+        config.generated_catalog_generation = Some(current.catalog_generation);
+        let revisions = match store.profile_revisions() {
+            Ok(revisions) => revisions,
+            Err(error) => {
+                config.generated_catalog_error = Some(format!("{error:#}"));
+                return Ok(config);
+            }
+        };
+        let manual_profiles = config.profiles.clone();
+        for revision in revisions {
+            if config.profiles.contains_key(&revision.name) {
+                config.generated_catalog_error = Some(format!(
+                    "generated profile name `{}` collides with a manual profile",
+                    revision.name
+                ));
+                config.profiles = manual_profiles;
+                return Ok(config);
+            }
+            config
+                .profiles
+                .insert(revision.name.clone(), revision.profile);
+        }
+        let mut generated_candidates = BTreeMap::new();
+        for (workspace, configured) in &config.workspaces {
+            for (team, value) in &configured.teams {
+                let scope = crate::supervisor::Scope {
+                    workspace: workspace.clone(),
+                    team: team.clone(),
+                    routing: value.routing.clone(),
+                };
+                for role in [
+                    GeneratedRole::Coordinator,
+                    GeneratedRole::Worker,
+                    GeneratedRole::Postmortem,
+                ] {
+                    match store.active_profile_names(&config, &scope, role) {
+                        Ok(names) if !names.is_empty() => {
+                            generated_candidates.insert(
+                                GeneratedCandidateKey {
+                                    workspace: workspace.clone(),
+                                    team: team.clone(),
+                                    routing: value.routing.clone(),
+                                    role,
+                                },
+                                names,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            config.generated_catalog_error = Some(format!("{error:#}"));
+                            config.profiles = manual_profiles;
+                            return Ok(config);
+                        }
+                    }
+                }
+            }
+        }
+        config.generated_candidates = generated_candidates;
+        Ok(config)
     }
 
     /// A SHA-256 over the files `load` reads, by sorted path and content:
@@ -408,6 +569,18 @@ impl Config {
             limits.max_runs >= 1 && limits.max_workers_per_run >= 1 && limits.max_agents >= 2,
             "limits must allow one run with one worker"
         );
+        if let Some(supervisor) = &self.supervisor {
+            self.profile(&supervisor.profile)
+                .with_context(|| "supervisor.profile".to_string())?;
+            ensure!(
+                (1..=20).contains(&supervisor.max_generated_profiles_per_routing),
+                "supervisor.max_generated_profiles_per_routing must be between 1 and 20"
+            );
+            ensure!(
+                limits.max_agents >= 3,
+                "limits.max_agents must be at least 3 when the supervisor is enabled"
+            );
+        }
         ensure!(
             limits.ask_to_continue_after_hours >= 1,
             "limits.ask_to_continue_after_hours must be at least 1"
@@ -496,7 +669,40 @@ impl Config {
                     at("postmortems")
                 );
             }
-            let several = routing.coordinators.len() > 1 || routing.postmortems.len() > 1;
+            ensure!(
+                self.supervisor.is_some() || routing.generated.is_empty(),
+                "routing.{name}.generated requires [supervisor]"
+            );
+            let generated_role = |key: &str, allowed: &[String], manual: &[String]| -> Result<()> {
+                for base in allowed {
+                    ensure!(
+                        !base.starts_with("generated-"),
+                        "routing.{name}.generated.{key}: generated profiles cannot be bases"
+                    );
+                    ensure!(
+                        manual.iter().any(|profile| profile == base),
+                        "routing.{name}.generated.{key}: `{base}` is not an approved manual profile for this role"
+                    );
+                    self.profile(base)
+                        .with_context(|| format!("routing.{name}.generated.{key}"))?;
+                }
+                Ok(())
+            };
+            generated_role(
+                "coordinators",
+                &routing.generated.coordinators,
+                &routing.coordinators,
+            )?;
+            generated_role("workers", &routing.generated.workers, &routing.workers)?;
+            generated_role(
+                "postmortems",
+                &routing.generated.postmortems,
+                &routing.postmortems,
+            )?;
+            let several = routing.coordinators.len() > 1
+                || routing.postmortems.len() > 1
+                || !routing.generated.coordinators.is_empty()
+                || !routing.generated.postmortems.is_empty();
             match &routing.agent {
                 Some(agent) => headless(&at("agent"), agent, "a routing agent")?,
                 None => ensure!(
@@ -582,15 +788,65 @@ impl Config {
             .with_context(|| format!("there is no routing.{name}"))
     }
 
-    /// A profile a coordinator may start a worker with under `routing`.
-    pub fn worker_profile<'a>(&'a self, routing: &Routing, name: &str) -> Result<&'a Profile> {
-        if !routing.workers.iter().any(|w| w == name) {
-            bail!(
-                "`{name}` is not a worker profile; the routing's workers are {}",
-                routing.workers.join(", ")
-            );
+    pub fn worker_profile_for<'a>(
+        &'a self,
+        workspace: &str,
+        team: &str,
+        name: &str,
+    ) -> Result<&'a Profile> {
+        let routing = self.routing_of(workspace, team)?;
+        let key = GeneratedCandidateKey {
+            workspace: workspace.into(),
+            team: team.into(),
+            routing: self.team(workspace, team)?.routing.clone(),
+            role: GeneratedRole::Worker,
+        };
+        if routing.workers.iter().any(|candidate| candidate == name)
+            || self
+                .generated_candidates
+                .get(&key)
+                .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == name))
+        {
+            return self.profile(name);
         }
-        self.profile(name)
+        bail!(
+            "`{name}` is not a worker profile authorized for {workspace}/{team}; the routing's workers are {}",
+            routing.workers.join(", ")
+        )
+    }
+
+    pub fn profile_candidates_for(
+        &self,
+        workspace: &str,
+        team: &str,
+        role: GeneratedRole,
+        manual: &[String],
+    ) -> Vec<String> {
+        let Some(team_config) = self
+            .workspaces
+            .get(workspace)
+            .and_then(|workspace| workspace.teams.get(team))
+        else {
+            return manual.to_vec();
+        };
+        let Some(_routing) = self.routing.get(&team_config.routing) else {
+            return manual.to_vec();
+        };
+        let key = GeneratedCandidateKey {
+            workspace: workspace.into(),
+            team: team.into(),
+            routing: team_config.routing.clone(),
+            role,
+        };
+        let mut names = manual.to_vec();
+        names.extend(
+            self.generated_candidates
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        names
     }
 
     pub fn workspace(&self, name: &str) -> Result<&Workspace> {
@@ -649,6 +905,10 @@ fn load_profiles(dir: &Path) -> Result<BTreeMap<String, Profile>> {
         if name.starts_with('.') {
             continue;
         }
+        ensure!(
+            !name.starts_with("generated-"),
+            "profile name `{name}` uses the reserved generated profile namespace"
+        );
         ensure!(
             path.is_dir(),
             "{} is not a folder: each profile is a folder with a {FILE_NAME}",
@@ -886,8 +1146,27 @@ workers = ["standard", "deep"]
     }
 
     #[test]
+    fn development_mode_loads_before_workspace_and_profile_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!Config::development_mode(temp.path()).unwrap());
+        for (text, enabled) in [
+            ("", false),
+            ("development_mode = false\n", false),
+            ("development_mode = true\n", true),
+        ] {
+            std::fs::write(Config::path(temp.path()), text).unwrap();
+            assert_eq!(Config::development_mode(temp.path()).unwrap(), enabled);
+        }
+        std::fs::write(Config::path(temp.path()), "development_mode = 'true'\n").unwrap();
+        assert!(Config::development_mode(temp.path()).is_err());
+        let configured = load_with(&format!("development_mode = true\n{SAMPLE}"), &[]).unwrap();
+        assert!(configured.development_mode);
+    }
+
+    #[test]
     fn the_sample_parses_with_defaults() {
         let config = sample();
+        assert!(!config.development_mode);
         let acme = config.workspace("acme").unwrap();
         assert_eq!(acme.callback_port, DEFAULT_CALLBACK_PORT);
         assert_eq!(
@@ -932,10 +1211,17 @@ workers = ["standard", "deep"]
         );
         assert_eq!(config.profile("coordinator").unwrap().instructions, []);
         assert_eq!(
-            config.worker_profile(routing, "deep").unwrap().kind,
+            config
+                .worker_profile_for("acme", "DATA", "deep")
+                .unwrap()
+                .kind,
             "codex"
         );
-        assert!(config.worker_profile(routing, "coordinator").is_err());
+        assert!(
+            config
+                .worker_profile_for("acme", "DATA", "coordinator")
+                .is_err()
+        );
         assert!(
             config
                 .repository("nope")
@@ -1667,6 +1953,44 @@ workers = ["standard", "deep"]
             load_with(SAMPLE, &[("router", "kind = \"gemini\"\n")])
                 .unwrap_err()
                 .ends_with("routing.default.agent: the `gemini` kind cannot be a routing agent")
+        );
+    }
+
+    #[test]
+    fn supervisor_and_generated_profile_bases_are_opt_in_and_validated() {
+        assert!(sample().supervisor.is_none());
+        let text = format!(
+            "{}\n[supervisor]\nprofile = \"supervisor\"\n\n[routing.default.generated]\ncoordinators = [\"coordinator\"]\nworkers = [\"standard\"]\n",
+            SAMPLE
+        );
+        let config = load_with(&text, &[("supervisor", "kind = \"claude\"\n")]).unwrap();
+        assert_eq!(
+            config
+                .supervisor
+                .unwrap()
+                .max_generated_profiles_per_routing,
+            5
+        );
+        assert_eq!(config.routing["default"].generated.workers, ["standard"]);
+
+        let bad_base = text.replace("workers = [\"standard\"]", "workers = [\"coordinator\"]");
+        assert!(load_with(&bad_base, &[("supervisor", "kind = \"claude\"\n")])
+            .unwrap_err()
+            .ends_with("routing.default.generated.workers: `coordinator` is not an approved manual profile for this role"));
+
+        let without_supervisor =
+            SAMPLE.to_string() + "\n[routing.default.generated]\nworkers = [\"standard\"]\n";
+        assert!(
+            load_with(&without_supervisor, &[])
+                .unwrap_err()
+                .ends_with("routing.default.generated requires [supervisor]")
+        );
+
+        let too_few = text.replace("[supervisor]", "[limits]\nmax_agents = 2\n\n[supervisor]");
+        assert!(
+            load_with(&too_few, &[("supervisor", "kind = \"claude\"\n")])
+                .unwrap_err()
+                .ends_with("limits.max_agents must be at least 3 when the supervisor is enabled")
         );
     }
 }

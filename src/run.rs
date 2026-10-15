@@ -237,6 +237,10 @@ pub struct AgentRecord {
     pub last_group: String,
     /// A "needs someone in the pane" elicitation was sent for the current episode.
     pub blocked_reported: bool,
+    /// Waiting episodes observed after this counter was introduced. `None`
+    /// means the history is unavailable for older records.
+    #[serde(default)]
+    pub waiting_episodes: Option<u32>,
     /// Durable bounded resume state for an agent that disappears from a surviving pane.
     pub recovery: Recovery,
 }
@@ -377,6 +381,17 @@ pub struct RunRecord {
     pub interrupt: Option<Interrupt>,
     /// A queued legacy interim/final postmortem or workflow postmortem stage.
     pub postmortem_due: Option<crate::postmortem::Stage>,
+    /// Stable identity of the currently due postmortem attempt. Missing or
+    /// blank in records written before attempt identities were added.
+    #[serde(default)]
+    pub postmortem_attempt_id: String,
+    /// Attempt whose Linear writes were queued under the run lock. Kept after
+    /// the due marker clears; its comment uses the attempt UUID for safe replay.
+    #[serde(default)]
+    pub postmortem_queued_attempt_id: String,
+    /// Attempt whose failure notice was written to the coordinator inbox.
+    #[serde(default)]
+    pub postmortem_notice_attempt_id: String,
     #[serde(default)]
     pub workflow: WorkflowProgress,
     #[serde(default)]

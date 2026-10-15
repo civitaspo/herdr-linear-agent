@@ -9,6 +9,7 @@ herdr-linear-agent is a Herdr plugin written in Rust. It polls Linear for issues
 - Read [README.md](README.md) for configuration, profiles, supported agent kinds, and user-visible behavior.
 - For lifecycle, persistence, or reconciliation changes, read the relevant section of [docs/behavior.md](docs/behavior.md). Check the current implementation before relying on entries marked as open questions or rewrite notes.
 - For real integration checks, read [docs/verification.md](docs/verification.md). Keep fake-test results distinct from checks against a real Linear workspace or agent CLI.
+- For real agent or Linear development checks, use [the integration-harness skill](.agents/skills/integration-harness/SKILL.md) to isolate configuration, state, worktrees and the Herdr session from ordinary use.
 - This file guides development of the plugin. [assets/COORDINATOR.md](assets/COORDINATOR.md) and [assets/WORKER.md](assets/WORKER.md) are the instructions the plugin gives its agents.
 
 ## Where to make changes
@@ -77,7 +78,7 @@ cargo test --workspace --locked <test_name_or_module>
 cargo fmt --all
 ```
 
-For local macOS builds that access real Linear credentials, follow [docs/development-signing.md](docs/development-signing.md). With `HLA_SIGN_IDENTITY` set, `mise run build-dev` builds and signs `target/release/herdr-linear-agent`, the executable used by `herdr-plugin.toml`. Ordinary lint, test, and debug-build checks do not need a signing identity.
+For local macOS builds that access real Linear credentials, follow [docs/development-signing.md](docs/development-signing.md). With `HLA_SIGN_IDENTITY` set, `mise run build-development` builds and signs `target/release/herdr-linear-agent`, the executable used by `herdr-plugin.toml`. Ordinary lint, test, and debug-build checks do not need a signing identity.
 
 ## Test and document changes
 
@@ -86,6 +87,7 @@ For local macOS builds that access real Linear credentials, follow [docs/develop
 - For retry and recovery changes, check observable Herdr requests, Linear writes, and persisted records. Exercise repeated reconciliation and relevant delayed or reordered events with the existing `World` controls.
 - The ignored `routing_live` test calls real agent CLIs and needs their logins. Run it only when the task calls for live routing verification. Use a scratch Linear team and scratch Herdr session for real lifecycle checks described in `docs/verification.md`.
 - When changing config or profiles, update validation tests and the shared sample in `src/config.rs` as needed. Update the README examples for user-facing changes.
+- Document user-facing settings, CLI options, environment variables and commands in the README, including development interfaces useful to contributors. Link detailed references from there; agent skills do not replace user documentation.
 - When changing agent-facing commands, keep `assets/COORDINATOR.md`, `assets/WORKER.md`, and the generated priming and command allow-lists in `src/coordinator.rs` consistent.
 - When changing lifecycle or persistence behavior, update the relevant section of `docs/behavior.md`. Record new real integration evidence in `docs/verification.md` with its limits.
 - For documentation-only changes, verify referenced paths and commands and run `git diff --check`. If opening a pull request, also run the required checks above.

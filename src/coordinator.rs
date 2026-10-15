@@ -133,6 +133,7 @@ pub fn pending_record(record: &RunRecord, profile: &str, kind: &str) -> AgentRec
         status: AgentStatus::Pending,
         profile: profile.to_string(),
         kind: kind.to_string(),
+        waiting_episodes: Some(0),
         agent_name: names::agent_name(
             &crate::run::run_key(&record.workspace, &record.identifier),
             &record.issue_id,
@@ -291,7 +292,14 @@ pub fn digest(
     // A team no longer in the config has no worker profiles.
     let workers = config
         .routing_of(&record.workspace, &record.team_key)
-        .map(|r| r.workers.clone())
+        .map(|routing| {
+            config.profile_candidates_for(
+                &record.workspace,
+                &record.team_key,
+                crate::config::GeneratedRole::Worker,
+                &routing.workers,
+            )
+        })
         .unwrap_or_default();
     for name in &workers {
         let Ok(profile) = config.profile(name) else {

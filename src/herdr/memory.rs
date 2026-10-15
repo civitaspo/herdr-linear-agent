@@ -81,6 +81,8 @@ struct Model {
     unparsed: Vec<PaneId>,
     /// Panes whose agent entry alone does not parse.
     unparsed_agents: Vec<PaneId>,
+    /// Herdr 0.9.3 snapshots omit workspace labels from panes.
+    omit_workspace_labels: bool,
 }
 
 #[derive(Clone)]
@@ -160,15 +162,19 @@ impl Model {
             *left -= 1;
             *left > 0
         });
-        let panes: BTreeMap<PaneId, Pane> = self
+        let mut panes: BTreeMap<PaneId, Pane> = self
             .panes
             .iter()
             .filter(|(id, _)| !hidden.contains(id))
             .map(|(id, pane)| (id.clone(), pane.clone()))
             .collect();
+        if !self.omit_workspace_labels {
+            for pane in panes.values_mut() {
+                pane.label = self.labels.get(&pane.workspace).cloned();
+            }
+        }
         agents.retain(|a| !hidden.contains(&a.pane));
         let mut skipped = 0;
-        let mut panes = panes;
         for pane in &self.unparsed {
             skipped += usize::from(panes.remove(pane).is_some());
             let before = agents.len();
@@ -265,6 +271,10 @@ impl FakeHerdr {
             .labels
             .get(&WorkspaceId(workspace.into()))
             .cloned()
+    }
+
+    pub fn omit_workspace_labels_in_snapshot(&self) {
+        self.model().omit_workspace_labels = true;
     }
 
     pub fn panes(&self) -> Vec<Pane> {
@@ -403,6 +413,10 @@ impl Herdr for FakeHerdr {
             let _ = go.await;
         }
         Ok(snapshot)
+    }
+
+    fn for_socket(&self, _socket: &str) -> Option<Self> {
+        Some(self.clone())
     }
 
     async fn workspace_create(&self, cwd: &str, label: &str) -> Result<Placed, HerdrError> {

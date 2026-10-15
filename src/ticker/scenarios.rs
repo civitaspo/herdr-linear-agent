@@ -1621,6 +1621,24 @@ async fn a_decision_failure_is_persisted_and_notified_without_merge_authority() 
 }
 
 #[tokio::test]
+async fn a_machine_decision_resumes_a_finished_review_once() {
+    let mut world = assessed_machine_world().await;
+    let pane = world.record(KEY).coordinator.pane_id;
+    let before = to(&world, &pane).len();
+    world.herdr.set_status("acme-data-1-coordinator", "idle");
+    world.settle().await;
+    world.later(61);
+    world.settle().await;
+    assert!(!world.record(KEY).finished);
+    assert_eq!(to(&world, &pane).len(), before + 1);
+    assert_eq!(to(&world, &pane).last().unwrap(), NUDGE_INBOX);
+    assert_eq!(world.issue_state(KEY), "In Review");
+    world.later(10);
+    world.settle().await;
+    assert_eq!(to(&world, &pane).len(), before + 1);
+}
+
+#[tokio::test]
 async fn machine_merge_consumes_the_receipt_with_a_head_guard_and_confirms_deployment() {
     let mut world = assessed_machine_world().await;
     let head = "a3".repeat(20);
@@ -2590,6 +2608,78 @@ async fn deployment_finish_runs_workflow_postmortem_then_moves_to_done() {
     );
     assert!(world.record(KEY).workflow.postmortem_succeeded);
     assert_eq!(posted(&world).len(), 1);
+}
+
+#[tokio::test]
+async fn a_saved_workflow_postmortem_retries_its_supervisor_feed_after_restart() {
+    let mut world =
+        World::with(|config| format!("{config}\n\n[supervisor]\nprofile = \"router\"\n"));
+    postmortem_method(
+        &mut world,
+        "review",
+        r#"{"summary":"Deployment learned from.","labels":[]}"#,
+    );
+    world.running_issue().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Ready for review.")
+        .await
+        .unwrap();
+    world.settle().await;
+
+    add_workflow_states(&world);
+    world.move_issue(KEY, "In Deploy");
+    world.fake_for(KEY).issue_mut("DATA-1")["updatedAt"] = json!("2030-01-01T00:00:00.000Z");
+    world.later(5);
+    world.settle().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Deployment complete.")
+        .await
+        .unwrap();
+
+    let store = crate::supervisor::SupervisorStore::new(world.ctx().supervisor_dir());
+    let feed_path = store.root().join("feed.json");
+    std::fs::write(&feed_path, b"not valid JSON").unwrap();
+    world.settle().await;
+
+    let attempt_id = world.record(KEY).postmortem_attempt_id;
+    let record = world.record(KEY);
+    assert_eq!(
+        record.postmortem_due,
+        Some(crate::postmortem::Stage::Workflow)
+    );
+    assert_eq!(record.postmortem_queued_attempt_id, attempt_id);
+    assert_eq!(world.fake().issue("DATA-1")["state"]["name"], "Done");
+    assert_eq!(
+        posted(&world).len(),
+        1,
+        "the Linear write is delivered once"
+    );
+
+    std::fs::write(
+        &feed_path,
+        serde_json::to_vec(&crate::supervisor::ReportFeed {
+            schema_version: 1,
+            reports: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    world.restart_ticker();
+    world.settle().await;
+
+    let record = world.record(KEY);
+    assert_eq!(record.postmortem_due, None);
+    assert_eq!(record.postmortem_queued_attempt_id, attempt_id);
+    assert_eq!(world.fake().issue("DATA-1")["state"]["name"], "Done");
+    assert_eq!(
+        posted(&world).len(),
+        1,
+        "replay does not duplicate Linear writes"
+    );
+    assert_eq!(
+        store
+            .pending_report_count(&crate::supervisor::authorized_scopes(&world.config))
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -4597,4 +4687,267 @@ async fn replacing_a_session_clears_old_queued_prompts_and_completed_turn() {
             .text(KEY, "conversation.md")
             .contains("Continue in the new session.")
     );
+}
+
+#[tokio::test]
+async fn supervisor_starts_once_adopts_on_restart_and_replaces_a_changed_profile() {
+    let mut world =
+        World::with(|config| format!("{config}\n\n[supervisor]\nprofile = \"router\"\n"));
+    world.settle().await;
+
+    let store = crate::supervisor::SupervisorStore::new(world.ctx().supervisor_dir());
+    let original = store.record().unwrap();
+    assert_eq!(
+        original.status,
+        crate::supervisor::SupervisorStatus::Idle,
+        "{}\nrequests: {:?}\npanes: {:?}\nstarts: {:?}",
+        world.log_text(),
+        world.herdr.requests(),
+        world.herdr.panes(),
+        world.herdr.starts()
+    );
+    assert_eq!(
+        world.herdr.label(&original.workspace_id).as_deref(),
+        Some("herdr-linear-agent-supervisor")
+    );
+    assert_eq!(
+        world
+            .herdr
+            .requests()
+            .iter()
+            .filter(|request| request.as_str() == "workspace.create")
+            .count(),
+        1
+    );
+    assert_eq!(world.herdr.starts().len(), 1);
+    let original_session_id = world.herdr.starts()[0]
+        .args
+        .windows(2)
+        .find(|args| args[0] == "--session-id")
+        .unwrap()[1]
+        .clone();
+
+    world.restart_ticker();
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        1,
+        "the existing pane is adopted"
+    );
+    assert_eq!(
+        world
+            .herdr
+            .requests()
+            .iter()
+            .filter(|request| request.as_str() == "workspace.create")
+            .count(),
+        1,
+        "an unchanged restart keeps the existing placement"
+    );
+
+    world
+        .herdr
+        .set_status("herdr-linear-agent-supervisor", "working");
+    world.config.supervisor.as_mut().unwrap().profile = "standard".into();
+    world.restart_ticker();
+    world.settle().await;
+    let draining = store.record().unwrap();
+    assert_eq!(
+        draining.status,
+        crate::supervisor::SupervisorStatus::Draining
+    );
+    assert_eq!(draining.workspace_id, original.workspace_id);
+    assert!(
+        world.herdr.closed().is_empty(),
+        "busy supervisor was interrupted"
+    );
+
+    world
+        .herdr
+        .set_status("herdr-linear-agent-supervisor", "idle");
+    world.settle().await;
+    // `settle` observes run and Herdr state, so take another round after the
+    // supervisor-only transition that clears the old placement.
+    world.settle().await;
+    let replacement = store.record().unwrap();
+    assert_eq!(
+        replacement.status,
+        crate::supervisor::SupervisorStatus::Idle,
+        "{}\nrequests: {:?}\npanes: {:?}\nstarts: {:?}",
+        world.log_text(),
+        world.herdr.requests(),
+        world.herdr.panes(),
+        world.herdr.starts()
+    );
+    assert!(replacement.generation > original.generation);
+    assert_ne!(replacement.workspace_id, original.workspace_id);
+    assert_eq!(
+        replacement.cwd, original.cwd,
+        "the managed workspace path is stable"
+    );
+    let new_session_id = world.herdr.starts()[1]
+        .args
+        .windows(2)
+        .find(|args| args[0] == "--session-id")
+        .unwrap()[1]
+        .clone();
+    assert_ne!(new_session_id, original_session_id);
+    assert_eq!(
+        world.herdr.closed(),
+        [crate::herdr::WorkspaceId(original.workspace_id)]
+    );
+    assert_eq!(world.herdr.starts().len(), 2);
+}
+
+#[tokio::test]
+async fn supervisor_adopts_its_saved_workspace_when_snapshot_omits_the_label() {
+    let mut world =
+        World::with(|config| format!("{config}\n\n[supervisor]\nprofile = \"router\"\n"));
+    world.settle().await;
+
+    let store = crate::supervisor::SupervisorStore::new(world.ctx().supervisor_dir());
+    let original = store.record().unwrap();
+    assert_eq!(original.status, crate::supervisor::SupervisorStatus::Idle);
+
+    world.herdr.omit_workspace_labels_in_snapshot();
+    world.restart_ticker();
+    world.settle().await;
+
+    let adopted = store.record().unwrap();
+    assert_eq!(adopted.status, crate::supervisor::SupervisorStatus::Idle);
+    assert_eq!(adopted.workspace_id, original.workspace_id);
+    assert_eq!(adopted.pane_id, original.pane_id);
+    assert_eq!(world.herdr.starts().len(), 1);
+    assert_eq!(
+        world
+            .herdr
+            .requests()
+            .iter()
+            .filter(|request| request.as_str() == "workspace.create")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn supervisor_reserves_an_agent_slot_from_issue_intake() {
+    let mut world = World::with(|config| {
+        format!(
+            "{config}\n\n[limits]\nmax_runs = 3\nmax_agents = 3\n\n[supervisor]\nprofile = \"router\"\n"
+        )
+    });
+    for key in ["DATA-1", "DATA-2", "DATA-3"] {
+        world.delegate(key, &format!("Fix {key}"), Some(2.0));
+    }
+
+    world.settle().await;
+
+    assert_eq!(world.runs(), 2, "the supervisor keeps one slot reserved");
+    assert_eq!(
+        world.herdr.starts().len(),
+        3,
+        "one supervisor and two coordinators start"
+    );
+    assert!(
+        world
+            .herdr
+            .starts()
+            .iter()
+            .any(|start| start.name == "herdr-linear-agent-supervisor")
+    );
+}
+
+#[tokio::test]
+async fn disabling_supervisor_closes_only_its_managed_workspace() {
+    let mut world =
+        World::with(|config| format!("{config}\n\n[supervisor]\nprofile = \"router\"\n"));
+    world.settle().await;
+    let store = crate::supervisor::SupervisorStore::new(world.ctx().supervisor_dir());
+    let original = store.record().unwrap();
+    let scratch = world.herdr.add_pane("/tmp/unmanaged-workspace");
+    world.config.supervisor = None;
+    world.restart_ticker();
+    world.settle().await;
+    world.settle().await;
+
+    let disabled = store.record().unwrap();
+    assert_eq!(
+        disabled.status,
+        crate::supervisor::SupervisorStatus::Disabled
+    );
+    assert!(disabled.workspace_id.is_empty());
+    assert!(disabled.generation > original.generation);
+    assert_eq!(
+        world.herdr.closed(),
+        [crate::herdr::WorkspaceId(original.workspace_id)]
+    );
+    assert!(world.herdr.panes().iter().any(|pane| pane.id == scratch));
+}
+
+#[tokio::test]
+async fn supervisor_waits_for_a_busy_agent_before_waking_for_a_report() {
+    let mut world =
+        World::with(|config| format!("{config}\n\n[supervisor]\nprofile = \"router\"\n"));
+    world.delegate("DATA-99", "Review a completed run", Some(2.0));
+    world.settle().await;
+    let run = world.run("DATA-99");
+    let store = crate::supervisor::SupervisorStore::new(world.ctx().supervisor_dir());
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let issue_id = run.record().unwrap().issue_id;
+    let artifact = crate::postmortem::SavedPostmortem {
+        schema_version: 1,
+        attempt_id: attempt_id.clone(),
+        run_key: run.key.clone(),
+        stage: Some(crate::postmortem::Stage::Final),
+        at: world.now().to_string(),
+        method: "reviewer".into(),
+        method_kind: "claude".into(),
+        picked: "only".into(),
+        version: "test".into(),
+        summary: "The run completed.".into(),
+        labels: Vec::new(),
+        failure: None,
+        supervisor_report: Some(crate::supervisor::SupervisorReport {
+            schema_version: 1,
+            id: crate::supervisor::report_id(&run.key, &attempt_id),
+            source_attempt: attempt_id,
+            source_hash: String::new(),
+            run_key: run.key,
+            issue_id,
+            workspace: "acme".into(),
+            team: "DATA".into(),
+            routing: "default".into(),
+            attribution_complete: true,
+            legacy_source: None,
+            stage: crate::postmortem::Stage::Final,
+            observed_at: world.now().to_string(),
+            outcome: crate::supervisor::ReportOutcome::Success {
+                summary: "The run completed.".into(),
+                labels: Vec::new(),
+            },
+            profiles: Vec::new(),
+            observations: crate::supervisor::RunObservations::default(),
+        }),
+    };
+    store.materialize_report(&artifact).unwrap();
+    let scopes = crate::supervisor::authorized_scopes(&world.config);
+    assert_eq!(store.pending_report_count(&scopes).unwrap(), 1);
+    let supervisor_pane = store.record().unwrap().pane_id;
+
+    world
+        .herdr
+        .set_status("herdr-linear-agent-supervisor", "working");
+    world.settle().await;
+    assert!(world.herdr.prompts_to(&supervisor_pane).is_empty());
+    assert_eq!(store.pending_report_count(&scopes).unwrap(), 1);
+
+    world
+        .herdr
+        .set_status("herdr-linear-agent-supervisor", "idle");
+    world.settle().await;
+    let prompts = world.herdr.prompts_to(&supervisor_pane);
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("generation 1"));
+    world.settle().await;
+    assert_eq!(world.herdr.prompts_to(&supervisor_pane).len(), 1);
 }

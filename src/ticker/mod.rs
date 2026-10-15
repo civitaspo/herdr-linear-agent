@@ -10,6 +10,7 @@ mod postmortems;
 pub mod reconcile;
 #[cfg(test)]
 mod scenarios;
+mod supervisor;
 mod watching;
 #[cfg(test)]
 mod world;
@@ -322,9 +323,9 @@ pub fn unreachable(link: &Link, now: Timestamp) -> bool {
 /// loads starts the tasks again with it, the lock still held.
 pub async fn run(ctx: &Ctx<'_>) -> Result<()> {
     let config_dir = ctx.config_dir();
-    let config = Config::load(&config_dir)?;
-    let fingerprint = Config::fingerprint(&config_dir)?;
     let state_dir = ctx.ensure_state_dir()?;
+    let config = Config::load_with_state_dir(&config_dir, &state_dir)?;
+    let fingerprint = Config::fingerprint(&config_dir)?;
     let _lock = acquire(&state_dir).await?;
     let _ = std::fs::remove_file(stop_path(&state_dir));
     let log = Arc::new(Log::new(log_path(&state_dir)));
@@ -417,7 +418,10 @@ async fn watch_config(
     loop {
         tokio::time::sleep(poll).await;
         if std::fs::remove_file(reload_path(state_dir)).is_ok() {
-            match (Config::load(config_dir), Config::fingerprint(config_dir)) {
+            match (
+                Config::load_with_state_dir(config_dir, state_dir),
+                Config::fingerprint(config_dir),
+            ) {
                 (Ok(config), Ok(now)) => return (Box::new(config), now),
                 (Err(error), _) | (_, Err(error)) => {
                     log.line(&format!("config reload failed: {error:#}"));
@@ -433,7 +437,7 @@ async fn watch_config(
             continue;
         }
         told = now;
-        let body = match Config::load(config_dir) {
+        let body = match Config::load_with_state_dir(config_dir, state_dir) {
             Ok(_) if now == fingerprint => continue,
             Ok(_) => {
                 log.line("config changed; run the reload action to apply it");

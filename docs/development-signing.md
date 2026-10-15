@@ -5,7 +5,7 @@ macOS with real Linear credentials. It is optional for development and avoids
 repeated Keychain authorization when the executable changes.
 
 Users installing published releases do not need to create a certificate,
-install Xcode, or run `build-dev`. They still authorize the plugin's normal
+install Xcode, or run `build-development`. They still authorize the plugin's normal
 Keychain access when macOS asks. Lint and tests use no production credentials
 and need no signing identity. Linux uses Secret Service instead of this setup.
 
@@ -109,11 +109,11 @@ In the development checkout, set the identity for your shell session:
 
 ```sh
 export HLA_SIGN_IDENTITY="Apple Development: YOUR_ACCOUNT (IDENTITY_SUFFIX)"
-mise run build-dev
+mise run build-development
 ```
 
 Using the SHA-1 hash instead of the name selects one identity when names are
-ambiguous. `build-dev` requires this variable and fails if it is unset.
+ambiguous. `build-development` requires this variable and fails if it is unset.
 
 The task builds the release binary, signs it with the fixed identifier
 `dev.herdr-linear-agent`, and verifies the signature. Its output is
@@ -121,7 +121,7 @@ The task builds the release binary, signs it with the fixed identifier
 the checkout you use for development; it does not install the result into
 another Herdr plugin checkout or restart a ticker.
 
-Use `build-dev` after source changes when running against real credentials.
+Use `build-development` after source changes when running against real credentials.
 The ordinary `mise run build` creates a debug binary without this local
 signature. `scripts/install.sh` downloads a published release or builds from
 source and does not apply your development signature.
@@ -169,7 +169,7 @@ contents:
 
 ```sh
 touch build.rs
-mise run build-dev
+mise run build-development
 codesign -dv --verbose=4 target/release/herdr-linear-agent 2>&1
 codesign -d -r- target/release/herdr-linear-agent
 target/release/herdr-linear-agent action doctor
