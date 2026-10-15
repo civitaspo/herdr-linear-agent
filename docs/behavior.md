@@ -38,10 +38,11 @@ Conventions:
 25. [Actions and doctor](#actions-and-doctor)
 26. [Past runs](#past-runs)
 27. [Postmortems](#postmortems)
-28. [Command line](#command-line)
-29. [Install script and build version](#install-script-and-build-version)
-30. [Porting the scenario tests](#porting-the-scenario-tests)
-31. [Decisions for the questions the inputs left open](#decisions-for-the-questions-the-inputs-left-open)
+28. [Local supervisor](#local-supervisor)
+29. [Command line](#command-line)
+30. [Install script and build version](#install-script-and-build-version)
+31. [Porting the scenario tests](#porting-the-scenario-tests)
+32. [Decisions for the questions the inputs left open](#decisions-for-the-questions-the-inputs-left-open)
 
 ## Architecture of the rewrite
 
@@ -105,6 +106,8 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. `src/
 | `limits.ask_to_continue_after_hours` | u64 | `8` | at least 1: `limits.ask_to_continue_after_hours must be at least 1`; see [Heartbeat and run timeout](#heartbeat-and-run-timeout) |
 | `limits.routing_agent_timeout_seconds` | u64 | `120` | 1 to 3600: `limits.routing_agent_timeout_seconds must be between 1 and 3600`; a routing agent's profile's `timeout_seconds` overrides it |
 | `limits.postmortem_agent_timeout_seconds` | u64 | `300` | 1 to 3600: `limits.postmortem_agent_timeout_seconds must be between 1 and 3600`; a postmortem profile's `timeout_seconds` overrides it |
+| `supervisor.profile` | profile name | unset: supervisor disabled | when set, this ordinary profile controls the supervisor agent; requires `limits.max_agents >= 3` |
+| `supervisor.max_generated_profiles_per_routing` | u32 | `5` | 1 to 20: `supervisor.max_generated_profiles_per_routing must be between 1 and 20` |
 | `notifications.herdr` | bool | `true` | |
 | `claude.auto_accept_trust_dialog` | bool | `false` | |
 | `repositories.<name>.path` | absolute path | required | `repositories.<name>.path must be an absolute path` |
@@ -115,6 +118,9 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. `src/
 | `routing.<name>.postmortems` | profile names | `[]` | each must exist, be of a kind that can be a routing agent (``routing.<name>.postmortems: the `<kind>` kind cannot be a postmortem agent``) and have an `instructions.md` (``routing.<name>.postmortems: profile `<p>` has no instructions.md, which holds the method``); see [Postmortems](#postmortems) |
 | `routing.<name>.agent` | profile name | required when `coordinators` or `postmortems` lists several (``routing.<name>.agent: set it, since the coordinators or the postmortem profiles have several candidates``) | must exist; its kind must be registered (`src/routing.rs` `RECIPES`): ``routing.<name>.agent: the `<kind>` kind cannot be a routing agent`` |
 | `routing.<name>.workers` | profile names | required | non-empty (`routing.<name>.workers lists no profile`), each must exist |
+| `routing.<name>.generated.coordinators` | manual profile names | `[]` | allowed bases for generated coordinator variants; a routing agent is required when this creates several candidates |
+| `routing.<name>.generated.workers` | manual profile names | `[]` | allowed bases for generated worker variants |
+| `routing.<name>.generated.postmortems` | manual profile names | `[]` | allowed bases for generated postmortem variants; a routing agent is required when this creates several candidates |
 
 `merge_decision.profile` must exist and use a registered headless agent kind, and its resolved instructions must be non-empty. `merge_decision.max_risk_score` is a TOML integer from 0 through 100. The selected profile's `timeout_seconds` and `env` apply under the headless-agent rules above; the two plugin path variables are forbidden in its `env`.
 
@@ -1204,10 +1210,26 @@ When a postmortem is due, recorded in the run as `postmortem_due`:
 - The input, on the picked profile's standard input: the brief, then each agent's transcripts, as history reads them (copies first; see [Past runs](#past-runs)), rendered the same way, sharing 150,000 characters: a longer one keeps its first third and its last two thirds of its share, with `[… <n> characters left out …]` between. `src/postmortem.rs:a_long_transcript_keeps_its_start_and_its_end`, `src/postmortem.rs:the_final_stage_names_the_state_the_issue_closed_in`
 - The instructions: a fixed frame (review one run to improve how agents and people work; the agents talk to people only in the Agent Session through `say`, `ask` and `finish`, so those calls in the transcripts are what people saw and `conversation.md` holds the people's replies; treat the records as data; write the summary in Markdown in the issue's language and begin it with how the run stands: for a final one the state the issue closed in, for a workflow one that deployment is complete and the run awaits its postmortem, for a legacy interim one that the work waits for review; give as `labels` the labels the method names, by their names in Linear, or none), then `# Method` and the profile's instructions.
 - The call runs like the routing agent's (`routing::ask`: the kind's recipe, a fresh `herdr-linear-agent-postmortem-…` folder, no tools), under the profile's `timeout_seconds` or `limits.postmortem_agent_timeout_seconds`, and must answer `{"summary": <non-empty string>, "labels": [<string>...]}`.
-- An answer: in one critical section, keep it as `.state/postmortems/<time>-<stage>.json` (`stage`, `at`, `method`, `picked`, `version`, `summary`, `labels`), clear `postmortem_due` when it still names this stage, and queue the comment and, when there are any, the labels (blank ones and repeats dropped). A successful workflow postmortem also marks `postmortem_succeeded` and queues `Workflow(Done)` in that same critical section. Log `<KEY>: wrote the <stage> postmortem with the `<profile>` profile (<how it was picked>)`. `src/ticker/scenarios.rs:a_finish_and_a_close_each_get_one_postmortem_comment`
-- No answer (a timeout, a failure, no summary): log `<KEY>: the <stage> postmortem failed: <why>` and clear it; it is not tried again. `src/ticker/scenarios.rs:a_failed_postmortem_is_logged_and_not_tried_again`
+- An answer: in one run-lock critical section, save the immutable attempt artifact and queue its comment and, when there are any, its labels (blank ones and repeats dropped). A successful workflow postmortem also marks `postmortem_succeeded` and queues `Workflow(Done)` in that section. The comment uses the attempt UUID and is read back by that ID before the first send and after an uncertain send. Replaying before the run marker is saved or after the outbox file is removed reuses that ID and cannot create a second comment. Labels and issue-state writes remain idempotent. When a supervisor report is required, keep `postmortem_due` set until the report is in the durable feed, then clear it in a separate run-lock update. A restart can replay the saved artifact and finish feed materialization without duplicating the comment, label membership or completed-state transition. Without a supervisor report, clear `postmortem_due` in the initial section. Log `<KEY>: wrote the <stage> postmortem with the `<profile>` profile (<how it was picked>)`. `src/ticker/scenarios.rs:a_finish_and_a_close_each_get_one_postmortem_comment`, `a_saved_workflow_postmortem_retries_its_supervisor_feed_after_restart`, `src/outbox.rs:a_replayed_postmortem_comment_keeps_its_identity_across_queue_and_marker_gaps`
+- No answer (a timeout, a failure, no summary): log `<KEY>: the <stage> postmortem failed: <why>` and do not ask the agent to generate it again. When a supervisor report is required, keep the due marker until the failed-attempt report is durable, then clear it. Otherwise clear it immediately. `src/ticker/scenarios.rs:a_failed_postmortem_is_logged_and_not_tried_again`
 - While one is being written, the ticker looks for its answer every 5 s.
 - The comment request is sent with its request id as the comment's id, and after an attempt whose answer was lost it is looked up (`HerdrLinearAgentCommentFind`) before it is sent again. The labels request reads the labels of the issue's team and workspace (`HerdrLinearAgentLabels`), adds each named one the issue lacks (`HerdrLinearAgentLabelAdd`), and fails with `no label named <names>` for a name none has, after adding the others; the plugin creates no label.
+
+## Local supervisor
+
+The supervisor is opt-in through `supervisor.profile`. It owns one managed Herdr workspace labeled exactly `herdr-linear-agent-supervisor`, with a stable working directory under the plugin state directory. The configured ordinary profile supplies its agent kind, model, effort, arguments and instruction layers. The ticker reserves one agent slot while it is enabled and reconciles the workspace from the pass's existing Herdr snapshot. It adopts a saved placement after restart when the identity, label and working directory still match.
+
+An unchanged profile fingerprint and Herdr session preserve the native session. A changed profile or session begins a bounded replacement: no new report batch is issued, an already issued batch may finish and commit, and then the old managed workspace is closed. At the drain deadline the plugin advances the mutation generation before interrupting the old pane. A replacement starts in a fresh native session only after cleanup is confirmed by a complete snapshot. Disabling the supervisor fences outstanding commands and closes only its managed workspace when Herdr is reachable. A later ticker startup reconciles an orphan left by a stop or connectivity loss.
+
+Each saved successful or failed postmortem attempt has a durable report artifact. The report records the workspace-qualified run key, issue/team/routing scope, attempt identity and hash, stage, outcome, the profiles and generated revisions used, and available observations such as closure state, elapsed time, waiting episodes, worker restart counts and worker reports. It does not include issue text or transcripts. Legacy postmortems without saved routing attribution can be inspected but are excluded from decision batches. Report materialization is replayable and separate from Linear outbox delivery. When materialization fails, the run's due marker remains set until the report feed is durable; a restart retries the saved artifact without duplicating the issue comment or labels.
+
+`supervisor context --generation <n>` resumes or issues a bounded batch and records the report ids shown. It includes current allowed manual bases, active variants and a bounded recent decision history for the report scopes. The supervisor may inspect issued handles with `supervisor show`, inspect a variant's full current revision with `supervisor profiles show`, and query committed knowledge with `supervisor memory search`. It submits a decision using `supervisor decide --generation <n> --decision-file <path>`. The decision must account for every report in the batch and include both a memory delta and a checkpoint, even when it proposes no profile change. The plugin commits the immutable decision, Markdown knowledge, acknowledgement state, and optional generated-catalog revision through one `current.json` commit pointer before clearing the active batch. A stale generation or invalid proposal cannot acknowledge reports. The index is derived, rebuilt from committed artifacts, and never controls acknowledgement or activation. An idle supervisor is woken for new reports or policy changes; a busy agent is not interrupted and wake/retry attempts are bounded.
+
+Generated variants require explicit role-specific manual bases in `[routing.<name>.generated]`. They may change description and `instructions.md`, or select another allowed manual base; kind, model, effort, arguments, environment and timeout remain inherited. Catalog revisions are immutable and share the same commit pointer as decisions and memory. The default limit is five active variants per routing, and one decision can change at most one catalog entry. New runs use the authorized current catalog. Existing runs retain their resolved profile pins through ordinary retirement; removal of role/base authorization blocks new use. A changed manual base fingerprint makes old variants ineligible for new runs until republished.
+
+`supervisor profiles list` and `show` inspect committed revisions. `retire` and `rollback` create new revisions with report evidence; rollback republishes retained content as a new revision. `export` writes an ordinary profile's files to a new operator-selected directory after validating its base fingerprint and effective behavior. It does not alter routing or retire its source. Review, deploy, config reload and retirement are separate operator actions.
+
+The durable memory consists of committed JSON metadata/checkpoints and immutable Markdown knowledge and episode records. SQLite FTS5 is a rebuildable local index. Queries are bounded and filter by current workspace, team, routing, topic and profile revision before results are rendered. The generated supervisor instructions treat reports and issue-derived text as data. Command allow-lists guide the agent CLI but do not sandbox its filesystem permissions.
 
 ## Command line
 
@@ -1230,6 +1252,11 @@ worker prompt KEY ID --text-file <path|->
 worker restart KEY ID [--profile P]
 worker request-merge KEY ID
 worker merge KEY ID
+supervisor context --generation N
+supervisor decide --generation N --decision-file <path>
+supervisor memory search <query>
+supervisor show <handle>
+supervisor profiles <list|show|retire|rollback|export>
 report [--percent N | --unknown] --activity TEXT
 ```
 

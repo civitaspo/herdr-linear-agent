@@ -137,6 +137,30 @@ pub fn write_held(
 /// item in either inbox directory is already delivered; conflicting content
 /// is surfaced and never overwritten.
 pub fn write_once_held(run: &Run, _lock: &crate::run::RunLock, item: &Item) -> Result<()> {
+    write_item_once_held(run, item, true)
+}
+
+/// Writes one stable item, returning the existing item on an exact replay.
+pub fn write_once_fields_held(
+    run: &Run,
+    _lock: &crate::run::RunLock,
+    id: &str,
+    kind: &str,
+    subject: &str,
+    summary: &str,
+) -> Result<String> {
+    let item = Item {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        subject: subject.to_string(),
+        created: files::now(),
+        summary: summary.to_string(),
+    };
+    write_item_once_held(run, &item, false)?;
+    Ok(id.to_string())
+}
+
+fn write_item_once_held(run: &Run, item: &Item, compare_created: bool) -> Result<()> {
     check_id(&item.id)?;
     for dir in [&inbox_dir(run), &done_dir(run)] {
         let path = item_path(dir, &item.id);
@@ -149,7 +173,12 @@ pub fn write_once_held(run: &Run, _lock: &crate::run::RunLock, item: &Item) -> R
                     .with_context(|| format!("could not read {}", path.display()))?;
                 let existing = parse(&text)
                     .with_context(|| format!("{} is not a valid inbox item", path.display()))?;
-                if existing != *item {
+                let matches = existing.id == item.id
+                    && existing.kind == item.kind
+                    && existing.subject == item.subject
+                    && existing.summary == item.summary
+                    && (!compare_created || existing.created == item.created);
+                if !matches {
                     bail!("{} conflicts with the decision receipt", path.display());
                 }
                 return Ok(());
@@ -419,6 +448,31 @@ summary = \"w1 (testing) is idle without a report; check its pane wH:p1.\"
         assert_eq!(items[0].subject, "w1");
         assert_eq!(items[1].summary, "A new reply.");
         assert!(run.dir.join(format!("inbox/{first}.md")).is_file());
+    }
+
+    #[test]
+    fn stable_items_are_idempotent_and_reject_conflicting_replays() {
+        let (_home, run) = run();
+        let lock = run.lock().unwrap();
+        let id = "postmortem-failure-00000000-0000-4000-8000-000000000001";
+        assert_eq!(
+            write_once_fields_held(&run, &lock, id, "postmortem", "failure", "failed").unwrap(),
+            id
+        );
+        assert_eq!(
+            write_once_fields_held(&run, &lock, id, "postmortem", "failure", "failed").unwrap(),
+            id
+        );
+        assert_eq!(ids(&unhandled(&run)), [id]);
+        assert!(
+            write_once_fields_held(&run, &lock, id, "postmortem", "failure", "changed").is_err()
+        );
+        drop(lock);
+
+        done(&run, &[id.into()], false).unwrap();
+        let lock = run.lock().unwrap();
+        write_once_fields_held(&run, &lock, id, "postmortem", "failure", "failed").unwrap();
+        assert!(unhandled(&run).is_empty());
     }
 
     #[test]

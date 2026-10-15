@@ -195,7 +195,7 @@ async fn login_workspace(
 /// starts its tasks over and reads the credentials again; without a running
 /// ticker, starts one, which loads it anyway.
 async fn reload(ctx: &Ctx<'_>) -> Result<String> {
-    Config::load(&ctx.config_dir())?;
+    Config::load_with_state_dir(&ctx.config_dir(), &ctx.state_dir())?;
     let state_dir = ctx.state_dir();
     if matches!(ticker::lock_state(&state_dir), ticker::LockState::Free) {
         ticker::start(ctx).await?;
@@ -268,7 +268,86 @@ pub fn status_text(ctx: &Ctx) -> String {
             run.key, record.status
         ));
     }
+    let config = Config::load_with_state_dir(&ctx.config_dir(), &ctx.state_dir()).ok();
+    if let Some(error) = config
+        .as_ref()
+        .and_then(|config| config.generated_catalog_error.as_deref())
+    {
+        lines.push(format!("generated profile catalog needs repair: {error}"));
+    }
+    if let Some(summary) = supervisor_summary(ctx, config.as_ref()) {
+        lines.push(summary.text);
+    }
     lines.join("\n")
+}
+
+#[derive(Debug)]
+struct SupervisorSummary {
+    text: String,
+    unhealthy: bool,
+}
+
+fn supervisor_summary(ctx: &Ctx<'_>, config: Option<&Config>) -> Option<SupervisorSummary> {
+    let store = crate::supervisor::SupervisorStore::new(ctx.supervisor_dir());
+    if !store.root().join("current.json").exists() {
+        return config
+            .is_some_and(|config| config.supervisor.is_some())
+            .then(|| SupervisorSummary {
+                text: "supervisor is configured and has not started".into(),
+                unhealthy: false,
+            });
+    }
+
+    let (record, commit) = match (store.record(), store.current()) {
+        (Ok(record), Ok(commit)) => (record, commit),
+        (Err(error), _) | (_, Err(error)) => {
+            return Some(SupervisorSummary {
+                text: format!("supervisor state needs repair: {error:#}"),
+                unhealthy: true,
+            });
+        }
+    };
+    let mut details = vec![format!(
+        "supervisor {:?}, generation {}, memory {}, catalog {}",
+        record.status, record.generation, commit.memory_generation, commit.catalog_generation
+    )];
+    let mut unhealthy = record.status == crate::supervisor::SupervisorStatus::Blocked
+        || !record.error.trim().is_empty();
+    if let Some(config) = config {
+        match store.pending_report_count(&crate::supervisor::authorized_scopes(config)) {
+            Ok(count) => details.push(format!("{count} unacknowledged report(s)")),
+            Err(error) => {
+                details.push(format!("report status unavailable: {error:#}"));
+                unhealthy = true;
+            }
+        }
+    }
+    if record.report_repair_pending {
+        details.push(format!(
+            "report feed repair in progress from `{}`",
+            record.report_repair_cursor
+        ));
+    }
+    if let Some(pending) = &record.pending_replacement {
+        details.push(format!(
+            "replacement deadline {}, target profile `{}` in session `{}` ({})",
+            pending.deadline,
+            pending.profile,
+            if pending.herdr_session.is_empty() {
+                "default"
+            } else {
+                &pending.herdr_session
+            },
+            pending.reason
+        ));
+    }
+    if !record.error.trim().is_empty() {
+        details.push(format!("recovery: {}", record.error));
+    }
+    Some(SupervisorSummary {
+        text: details.join(", "),
+        unhealthy,
+    })
 }
 
 async fn pause(ctx: &Ctx<'_>, paused: bool) -> Result<String> {
@@ -419,7 +498,7 @@ async fn linear_budget(
 async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
     let mut ok = Vec::new();
     let mut problems = Vec::new();
-    let config = Config::load(&ctx.config_dir());
+    let config = Config::load_with_state_dir(&ctx.config_dir(), &ctx.state_dir());
     // Without a config this is the default session.
     let session = config.as_ref().ok().and_then(|c| c.herdr.session.clone());
     let socket = herdr::session_socket(&ctx.env.herdr_bin(), session.as_deref()).await;
@@ -451,6 +530,14 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
         }
     };
     if let Some(config) = &config {
+        if let Some(error) = &config.generated_catalog_error {
+            problems.push(format!("generated profile catalog: {error}"));
+        } else if !config.generated_candidates.is_empty() {
+            ok.push(format!(
+                "generated profile catalog {} routing candidate set(s)",
+                config.generated_candidates.len()
+            ));
+        }
         match (&socket, &version) {
             (Err(error), _) => problems.push(format!("{error:#}")),
             (Ok(_), Some(_)) => ok.push(format!(
@@ -511,6 +598,13 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
             ));
         }
     }
+    if let Some(summary) = supervisor_summary(ctx, config.as_ref()) {
+        if summary.unhealthy {
+            problems.push(summary.text);
+        } else {
+            ok.push(summary.text);
+        }
+    }
     match ticker::lock_state(&ctx.state_dir()) {
         ticker::LockState::Held(info) if info.version == crate::VERSION => {
             ok.push("ticker running".into())
@@ -547,6 +641,65 @@ mod tests {
     use crate::paths::Env;
     use crate::process::fake::FakeRunner;
     use crate::run::RunRecord;
+
+    #[test]
+    fn supervisor_status_exposes_replacement_recovery_and_catalog_versions() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        ctx.ensure_state_dir().unwrap();
+        let store = crate::supervisor::SupervisorStore::new(ctx.supervisor_dir());
+        store
+            .initialize("router", "fingerprint", "session", "policy")
+            .unwrap();
+        store
+            .update_record(|record| {
+                record.status = crate::supervisor::SupervisorStatus::Draining;
+                record.report_repair_pending = true;
+                record.report_repair_cursor = "acme/DATA-1".into();
+                record.pending_replacement = Some(crate::supervisor::PendingReplacement {
+                    enabled: true,
+                    profile: "router-v2".into(),
+                    fingerprint: "next-fingerprint".into(),
+                    herdr_session: "next-session".into(),
+                    policy_revision: "next-policy".into(),
+                    deadline: "2030-01-01T00:00:00Z".into(),
+                    reason: "profile changed".into(),
+                });
+            })
+            .unwrap();
+
+        let summary = supervisor_summary(&ctx, None).unwrap();
+        assert!(summary.text.contains("supervisor Draining"));
+        assert!(summary.text.contains("memory 0, catalog 0"));
+        assert!(summary.text.contains("report feed repair in progress"));
+        assert!(
+            summary
+                .text
+                .contains("replacement deadline 2030-01-01T00:00:00Z")
+        );
+        assert!(!summary.unhealthy);
+
+        store
+            .update_record(|record| {
+                record.status = crate::supervisor::SupervisorStatus::Blocked;
+                record.error = "supervisor agent did not start".into();
+            })
+            .unwrap();
+        let summary = supervisor_summary(&ctx, None).unwrap();
+        assert!(summary.unhealthy);
+        assert!(
+            summary
+                .text
+                .contains("recovery: supervisor agent did not start")
+        );
+        assert!(status_text(&ctx).contains("supervisor Blocked"));
+    }
 
     #[test]
     fn issue_urls_give_their_organization_and_key() {

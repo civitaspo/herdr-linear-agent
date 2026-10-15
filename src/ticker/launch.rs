@@ -12,6 +12,7 @@ use super::reconcile::{
 use crate::config::Config;
 use crate::herdr::{Herdr, HerdrError, PaneId, Placed, Snapshot};
 use crate::run::{AgentRecord, AgentStatus, Run, RunRecord, Status};
+use crate::supervisor::{Scope as SupervisorScope, SupervisorStore};
 use crate::{agents, claude_trust, coordinator, worker};
 
 /// The session a start begins: the recorded one for a resume, a new id the
@@ -457,6 +458,11 @@ impl Reconciler {
         {
             return Ok(());
         }
+        if !generated_profile_allowed(d, &run_state, agent, key.worker.is_some(), false)? {
+            block_revoked_profile(&current_run, key)?;
+            d.log.line(&format!("{}: blocked a pinned generated profile after its routing authorization was revoked", key.run));
+            return Ok(());
+        }
         if let Some(id) = &key.worker {
             let w = worker::load(&current_run, id)?;
             if w.restarting
@@ -862,9 +868,21 @@ impl Reconciler {
         }
         // Recorded before the start goes out, so a session begun by a start
         // whose answer is lost is still known.
+        let run = Run::load(&d.ctx.runs_dir(), &key.run)?;
+        let run_record = run.record()?;
+        if !generated_profile_allowed(
+            d,
+            &run_record,
+            agent,
+            key.worker.is_some(),
+            agent.started_at.is_empty() && !agent.resume,
+        )? {
+            block_revoked_profile(&run, key)?;
+            d.log.line(&format!("{}: blocked a pinned generated profile after its routing authorization was revoked", key.run));
+            return Ok(true);
+        }
         let session = start_session(agent);
         let args = start_args(d.config, agent, &session)?;
-        let run = Run::load(&d.ctx.runs_dir(), &key.run)?;
         let at = now.to_string();
         let set = |a: &mut AgentRecord| {
             a.agent_session = session.clone();
@@ -977,4 +995,59 @@ impl Reconciler {
         })
         .await
     }
+}
+
+fn generated_profile_allowed<H>(
+    d: &Deps<'_, H>,
+    run: &RunRecord,
+    agent: &AgentRecord,
+    worker: bool,
+    require_active: bool,
+) -> Result<bool> {
+    if !agent.profile.starts_with("generated-") {
+        return Ok(true);
+    }
+    let scope = SupervisorScope {
+        workspace: run.workspace.clone(),
+        team: run.team_key.clone(),
+        routing: d
+            .config
+            .team(&run.workspace, &run.team_key)?
+            .routing
+            .clone(),
+    };
+    SupervisorStore::new(d.ctx.supervisor_dir()).profile_is_authorized(
+        d.config,
+        &agent.profile,
+        &scope,
+        if worker {
+            crate::config::GeneratedRole::Worker
+        } else {
+            crate::config::GeneratedRole::Coordinator
+        },
+        require_active,
+    )
+}
+
+fn block_revoked_profile(run: &Run, key: &AgentKey) -> Result<()> {
+    let message = "generated profile base is no longer authorized for this routing";
+    match &key.worker {
+        None => {
+            run.update(|record| {
+                record.coordinator.status = AgentStatus::Failed;
+                record.coordinator.prompt_pending = false;
+                record.coordinator.recovery = crate::run::Recovery::None;
+                record.coordinator.error = message.into();
+            })?;
+        }
+        Some(id) => {
+            worker::update(run, id, |worker| {
+                worker.agent.status = AgentStatus::Failed;
+                worker.agent.prompt_pending = false;
+                worker.agent.recovery = crate::run::Recovery::None;
+                worker.agent.error = message.into();
+            })?;
+        }
+    };
+    Ok(())
 }

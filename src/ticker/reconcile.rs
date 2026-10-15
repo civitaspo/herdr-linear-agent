@@ -229,6 +229,7 @@ pub struct Reconciler {
         String,
         (
             crate::postmortem::Stage,
+            String,
             tokio::task::JoinHandle<super::postmortems::Written>,
         ),
     >,
@@ -395,7 +396,7 @@ impl Reconciler {
     #[cfg(test)]
     pub async fn copies_done(&self) {
         while self.keeping.iter().any(|h| !h.is_finished())
-            || self.writing.values().any(|(_, h)| !h.is_finished())
+            || self.writing.values().any(|(_, _, h)| !h.is_finished())
         {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
@@ -520,6 +521,7 @@ impl Reconciler {
         self.postmortems(d, now).await;
         let snapshot = d.herdr.snapshot().await.ok();
         let snap = snapshot.as_ref();
+        self.supervisor(d, snap, now).await;
         if let Some(snapshot) = snap {
             for pane in snapshot.panes.keys() {
                 self.seen_panes.insert(pane.0.clone());
@@ -861,6 +863,8 @@ pub async fn run<H: Herdr + Clone + 'static>(mut inputs: Inputs<'_, H>) -> Resul
     let mut reconciler = Reconciler::new(effects_tx, routing_tx)
         .context("the reconciler could not find its binary")?;
     let mut deadline = tokio::time::Instant::now();
+    let mut runtime_config = inputs.config.clone();
+    let mut catalog_load_error: Option<String> = None;
     loop {
         let mut wake = Wake::default();
         tokio::select! {
@@ -900,9 +904,53 @@ pub async fn run<H: Herdr + Clone + 'static>(mut inputs: Inputs<'_, H>) -> Resul
         let current = inputs.level.borrow_and_update().clone();
         let now = (inputs.clock)();
         let socket = inputs.socket.borrow().clone();
+        let store =
+            crate::supervisor::SupervisorStore::new(inputs.ctx.state_dir().join("supervisor"));
+        match store.catalog_generation_hint() {
+            Ok(generation) if generation != runtime_config.generated_catalog_generation => {
+                match Config::load_with_state_dir(&inputs.ctx.config_dir(), &inputs.ctx.state_dir())
+                {
+                    Ok(config) => {
+                        if let Some(error) = &config.generated_catalog_error {
+                            if catalog_load_error.as_deref() != Some(error) {
+                                inputs.log.line(&format!(
+                                    "generated profile catalog unavailable: {error}"
+                                ));
+                            }
+                            catalog_load_error = Some(error.clone());
+                        } else {
+                            if catalog_load_error.is_some() {
+                                inputs.log.line("generated profile catalog reloaded");
+                            }
+                            catalog_load_error = None;
+                        }
+                        runtime_config = config;
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if catalog_load_error.as_deref() != Some(&message) {
+                            inputs.log.line(&format!(
+                                "generated profile catalog refresh failed: {message}"
+                            ));
+                        }
+                        catalog_load_error = Some(message);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!("{error:#}");
+                if catalog_load_error.as_deref() != Some(&message) {
+                    inputs.log.line(&format!(
+                        "generated profile catalog generation could not be read: {message}"
+                    ));
+                }
+                catalog_load_error = Some(message);
+            }
+        }
         let deps = Deps {
             ctx: inputs.ctx,
-            config: inputs.config,
+            config: &runtime_config,
             herdr: &inputs.herdr,
             socket: &socket,
             log: &inputs.log,

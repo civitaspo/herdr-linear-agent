@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::config::{Config, Limits, Repository};
 use crate::coordinator::{self, View};
@@ -16,6 +16,7 @@ use crate::outbox::{self, Op, StateTarget};
 use crate::paths::Ctx;
 use crate::process::{Cmd, Runner};
 use crate::run::{AgentStatus, Run, RunRecord, Status};
+use crate::supervisor::{self, DecisionProposal, SupervisorStore};
 use crate::worker::{
     self, DecisionRequest, Group, MergeAttempt, MergeAuthorization, MergeDecisionState, Worker,
 };
@@ -24,6 +25,232 @@ use crate::{files, inbox, names, ticker};
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const UNREACHABLE: &str = "the configured Herdr session is not reachable";
+
+fn supervisor_state(ctx: &Ctx<'_>) -> Result<(Config, SupervisorStore)> {
+    let config = Config::load_with_state_dir(&ctx.config_dir(), &ctx.state_dir())?;
+    if config.supervisor.is_none() {
+        bail!("[supervisor] is not configured");
+    }
+    let store = SupervisorStore::new(ctx.supervisor_dir());
+    Ok((config, store))
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+pub fn supervisor_context(ctx: &Ctx<'_>, generation: u64) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let policy = supervisor::policy_revision(&config)?;
+    if store.repair_reports(100)? {
+        bail!("supervisor report recovery is still in progress; request context again shortly");
+    }
+    let context = store.context(
+        generation,
+        &policy,
+        &supervisor::authorized_scopes(&config),
+        &supervisor::authorized_profile_policies(&config)?,
+        &files::now(),
+    )?;
+    print_json(&context)
+}
+
+pub fn supervisor_decide(ctx: &Ctx<'_>, generation: u64, text: &str) -> Result<()> {
+    if text.len() > 64_000 {
+        bail!("decision proposal exceeds 64000 bytes");
+    }
+    let proposal: DecisionProposal = serde_json::from_str(text)
+        .context("decision file is not a valid supervisor decision proposal")?;
+    let (config, store) = supervisor_state(ctx)?;
+    let policy = supervisor::policy_revision(&config)?;
+    let mut receipt = store.decide(
+        generation,
+        &policy,
+        &supervisor::authorized_scopes(&config),
+        &config,
+        proposal,
+    )?;
+    receipt.projections_pending = store.rebuild_memory_index().is_err();
+    ticker::poke(&ctx.state_dir());
+    print_json(&receipt)
+}
+
+pub fn supervisor_memory_search(ctx: &Ctx<'_>, query: &str) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let scopes = supervisor::authorized_scopes(&config);
+    let results = match store.search_memory(&scopes, query, 20) {
+        Ok(results) => results,
+        Err(_) => {
+            store.rebuild_memory_index()?;
+            store.search_memory(&scopes, query, 20)?
+        }
+    };
+    print_json(&results)
+}
+
+pub fn supervisor_show(ctx: &Ctx<'_>, handle: &str) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let scopes = supervisor::authorized_scopes(&config);
+    if let Some(id) = handle.strip_prefix("report:") {
+        return print_json(&store.report_in_scopes(id, &scopes)?);
+    }
+    if let Some(id) = handle.strip_prefix("decision:") {
+        return print_json(&store.decision_in_scopes(id, &scopes)?);
+    }
+    if let Some(topic) = handle.strip_prefix("topic:") {
+        let (id, revision) = match topic.rsplit_once('@') {
+            Some((id, revision)) => (
+                id,
+                Some(
+                    revision
+                        .parse::<u64>()
+                        .context("topic revision must be an integer")?,
+                ),
+            ),
+            None => (topic, None),
+        };
+        let (metadata, content) = store.topic(id, revision)?;
+        if !scopes.contains(&metadata.scope) {
+            bail!("knowledge topic is outside the current authorization scope");
+        }
+        return print_json(&serde_json::json!({ "metadata": metadata, "content_md": content }));
+    }
+    bail!("unknown supervisor handle; use report:<id>, decision:<id> or topic:<id>@<revision>")
+}
+
+pub fn supervisor_profiles_list(ctx: &Ctx<'_>) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let scopes = supervisor::authorized_scopes(&config);
+    let catalog = store
+        .profile_catalog()?
+        .into_iter()
+        .filter(|entry| scopes.contains(&entry.revision.scope))
+        .collect::<Vec<_>>();
+    print_json(&catalog)
+}
+
+pub fn supervisor_profiles_show(
+    ctx: &Ctx<'_>,
+    id: &str,
+    requested_revision: Option<u64>,
+) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let scopes = supervisor::authorized_scopes(&config);
+    let entry = store
+        .profile_catalog()?
+        .into_iter()
+        .filter(|entry| entry.revision.id == id)
+        .filter(|entry| {
+            requested_revision.is_none_or(|revision| entry.revision.revision == revision)
+        })
+        .max_by_key(|entry| entry.revision.revision)
+        .context("generated profile revision does not exist")?;
+    if !scopes.contains(&entry.revision.scope) {
+        bail!("generated profile is outside the current authorization scope");
+    }
+    print_json(&entry)
+}
+
+pub fn supervisor_profiles_retire(
+    ctx: &Ctx<'_>,
+    id: &str,
+    expected_revision: u64,
+    reason: &str,
+    source_report_ids: &[String],
+) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let entry = store
+        .profile_catalog()?
+        .into_iter()
+        .find(|entry| entry.revision.id == id && entry.current)
+        .context("generated profile does not exist in the current catalog")?;
+    if entry.revision.revision != expected_revision {
+        bail!(
+            "generated profile is at revision {}; refresh the catalog before retiring it",
+            entry.revision.revision
+        );
+    }
+    let receipt = store.operator_profile_change(
+        &config,
+        supervisor::ProfileChange::Retire {
+            id: id.into(),
+            expected_revision,
+            reason: reason.into(),
+            source_report_ids: source_report_ids.to_vec(),
+        },
+        &format!("profile-retire:{id}@{expected_revision}"),
+        reason,
+        &files::now().to_string(),
+    )?;
+    let mut receipt = receipt;
+    receipt.projections_pending = store.rebuild_memory_index().is_err();
+    ticker::poke(&ctx.state_dir());
+    print_json(&receipt)
+}
+
+pub fn supervisor_profiles_rollback(
+    ctx: &Ctx<'_>,
+    id: &str,
+    revision: u64,
+    reason: &str,
+) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let catalog = store.profile_catalog()?;
+    let target = catalog
+        .iter()
+        .find(|entry| entry.revision.id == id && entry.revision.revision == revision)
+        .context("rollback target is not a committed profile revision")?;
+    let current = catalog
+        .iter()
+        .find(|entry| entry.revision.id == id && entry.current)
+        .context("generated profile does not exist in the current catalog")?;
+    if current.revision.status != supervisor::GeneratedProfileStatus::Active {
+        bail!("generated profile is retired; publish it through an explicit operator review");
+    }
+    let receipt = store.operator_profile_change(
+        &config,
+        supervisor::ProfileChange::Revise {
+            id: id.into(),
+            expected_revision: current.revision.revision,
+            base_profile: Some(target.revision.base_profile.clone()),
+            description: target.revision.description.clone(),
+            instructions_md: target.revision.instructions_md.clone(),
+            source_report_ids: target.revision.source_report_ids.clone(),
+        },
+        &format!("profile-rollback:{id}@{revision}"),
+        reason,
+        &files::now().to_string(),
+    )?;
+    let mut receipt = receipt;
+    receipt.projections_pending = store.rebuild_memory_index().is_err();
+    ticker::poke(&ctx.state_dir());
+    print_json(&receipt)
+}
+
+pub fn supervisor_profiles_export(
+    ctx: &Ctx<'_>,
+    id: &str,
+    revision: u64,
+    name: &str,
+    output: &Path,
+) -> Result<()> {
+    let (config, store) = supervisor_state(ctx)?;
+    let entry = store
+        .profile_catalog()?
+        .into_iter()
+        .find(|entry| entry.revision.id == id && entry.revision.revision == revision)
+        .context("generated profile revision is not committed")?;
+    if !supervisor::authorized_scopes(&config).contains(&entry.revision.scope) {
+        bail!("generated profile is outside the current authorization scope");
+    }
+    store.export_profile(&config, id, revision, name, output)?;
+    println!(
+        "exported `{id}@{revision}` as `{name}` to {}",
+        output.display()
+    );
+    Ok(())
+}
 
 /// The configured Herdr session: a client and the socket path its panes see.
 pub struct Session<H> {
@@ -47,7 +274,7 @@ impl Session<herdr::Client> {
 async fn load_active(ctx: &Ctx<'_>, key: &str) -> Result<(Config, Run, RunRecord)> {
     // Every command an agent runs keeps the ticker alive.
     ticker::start(ctx).await?;
-    let config = Config::load(&ctx.config_dir())?;
+    let config = Config::load_with_state_dir(&ctx.config_dir(), &ctx.state_dir())?;
     let run = Run::load(&ctx.runs_dir(), key)?;
     let record = run.record()?;
     if record.status != Status::Active {
@@ -57,6 +284,38 @@ async fn load_active(ctx: &Ctx<'_>, key: &str) -> Result<(Config, Run, RunRecord
         );
     }
     Ok((config, run, record))
+}
+
+fn ensure_generated_profile_authorized(
+    ctx: &Ctx<'_>,
+    config: &Config,
+    record: &RunRecord,
+    name: &str,
+    role: crate::config::GeneratedRole,
+    require_active: bool,
+) -> Result<()> {
+    if !name.starts_with("generated-") {
+        return Ok(());
+    }
+    let scope = crate::supervisor::Scope {
+        workspace: record.workspace.clone(),
+        team: record.team_key.clone(),
+        routing: config
+            .team(&record.workspace, &record.team_key)?
+            .routing
+            .clone(),
+    };
+    ensure!(
+        SupervisorStore::new(ctx.supervisor_dir()).profile_is_authorized(
+            config,
+            name,
+            &scope,
+            role,
+            require_active,
+        )?,
+        "generated profile `{name}` is no longer authorized for this routing"
+    );
+    Ok(())
 }
 
 fn non_empty(text: &str, what: &str) -> Result<()> {
@@ -83,7 +342,7 @@ pub async fn context<H: Herdr>(
     key: &str,
 ) -> Result<()> {
     ticker::start(ctx).await?;
-    let config = Config::load(&ctx.config_dir())?;
+    let config = Config::load_with_state_dir(&ctx.config_dir(), &ctx.state_dir())?;
     let run = Run::load(&ctx.runs_dir(), key)?;
     let state_dir = ctx.state_dir();
     let snapshot = match session {
@@ -473,10 +732,14 @@ fn check_room(workers: &[Worker], repo: &str, limits: Limits) -> Result<()> {
     Ok(())
 }
 
-fn check_agents(ctx: &Ctx, limits: Limits) -> Result<()> {
+fn check_agents(ctx: &Ctx, config: &Config) -> Result<()> {
     let count = worker::agent_count(&Run::list(&ctx.runs_dir()));
-    if count + 1 > limits.max_agents as usize {
-        bail!("the limit of {} agents is reached", limits.max_agents);
+    let reserved = usize::from(config.supervisor.is_some());
+    if count + 1 + reserved > config.limits.max_agents as usize {
+        bail!(
+            "the limit of {} agents is reached",
+            config.limits.max_agents
+        );
     }
     Ok(())
 }
@@ -491,18 +754,27 @@ pub async fn worker_start<H: Herdr>(
 ) -> Result<Worker> {
     let (config, run, record) = load_active(ctx, key).await?;
     let repo = config.repository(&args.repo)?.clone();
-    let routing = config.routing_of(&record.workspace, &record.team_key)?;
-    let profile = config.worker_profile(routing, &args.profile)?.clone();
+    let profile = config
+        .worker_profile_for(&record.workspace, &record.team_key, &args.profile)?
+        .clone();
+    ensure_generated_profile_authorized(
+        ctx,
+        &config,
+        &record,
+        &args.profile,
+        crate::config::GeneratedRole::Worker,
+        true,
+    )?;
     let limits = config.limits;
     check_room(&worker::list(&run), &args.repo, limits)?;
-    check_agents(ctx, limits)?;
+    check_agents(ctx, &config)?;
     fetch(ctx.runner, &repo).await?;
     let repo_path = repo.path.to_string_lossy().into_owned();
     let worker = worker::allocate(
         &run,
         |workers| {
             check_room(workers, &args.repo, limits)?;
-            check_agents(ctx, limits)
+            check_agents(ctx, &config)
         },
         |w| {
             w.title = args.title.clone();
@@ -513,6 +785,7 @@ pub async fn worker_start<H: Herdr>(
             w.agent.status = AgentStatus::Pending;
             w.agent.profile = args.profile.clone();
             w.agent.kind = profile.kind.clone();
+            w.agent.waiting_episodes = Some(0);
             w.agent.agent_name = names::agent_name(key, &record.issue_id, &w.id);
         },
     )?;
@@ -1532,21 +1805,29 @@ pub async fn worker_restart<H: Herdr>(
             worker::MAX_RESTARTS
         );
     }
+    let require_active_profile = profile.is_some();
     let (profile_name, profile) = match profile {
-        Some(name) => {
-            let routing = config.routing_of(&record.workspace, &record.team_key)?;
-            (
-                name.to_string(),
-                config.worker_profile(routing, name)?.clone(),
-            )
-        }
+        Some(name) => (
+            name.to_string(),
+            config
+                .worker_profile_for(&record.workspace, &record.team_key, name)?
+                .clone(),
+        ),
         None => (
             w.agent.profile.clone(),
             config.profile(&w.agent.profile)?.clone(),
         ),
     };
+    ensure_generated_profile_authorized(
+        ctx,
+        &config,
+        &record,
+        &profile_name,
+        crate::config::GeneratedRole::Worker,
+        require_active_profile,
+    )?;
     if !w.counts() {
-        check_agents(ctx, config.limits)?;
+        check_agents(ctx, &config)?;
     }
     let task_path = worker::task_path(&run, id);
     let task = std::fs::read_to_string(&task_path).with_context(|| {

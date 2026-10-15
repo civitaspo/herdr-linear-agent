@@ -576,3 +576,9 @@ the repository-scoped comment-token fix; the server verified it against a real
 client PR in run
 [38511694306](https://github.com/civitaspo/securefix-server/actions/runs/38511694306).
 The workflows in this repository now pin v0.2.14.
+
+## Local postmortem supervisor checks (2026-10-15)
+
+The implementation was verified against the repository's fake Herdr, fake Linear and fake agent runners. `cargo test --workspace --locked` passed 467 tests; `routing_live` was ignored. The regression scenario `ticker::scenarios::a_saved_workflow_postmortem_retries_its_supervisor_feed_after_restart` leaves the feed malformed while the issue comment and Done state are delivered, confirms the run keeps its due marker, then repairs the feed and restarts the ticker. Replay materializes one report and clears the marker without repeating Linear writes. The outbox regression `outbox::tests::a_replayed_postmortem_comment_keeps_its_identity_across_queue_and_marker_gaps` covers a repeated queue, an uncertain response and replay after queue removal. `cargo check --workspace --locked`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo build --workspace --locked`, `cargo fmt --all -- --check`, and `git diff --check` passed after the fix. Direct runs of `shellcheck scripts/*.sh`, `ghalint run`, and `pinact run --check --verify-comment` passed.
+
+The `mise run lint`, `mise run test`, and `mise run build` wrappers could not start because mise attempted to install `aqua:DataDog/pup@latest` and the environment returned `Operation not permitted`. The locked Rust checks and shell/workflow lint commands listed above were run directly. No real Herdr session, Linear workspace, or logged-in agent CLI was used for the supervisor. Profile replacement, real report consumption and publication, long-idle behavior, and performance targets remain unverified against live services; no throughput measurements were taken.

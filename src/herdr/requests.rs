@@ -32,6 +32,16 @@ pub struct Placed {
 pub trait Herdr: Send + Sync {
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, HerdrError>> + Send;
 
+    /// A client for a previously recorded session socket, when the
+    /// implementation can open one. The reconciler uses it only to close a
+    /// managed workspace left in the old session after an explicit switch.
+    fn for_socket(&self, _socket: &str) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     fn workspace_create(
         &self,
         cwd: &str,
@@ -151,6 +161,10 @@ impl Client {
 impl Herdr for Client {
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, HerdrError>> + Send {
         Client::snapshot(self)
+    }
+
+    fn for_socket(&self, socket: &str) -> Option<Self> {
+        Some(Client::new(socket))
     }
 
     async fn workspace_create(&self, cwd: &str, label: &str) -> Result<Placed, HerdrError> {

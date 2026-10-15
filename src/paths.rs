@@ -94,6 +94,10 @@ impl Ctx<'_> {
         self.env.state_dir().join("runs")
     }
 
+    pub fn supervisor_dir(&self) -> PathBuf {
+        self.env.state_dir().join("supervisor")
+    }
+
     /// The private state directory, created when missing.
     pub fn ensure_state_dir(&self) -> Result<PathBuf> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};

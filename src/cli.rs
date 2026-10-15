@@ -77,6 +77,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkerCommand,
     },
+    /// Manage the local supervisor's reports and portable memory.
+    Supervisor {
+        #[command(subcommand)]
+        command: SupervisorCommand,
+    },
     /// Report a worker's progress from its own pane.
     Report(ReportArgs),
     /// Tools for checking the plugin against a real Herdr.
@@ -172,6 +177,79 @@ enum WorkerCommand {
     Merge { key: String, id: String },
 }
 
+#[derive(Subcommand)]
+enum SupervisorCommand {
+    /// Read or resume the current bounded report batch.
+    Context {
+        #[arg(long)]
+        generation: u64,
+    },
+    /// Commit a decision and its portable memory delta.
+    Decide {
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        decision_file: String,
+    },
+    /// Search committed knowledge in the current authorization scope.
+    Memory {
+        #[command(subcommand)]
+        command: SupervisorMemoryCommand,
+    },
+    /// Read a plugin-issued report, decision or topic handle.
+    Show { handle: String },
+    /// Inspect and maintain the committed generated-profile catalog.
+    Profiles {
+        #[command(subcommand)]
+        command: SupervisorProfilesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SupervisorProfilesCommand {
+    /// List authorized generated revisions and mark each current catalog entry.
+    List,
+    /// Show one exact committed generated revision.
+    Show {
+        id: String,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    /// Retire the expected active revision for future runs.
+    Retire {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "source-report")]
+        source_report_ids: Vec<String>,
+    },
+    /// Publish a new revision using the content of a retained revision.
+    Rollback {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Export a revision as ordinary profile files into a new exact directory.
+    Export {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SupervisorMemoryCommand {
+    Search { query: String },
+}
+
 #[derive(Args)]
 struct ReportArgs {
     /// Rough progress of the whole task, 0 to 100.
@@ -265,6 +343,48 @@ pub async fn run() -> Result<()> {
             commands::finish(&ctx, &session, &args.key, &text).await
         }
         Command::Worker { command } => worker(&ctx, command).await,
+        Command::Supervisor { command } => match command {
+            SupervisorCommand::Context { generation } => {
+                commands::supervisor_context(&ctx, generation)
+            }
+            SupervisorCommand::Decide {
+                generation,
+                decision_file,
+            } => commands::supervisor_decide(&ctx, generation, &read_text_arg(&decision_file)?),
+            SupervisorCommand::Memory {
+                command: SupervisorMemoryCommand::Search { query },
+            } => commands::supervisor_memory_search(&ctx, &query),
+            SupervisorCommand::Show { handle } => commands::supervisor_show(&ctx, &handle),
+            SupervisorCommand::Profiles { command } => match command {
+                SupervisorProfilesCommand::List => commands::supervisor_profiles_list(&ctx),
+                SupervisorProfilesCommand::Show { id, revision } => {
+                    commands::supervisor_profiles_show(&ctx, &id, revision)
+                }
+                SupervisorProfilesCommand::Retire {
+                    id,
+                    expected_revision,
+                    reason,
+                    source_report_ids,
+                } => commands::supervisor_profiles_retire(
+                    &ctx,
+                    &id,
+                    expected_revision,
+                    &reason,
+                    &source_report_ids,
+                ),
+                SupervisorProfilesCommand::Rollback {
+                    id,
+                    revision,
+                    reason,
+                } => commands::supervisor_profiles_rollback(&ctx, &id, revision, &reason),
+                SupervisorProfilesCommand::Export {
+                    id,
+                    revision,
+                    name,
+                    output,
+                } => commands::supervisor_profiles_export(&ctx, &id, revision, &name, &output),
+            },
+        },
         Command::Report(args) => {
             progress::report(&env, args.percent.filter(|_| !args.unknown), &args.activity).await
         }
@@ -445,5 +565,60 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn supervisor_profile_operator_commands_parse() {
+        for argv in [
+            vec!["herdr-linear-agent", "supervisor", "profiles", "list"],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "show",
+                "p-example",
+                "--revision",
+                "2",
+            ],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "retire",
+                "p-example",
+                "--expected-revision",
+                "2",
+                "--reason",
+                "Adopt manual profile",
+                "--source-report",
+                "r-00000000000000000000000000000000",
+            ],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "rollback",
+                "p-example",
+                "--revision",
+                "1",
+                "--reason",
+                "Restore prior instructions",
+            ],
+            vec![
+                "herdr-linear-agent",
+                "supervisor",
+                "profiles",
+                "export",
+                "p-example",
+                "--revision",
+                "1",
+                "--name",
+                "manual-example",
+                "--output",
+                "/tmp/profile",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv.clone()).is_ok(), "{argv:?}");
+        }
     }
 }

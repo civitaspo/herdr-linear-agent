@@ -141,6 +141,10 @@ pub struct Request {
     /// A send was started; its outcome is checked by a read before any resend.
     #[serde(default)]
     pub attempted: bool,
+    /// Read back before the first send. Stable comments use this to recover
+    /// after the queue file was removed but the caller's run marker was not saved.
+    #[serde(default)]
+    pub check_before_send: bool,
     /// Accepted-prompt generation when the question was queued. This uses a
     /// local monotonic token, not a comparison between server and local time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,6 +222,7 @@ pub fn push_held(run: &Run, lock: &RunLock, op: Op) -> Result<Option<String>> {
         id: uuid::Uuid::new_v4().to_string(),
         created: files::now(),
         attempted: false,
+        check_before_send: false,
         wait_generation: wait_reason.map(|_| record.reply_generation),
         op,
     };
@@ -244,6 +249,46 @@ pub fn push_held(run: &Run, lock: &RunLock, op: Op) -> Result<Option<String>> {
         run.update_held(lock, |current| *current = record)?;
     }
     Ok(Some(request.id))
+}
+
+/// Queues a comment with a stable UUID and reads it back before the first
+/// send. A caller can safely recreate this request after its run marker lags
+/// the outbox because Linear comments are identified by that UUID.
+pub fn push_idempotent_comment_held(
+    run: &Run,
+    _lock: &RunLock,
+    id: &str,
+    body: &str,
+) -> Result<Option<String>> {
+    if uuid::Uuid::parse_str(id).is_err() {
+        bail!("idempotent comment id must be a UUID");
+    }
+    let op = Op::Comment {
+        body: body.to_string(),
+    };
+    for path in queued_paths(run) {
+        if let Some(existing) = files::read_json::<Request>(&path)
+            && existing.id == id
+        {
+            if existing.op != op {
+                bail!("outbox request `{id}` already has different content");
+            }
+            return Ok(Some(id.to_string()));
+        }
+    }
+    let counter_path = run.state_dir().join("outbox-counter.json");
+    let n: u64 = files::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
+    files::write_json(&counter_path, &n)?;
+    let request = Request {
+        id: id.to_string(),
+        created: files::now(),
+        attempted: false,
+        check_before_send: true,
+        wait_generation: None,
+        op,
+    };
+    files::write_json(&outbox_dir(run).join(format!("{n:010}.json")), &request)?;
+    Ok(Some(id.to_string()))
 }
 
 fn queued_paths(run: &Run) -> Vec<PathBuf> {
@@ -499,7 +544,9 @@ async fn send_one(
         {
             linear.activity_exists(session_id, &request.id).await?
         }
-        Op::Comment { .. } | Op::ResumeQuestion { .. } if request.attempted => {
+        Op::Comment { .. } | Op::ResumeQuestion { .. }
+            if request.attempted || request.check_before_send =>
+        {
             linear.comment_exists(&request.id).await?
         }
         // Replacing the plan or the URL list and adding labels are
@@ -1318,6 +1365,55 @@ mod tests {
         let fake = linear.lock().unwrap();
         assert_eq!(fake.sessions[0].sent("thought").len(), 1);
         assert_eq!(fake.count("HerdrLinearAgentActivityFind"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_postmortem_comment_keeps_its_identity_across_queue_and_marker_gaps() {
+        let (_dir, run, linear, session, issue) = setup();
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = "Postmortem summary.";
+        {
+            let lock = run.lock().unwrap();
+            push_idempotent_comment_held(&run, &lock, &id, body).unwrap();
+            push_idempotent_comment_held(&run, &lock, &id, body).unwrap();
+            assert!(push_idempotent_comment_held(&run, &lock, &id, "changed").is_err());
+        }
+        assert_eq!(
+            pending(&run).len(),
+            1,
+            "a pre-marker replay reuses the queue item"
+        );
+        assert!(pending(&run)[0].1.check_before_send);
+
+        linear.lock().unwrap().lose_next_response = true;
+        let sent = send(&run, &session, &issue, &state_names(), &linear).await;
+        assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
+        assert_eq!(pending(&run).len(), 1);
+        {
+            let lock = run.lock().unwrap();
+            push_idempotent_comment_held(&run, &lock, &id, body).unwrap();
+        }
+        let replay = send(&run, &session, &issue, &state_names(), &linear).await;
+        assert_eq!(
+            replay.count, 1,
+            "the uncertain write is confirmed by its stable id"
+        );
+        assert!(pending(&run).is_empty());
+
+        // A crash after outbox removal but before the caller's marker requeues
+        // the same identity. The preflight read sees the existing comment.
+        {
+            let lock = run.lock().unwrap();
+            push_idempotent_comment_held(&run, &lock, &id, body).unwrap();
+        }
+        assert_eq!(pending(&run).len(), 1);
+        assert!(pending(&run)[0].1.check_before_send);
+        let after_delivery = send(&run, &session, &issue, &state_names(), &linear).await;
+        assert_eq!(after_delivery.count, 1);
+        assert!(pending(&run).is_empty());
+        let fake = linear.lock().unwrap();
+        assert_eq!(fake.count("HerdrLinearAgentCommentCreate"), 1);
+        assert_eq!(fake.count("HerdrLinearAgentCommentFind"), 3);
     }
 
     #[tokio::test]

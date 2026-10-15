@@ -19,6 +19,8 @@ mod process;
 mod progress;
 mod routing;
 mod run;
+mod supervisor;
+mod supervisor_index;
 mod ticker;
 mod transcript;
 mod worker;

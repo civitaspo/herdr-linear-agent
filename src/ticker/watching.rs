@@ -573,6 +573,11 @@ impl Reconciler {
         let group = worker::group(&next, &live);
         let mut milestones = Vec::new();
         if group.token() != w.agent.last_group {
+            if group == Group::WaitingOnYou
+                && let Some(episodes) = &mut next.agent.waiting_episodes
+            {
+                *episodes = episodes.saturating_add(1);
+            }
             let summary = match group {
                 Group::WaitingOnYou => {
                     let reason = waiting_reason(&next, &live);
@@ -645,6 +650,9 @@ impl Reconciler {
                 worker::update_held(run, lock, &id, |r| {
                     if before.agent.last_group != next.agent.last_group {
                         r.agent.last_group = next.agent.last_group.clone();
+                    }
+                    if before.agent.waiting_episodes != next.agent.waiting_episodes {
+                        r.agent.waiting_episodes = next.agent.waiting_episodes;
                     }
                     if before.announced_report_hash != next.announced_report_hash {
                         r.announced_report_hash = next.announced_report_hash.clone();

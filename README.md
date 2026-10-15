@@ -103,6 +103,14 @@ agent = "router"                         # the profile of the routing agent; nee
 coordinators = ["coordinator", "coordinator-light"]  # the coordinator profiles it picks from
 postmortems = ["postmortem"]             # the profiles that may write postmortems (see Postmortems); none writes none
 workers = ["standard", "deep"]           # the profiles a coordinator may start workers with
+
+# Optional local supervisor. Omit this and [routing.default.generated] to disable it.
+[supervisor]
+profile = "supervisor"                   # ordinary profile controlling its kind, model, arguments and instructions
+max_generated_profiles_per_routing = 5   # defaults to 5; allowed range is 1 to 20
+
+[routing.default.generated]
+workers = ["standard"]                   # approved manual bases; generated variants inherit only from these
 ```
 
 **Reloading the config.** The running ticker keeps the config it started with until you run the Herdr action **herdr-linear-agent: reload the config**. The action checks the config first and shows why it does not load; when it loads, the ticker starts its tasks again with it, as a ticker restart would, and reads the Linear credentials again, so the macOS Keychain may ask once more. The ticker also compares `config.toml` and the profile folders with the ones it runs on every second, by content, and when they changed it shows a Herdr notification (if `notifications.herdr` is on) asking you to reload, or saying why the new files do not load; it tells once per change. A reload takes effect for what is decided and started afterwards: routing of new issues, coordinator and worker launches and restarts, limits and notifications.
@@ -139,6 +147,42 @@ Add the label `Improvement` only when there is something concrete to change in h
 ```
 
 Then list it in the routing: `postmortems = ["postmortem"]`. Each postmortem, workflow or final, picks its profile when it is written: a list with one profile gives that profile; with several, the routing agent picks one from the run's issue, `conversation.md`, workers' reports, PRs and times (not the transcripts), and a failed pick gives the first. The picked profile runs headless the way the routing agent does, with no tools: the plugin gives it the run's records on standard input (the issue, `conversation.md`, the workers' reports, and the agents' transcripts, long ones shortened in the middle), and it answers with the summary and the labels. The plugin keeps each answer in the run folder (`.state/postmortems/`), posts the comment, and adds the labels that exist in Linear (it creates none). A workflow comment reads `**Postmortem (workflow)**, method `postmortem` version `<12 hex digits>``, then the summary; the version is a hash of the profile, so it changes when you edit the method.
+
+### Supervisor
+
+The optional supervisor reviews saved postmortem outcomes and keeps local, workspace/team/routing-scoped knowledge for future decisions. It does not read Linear credentials or write to Linear. The plugin remains the only Linear writer. The supervisor's model, kind, arguments and method come from an ordinary profile you own. Its managed Herdr space uses the exact label `herdr-linear-agent-supervisor`; one agent slot is reserved while it is enabled. Its durable reports, decisions, Markdown knowledge and rebuildable SQLite search index live under the plugin state directory.
+
+Enable it with `[supervisor]` and give each routing an explicit list of allowed manual bases under `[routing.<name>.generated]`. These lists default to empty. A generated profile can change its description and instruction file, and can inherit from another listed base for its role. It cannot change kind, model, effort, arguments, environment or timeout. Publishing a new revision changes future candidate lists after the supervisor's decision, while an already pinned run keeps its resolved profile. Removing a role or base from config blocks new starts and resumes that depend on it. Retiring a variant removes it from future runs while preserving existing pins.
+
+The supervisor receives bounded batches of saved reports and commits a decision and portable memory checkpoint before those reports are acknowledged. A decision may update knowledge, publish or retire one variant, or record no change. Legacy postmortems without saved routing attribution are preserved for inspection but excluded from decisions. The derived search index can be rebuilt from the committed Markdown and JSON files; it is not the source of truth.
+
+```toml
+# profiles/supervisor/config.toml
+kind = "claude"
+model = "sonnet"
+effort = "high"
+args = ["--permission-mode", "auto"]
+description = "Reviews completed runs and maintains scoped agent guidance"
+```
+
+```markdown
+<!-- profiles/supervisor/instructions.md -->
+Use `herdr-linear-agent supervisor context --generation <generation>` to read the current batch.
+Record a durable decision with `supervisor decide --generation <generation> --decision-file <path>`.
+Use report and topic handles for evidence. Do not infer success from issue state or labels.
+```
+
+Operator commands use the same local state and authorization scopes:
+
+```text
+herdr-linear-agent supervisor profiles list
+herdr-linear-agent supervisor profiles show <id> [--revision <revision>]
+herdr-linear-agent supervisor profiles retire <id> --expected-revision <revision> --reason <text> --source-report <report-id>
+herdr-linear-agent supervisor profiles rollback <id> --revision <revision> --reason <text>
+herdr-linear-agent supervisor profiles export <id> --revision <revision> --name <manual-name> --output <new-directory>
+```
+
+Retirement and rollback create new immutable catalog revisions through the same commit path as supervisor decisions. Export writes `config.toml`, `instructions.md` and a short `README.md` directly into a new destination directory; it does not activate the exported profile or change routing. Review and deploy that ordinary profile through your existing config process, then retire the generated variant separately if wanted. Local filesystem access is the operator boundary; command allow-lists are not an operating-system sandbox.
 
 ### Finding user IDs
 

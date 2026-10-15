@@ -160,15 +160,17 @@ impl Model {
             *left -= 1;
             *left > 0
         });
-        let panes: BTreeMap<PaneId, Pane> = self
+        let mut panes: BTreeMap<PaneId, Pane> = self
             .panes
             .iter()
             .filter(|(id, _)| !hidden.contains(id))
             .map(|(id, pane)| (id.clone(), pane.clone()))
             .collect();
+        for pane in panes.values_mut() {
+            pane.label = self.labels.get(&pane.workspace).cloned();
+        }
         agents.retain(|a| !hidden.contains(&a.pane));
         let mut skipped = 0;
-        let mut panes = panes;
         for pane in &self.unparsed {
             skipped += usize::from(panes.remove(pane).is_some());
             let before = agents.len();
@@ -403,6 +405,10 @@ impl Herdr for FakeHerdr {
             let _ = go.await;
         }
         Ok(snapshot)
+    }
+
+    fn for_socket(&self, _socket: &str) -> Option<Self> {
+        Some(self.clone())
     }
 
     async fn workspace_create(&self, cwd: &str, label: &str) -> Result<Placed, HerdrError> {

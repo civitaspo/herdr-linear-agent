@@ -10,6 +10,7 @@ use sha2::Digest;
 use crate::config::Profile;
 use crate::routing::{self, Ask, Fallback};
 use crate::run::{Run, RunRecord};
+use crate::supervisor::SupervisorReport;
 use crate::transcript::{self, Roots};
 use crate::worker;
 
@@ -79,6 +80,23 @@ impl Stage {
             Stage::Workflow => "workflow",
         }
     }
+}
+
+/// Starts a postmortem attempt once and preserves its identity across process
+/// restarts until the run's due marker is cleared.
+pub fn begin_attempt(record: &mut RunRecord, stage: Stage) {
+    if record.postmortem_due != Some(stage)
+        || uuid::Uuid::parse_str(&record.postmortem_attempt_id).is_err()
+    {
+        record.postmortem_due = Some(stage);
+        record.postmortem_attempt_id = uuid::Uuid::new_v4().to_string();
+    }
+}
+
+/// Clears the attempt identity with its due marker.
+pub fn clear_attempt(record: &mut RunRecord) {
+    record.postmortem_due = None;
+    record.postmortem_attempt_id.clear();
 }
 
 /// What the agent answered.
@@ -242,12 +260,12 @@ pub fn input(roots: &Roots, run: &Run, record: &RunRecord, brief: &str) -> Strin
 }
 
 /// The comment the plugin posts.
-pub fn comment(stage: Stage, method: &Method, summary: &str) -> String {
+pub fn comment(stage: Stage, method: &str, version: &str, summary: &str) -> String {
     format!(
         "**Postmortem ({})**, method `{}` version `{}`\n\n{}",
         stage.word(),
-        method.name,
-        method.version,
+        method,
+        version,
         summary.trim()
     )
 }
@@ -294,29 +312,69 @@ pub async fn write(
     Ok(Outcome { summary, labels })
 }
 
-/// Keeps the outcome in `.state/postmortems/<time>-<stage>.json`, for
-/// looking across runs later.
-pub fn keep(
-    run: &Run,
-    stage: Stage,
-    method: &Method,
-    picked: &str,
-    outcome: &Outcome,
-    at: &str,
-) -> Result<()> {
-    let dir = run.state_dir().join("postmortems");
-    std::fs::create_dir_all(&dir)?;
-    let file = dir.join(format!("{}-{}.json", at.replace(':', ""), stage.word()));
-    let record = json!({
-        "stage": stage,
-        "at": at,
-        "method": method.name,
-        "picked": picked,
-        "version": method.version,
-        "summary": outcome.summary,
-        "labels": outcome.labels,
-    });
-    crate::files::write_json(&file, &record)
+/// One immutable attempt artifact. Older postmortem JSON files deserialize
+/// with the new fields empty so history remains readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SavedPostmortem {
+    pub schema_version: u32,
+    pub attempt_id: String,
+    pub run_key: String,
+    pub stage: Option<Stage>,
+    pub at: String,
+    pub method: String,
+    pub method_kind: String,
+    pub picked: String,
+    pub version: String,
+    pub summary: String,
+    pub labels: Vec<String>,
+    pub failure: Option<String>,
+    pub supervisor_report: Option<SupervisorReport>,
+}
+
+fn attempt_path(run: &Run, attempt_id: &str) -> Result<std::path::PathBuf> {
+    uuid::Uuid::parse_str(attempt_id).context("the postmortem attempt id is invalid")?;
+    Ok(run
+        .state_dir()
+        .join("postmortems")
+        .join(format!("{attempt_id}.json")))
+}
+
+/// Reads an attempt artifact after validating its path identity.
+pub fn saved_attempt(run: &Run, attempt_id: &str) -> Result<Option<SavedPostmortem>> {
+    let path = attempt_path(run, attempt_id)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
+        }
+    };
+    let artifact: SavedPostmortem = serde_json::from_str(&text)
+        .with_context(|| format!("{} does not parse", path.display()))?;
+    if artifact.attempt_id != attempt_id || artifact.run_key != run.key {
+        anyhow::bail!("{} has an unexpected postmortem identity", path.display());
+    }
+    Ok(Some(artifact))
+}
+
+/// Writes one completed attempt without replacing different content.
+pub(super) fn save_attempt(run: &Run, artifact: SavedPostmortem) -> Result<()> {
+    let path = attempt_path(run, &artifact.attempt_id)?;
+    std::fs::create_dir_all(path.parent().expect("attempt path has a parent"))?;
+    if path.exists() {
+        let existing = std::fs::read(&path)?;
+        let existing: SavedPostmortem = serde_json::from_slice(&existing)
+            .with_context(|| format!("{} does not parse", path.display()))?;
+        if existing != artifact {
+            anyhow::bail!(
+                "postmortem attempt {} already has different content",
+                artifact.attempt_id
+            );
+        }
+        return Ok(());
+    }
+    crate::files::write_json(&path, &artifact)
 }
 
 #[cfg(test)]
@@ -391,5 +449,90 @@ mod tests {
             "{clipped}"
         );
         assert_eq!(clip("short", 30), "short");
+    }
+
+    #[test]
+    fn attempt_identity_survives_reconciliation_and_changes_after_clear() {
+        let mut record = RunRecord::default();
+        begin_attempt(&mut record, Stage::Workflow);
+        let first = record.postmortem_attempt_id.clone();
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+
+        begin_attempt(&mut record, Stage::Workflow);
+        assert_eq!(record.postmortem_attempt_id, first);
+
+        clear_attempt(&mut record);
+        begin_attempt(&mut record, Stage::Workflow);
+        assert_ne!(record.postmortem_attempt_id, first);
+    }
+
+    #[test]
+    fn old_postmortem_json_reads_with_defaulted_supervisor_fields() {
+        let artifact: SavedPostmortem = serde_json::from_str(
+            r#"{"stage":"final","at":"2026-10-15T00:00:00Z","method":"review","picked":"only candidate","version":"abc123","summary":"Done.","labels":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(artifact.stage, Some(Stage::Final));
+        assert_eq!(artifact.summary, "Done.");
+        assert_eq!(artifact.schema_version, 0);
+        assert!(artifact.attempt_id.is_empty());
+        assert!(artifact.supervisor_report.is_none());
+    }
+
+    #[test]
+    fn saved_attempt_is_replayable_but_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = Run::create(
+            dir.path(),
+            RunRecord {
+                workspace: "acme".into(),
+                identifier: "DATA-1".into(),
+                ..RunRecord::default()
+            },
+        )
+        .unwrap();
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let artifact = SavedPostmortem {
+            schema_version: 1,
+            attempt_id: attempt_id.clone(),
+            run_key: run.key.clone(),
+            stage: Some(Stage::Final),
+            at: "2026-10-15T00:00:00Z".into(),
+            method: "review".into(),
+            summary: "Done.".into(),
+            supervisor_report: Some(crate::supervisor::SupervisorReport {
+                schema_version: 1,
+                id: crate::supervisor::report_id(&run.key, &attempt_id),
+                source_attempt: attempt_id.clone(),
+                source_hash: String::new(),
+                run_key: run.key.clone(),
+                issue_id: "issue-id".into(),
+                workspace: "acme".into(),
+                team: "DATA".into(),
+                routing: "default".into(),
+                attribution_complete: true,
+                legacy_source: None,
+                stage: Stage::Final,
+                observed_at: "2026-10-15T00:00:00Z".into(),
+                outcome: crate::supervisor::ReportOutcome::Success {
+                    summary: "Done.".into(),
+                    labels: Vec::new(),
+                },
+                profiles: Vec::new(),
+                observations: crate::supervisor::RunObservations::default(),
+            }),
+            ..SavedPostmortem::default()
+        };
+
+        save_attempt(&run, artifact.clone()).unwrap();
+        save_attempt(&run, artifact.clone()).unwrap();
+        assert_eq!(
+            saved_attempt(&run, &attempt_id).unwrap(),
+            Some(artifact.clone())
+        );
+
+        let mut changed = artifact;
+        changed.summary = "Different.".into();
+        assert!(save_attempt(&run, changed).is_err());
     }
 }
