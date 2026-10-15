@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] - 2026-10-14
+## [0.8.0] - 2026-10-15
 
 
 ### Bug Fixes
@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update Securefix caller workflows to v0.2.17 (#158)
 - update Securefix caller workflows to v0.2.16 (#155)
 - update dependency jdx/mise to v2026.10.10 (#154)
 - update Securefix caller workflows to v0.2.15 (#153)
