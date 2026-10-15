@@ -11,6 +11,8 @@ mod wake;
 
 pub use client::{Client, Snapshot, Subscription, invoking_socket, session_socket};
 #[cfg(test)]
+pub(crate) use fake::FakeHerdrServer;
+#[cfg(test)]
 pub use memory::FakeHerdr;
 pub use requests::{Herdr, Placed};
 pub use wake::{Link, wake};

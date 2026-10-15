@@ -11,9 +11,6 @@ use super::{Client, HerdrError, Pane, PaneId, Snapshot, WorkspaceId};
 
 /// Herdr waits this long for a started agent to become ready.
 const AGENT_START_TIMEOUT_MS: u64 = 30_000;
-/// `agent.start` answers only after the agent is ready, so the client waits
-/// longer than Herdr does.
-const AGENT_START_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 /// A worktree checkout can take a while on a large repository.
 const WORKTREE_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -153,6 +150,23 @@ impl PlacedAnswer {
 }
 
 impl Client {
+    pub async fn agent_start_with_timeout(
+        &self,
+        name: &str,
+        kind: &str,
+        pane: &PaneId,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        let params = json!({
+            "name": name, "kind": kind, "pane_id": pane, "args": args,
+            "timeout_ms": timeout.as_millis() as u64,
+        });
+        self.call_with_timeout::<Value>("agent.start", params, timeout + Duration::from_secs(5))
+            .await
+            .map(|_| ())
+    }
+
     async fn ok(&self, method: &str, params: Value) -> Result<(), HerdrError> {
         self.call::<Value>(method, params).await.map(|_| ())
     }
@@ -206,13 +220,14 @@ impl Herdr for Client {
         pane: &PaneId,
         args: &[String],
     ) -> Result<(), HerdrError> {
-        let params = json!({
-            "name": name, "kind": kind, "pane_id": pane, "args": args,
-            "timeout_ms": AGENT_START_TIMEOUT_MS,
-        });
-        self.call_with_timeout::<Value>("agent.start", params, AGENT_START_CLIENT_TIMEOUT)
-            .await
-            .map(|_| ())
+        self.agent_start_with_timeout(
+            name,
+            kind,
+            pane,
+            args,
+            Duration::from_millis(AGENT_START_TIMEOUT_MS),
+        )
+        .await
     }
 
     async fn agent_prompt(&self, pane: &PaneId, text: &str) -> Result<(), HerdrError> {

@@ -1,4 +1,5 @@
 mod actions;
+mod agent_smoke;
 mod agents;
 mod claude_trust;
 mod cli;

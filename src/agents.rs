@@ -63,6 +63,23 @@ pub fn profile_args(profile: &Profile) -> Vec<String> {
     out
 }
 
+/// Arguments shared by live coordinator launches and the explicit startup smoke check.
+pub fn start_args(profile: &Profile, resume: bool, session: &str) -> Vec<String> {
+    let mut args = profile_args(profile);
+    let words = resume_args(&profile.kind, session).filter(|_| resume);
+    match words {
+        Some(words) if profile.kind == "codex" => {
+            args.splice(0..0, words);
+        }
+        Some(words) => args.extend(words),
+        None if profile.kind == "claude" && !session.is_empty() => {
+            args.extend(["--session-id".to_string(), session.to_string()]);
+        }
+        None => {}
+    }
+    args
+}
+
 /// The words that make the kind's CLI continue a native session, or `None`
 /// when the kind cannot or the session id is unusable.
 pub fn resume_args(kind: &str, session: &str) -> Option<Vec<String>> {

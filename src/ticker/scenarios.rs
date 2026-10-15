@@ -1621,6 +1621,24 @@ async fn a_decision_failure_is_persisted_and_notified_without_merge_authority() 
 }
 
 #[tokio::test]
+async fn a_machine_decision_resumes_a_finished_review_once() {
+    let mut world = assessed_machine_world().await;
+    let pane = world.record(KEY).coordinator.pane_id;
+    let before = to(&world, &pane).len();
+    world.herdr.set_status("acme-data-1-coordinator", "idle");
+    world.settle().await;
+    world.later(61);
+    world.settle().await;
+    assert!(!world.record(KEY).finished);
+    assert_eq!(to(&world, &pane).len(), before + 1);
+    assert_eq!(to(&world, &pane).last().unwrap(), NUDGE_INBOX);
+    assert_eq!(world.issue_state(KEY), "In Review");
+    world.later(10);
+    world.settle().await;
+    assert_eq!(to(&world, &pane).len(), before + 1);
+}
+
+#[tokio::test]
 async fn machine_merge_consumes_the_receipt_with_a_head_guard_and_confirms_deployment() {
     let mut world = assessed_machine_world().await;
     let head = "a3".repeat(20);

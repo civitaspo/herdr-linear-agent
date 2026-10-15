@@ -9,7 +9,7 @@ rust = { version = "1.99.0", components = ["clippy", "rustfmt"] }
 [tasks.lint]
 description = "Run repository and Rust lint checks"
 run = [
-  "shellcheck scripts/*.sh",
+  "shellcheck scripts/*.sh .agents/skills/integration-harness/scripts/*.sh",
   "ghalint run",
   "pinact run --check --verify-comment",
   "cargo fmt --all -- --check",

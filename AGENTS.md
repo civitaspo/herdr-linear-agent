@@ -9,6 +9,7 @@ herdr-linear-agent is a Herdr plugin written in Rust. It polls Linear for issues
 - Read [README.md](README.md) for configuration, profiles, supported agent kinds, and user-visible behavior.
 - For lifecycle, persistence, or reconciliation changes, read the relevant section of [docs/behavior.md](docs/behavior.md). Check the current implementation before relying on entries marked as open questions or rewrite notes.
 - For real integration checks, read [docs/verification.md](docs/verification.md). Keep fake-test results distinct from checks against a real Linear workspace or agent CLI.
+- For real agent or Linear development checks, use [the integration-harness skill](.agents/skills/integration-harness/SKILL.md) to isolate configuration, state, worktrees and the Herdr session from ordinary use.
 - This file guides development of the plugin. [assets/COORDINATOR.md](assets/COORDINATOR.md) and [assets/WORKER.md](assets/WORKER.md) are the instructions the plugin gives its agents.
 
 ## Where to make changes

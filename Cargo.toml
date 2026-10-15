@@ -26,7 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 tempfile = "=3.27.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal"] }
 toml = "1.0"
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", features = ["alloc"] }

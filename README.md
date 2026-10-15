@@ -306,7 +306,7 @@ description = "Scoped features and fixes"
 
 A profile becomes agent CLI flags: `claude` gets `--model` and `--effort`, `codex` gets `-m` and `-c model_reasoning_effort=...`, and any other kind gets `--model` (put the effort in the model ID). `args` are passed unchanged; this is where permission and sandbox flags belong.
 
-**Coordinators on other kinds.** A coordinator reads the run folder's `AGENTS.md`, which Claude Code (through the `CLAUDE.md` link), Codex, Cursor Agent and OpenCode all read. Cursor Agent and OpenCode ran as coordinators in a Herdr pane, before the subagent switches below were added; Codex was not run as a coordinator (see below):
+**Coordinators on other kinds.** A coordinator reads the run folder's `AGENTS.md`, which Claude Code (through the `CLAUDE.md` link), Codex, Cursor Agent and OpenCode all read. Cursor Agent and OpenCode ran as coordinators in a Herdr pane, before the subagent switches below were added. Codex 0.160.0 completed an isolated documentation workflow through merge, deployment verification, postmortem and supervisor persistence, with operator assistance for sandbox setup, commit creation and review; see the [live evidence and limits](docs/verification.md#isolated-codex-workflow-and-supervisor-persistence-2026-10-15). Use the [explicit startup smoke test](docs/verification.md#explicit-agent-startup-smoke-test) to check a profile without sending a prompt:
 
 ```toml
 # profiles/coordinator-codex/config.toml
@@ -335,7 +335,7 @@ model = "openai/gpt-6-luna"              # provider/model, as `opencode models` 
 description = "Coordinator on OpenCode"
 ```
 
-- Codex asks whether you trust each new run folder, and neither a flag nor a `-c projects...` override skips that dialog (codex-cli 0.156.1), so a Codex coordinator waits in Herdr until someone answers; the answer is saved in your Codex config.
+- Codex 0.156.1 asked whether you trust each new run folder, and neither a flag nor a `-c projects...` override skipped that dialog. The 0.160.0 startup check with `-s read-only` reached interactive readiness without a trust dialog. Other permission settings may still require an answer in Herdr; the answer is saved in your Codex config.
 - Cursor Agent asks before it runs a command that is not in its allow-list. The plugin writes `.cursor/cli.json` into each run folder, allowing the plugin's binary by the path the sheet gives the coordinator, as it writes `.claude/settings.local.json` for Claude Code.
 - OpenCode starts as `opencode mini`: its full interface takes no model flag, and `mini` takes `--model` and the `--session` a resume adds. OpenCode lets agents run commands unless your OpenCode config says otherwise.
 

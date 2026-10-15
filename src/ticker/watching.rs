@@ -4,8 +4,8 @@ use anyhow::Result;
 use jiff::Timestamp;
 
 use super::reconcile::{
-    COORDINATOR_IDLE, Deps, HEARTBEAT, PANE_GRACE, Reconciler, apply_tracked, error_activity,
-    inbox_item, since, update_worker,
+    COORDINATOR_IDLE, Deps, HEARTBEAT, PANE_GRACE, Reconciler, apply_tracked, blocking,
+    error_activity, inbox_item, since, update_worker,
 };
 use crate::agents;
 use crate::herdr::{Herdr, PaneId, Snapshot};
@@ -892,7 +892,6 @@ impl Reconciler {
             || c.prompt_pending
             || record.stopped
             || record.awaiting_reply.is_some()
-            || record.finished
         {
             return Ok(());
         }
@@ -914,6 +913,12 @@ impl Reconciler {
         if unseen.is_empty() {
             return Ok(());
         }
+        if record.finished
+            && (record.workflow.confirmed != Some(crate::run::WorkflowStage::InReview)
+                || !unseen.iter().any(|item| item.kind == "merge-decision"))
+        {
+            return Ok(());
+        }
         let ids: Vec<&str> = unseen.iter().map(|i| i.id.as_str()).collect();
         let hash = files::sha256_hex(ids.join("\n").as_bytes());
         if self.nudged.get(&run.key) == Some(&hash) {
@@ -924,7 +929,30 @@ impl Reconciler {
         } else {
             coordinator::NUDGE_INBOX
         };
-        outbox::clear_turn_complete(run)?;
+        let run_for_write = run.clone();
+        let resume_review = unseen.iter().any(|item| item.kind == "merge-decision");
+        if !blocking(move || {
+            let lock = run_for_write.lock()?;
+            let current = run_for_write.record()?;
+            if current.status != crate::run::Status::Active
+                || current.stopped
+                || current.awaiting_reply.is_some()
+                || (current.finished
+                    && !(resume_review
+                        && current.workflow.confirmed == Some(crate::run::WorkflowStage::InReview)))
+            {
+                return Ok(false);
+            }
+            run_for_write.update_held(&lock, |record| {
+                record.finished = false;
+                record.turn_complete = None;
+            })?;
+            Ok(true)
+        })
+        .await?
+        {
+            return Ok(());
+        }
         if super::launch::delivered(d.herdr.agent_prompt(&agent.pane, text).await).is_ok() {
             self.nudged.insert(run.key.clone(), hash);
         }

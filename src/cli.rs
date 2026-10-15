@@ -94,6 +94,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DebugCommand {
+    /// Start one real coordinator without prompting it, then remove its workspace.
+    AgentSmoke(crate::agent_smoke::Options),
     /// Follow the Herdr session and print one JSON line per wake.
     HerdrWatch {
         /// The socket to watch; the configured session's by default.
@@ -270,6 +272,14 @@ fn parse_option(text: &str) -> Result<(String, String), String> {
 pub async fn run() -> Result<()> {
     let command = Cli::parse().command;
     let env = Env::from_process()?;
+    // This opt-in check must never inspect or chmod the ordinary state folder,
+    // start the ticker, or enter any credential-loading path.
+    let command = match command {
+        Command::Debug {
+            command: DebugCommand::AgentSmoke(options),
+        } => return crate::agent_smoke::run(&env, options).await,
+        command => command,
+    };
     let runner = RealRunner;
     let ctx = Ctx {
         env: &env,
@@ -291,6 +301,9 @@ pub async fn run() -> Result<()> {
     }
 
     match command {
+        Command::Debug {
+            command: DebugCommand::AgentSmoke(_),
+        } => unreachable!("handled before ordinary state initialization"),
         Command::Debug {
             command: DebugCommand::HerdrWatch { socket },
         } => herdr_watch(socket).await,
@@ -474,6 +487,27 @@ async fn herdr_watch(socket: Option<PathBuf>) -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn agent_smoke_requires_an_explicit_session_and_exactly_one_target() {
+        let prefix = ["herdr-linear-agent", "debug", "agent-smoke"];
+        for args in [
+            vec![],
+            vec!["--kind", "codex"],
+            vec!["--session", "test"],
+            vec!["--session", "test", "--kind", "codex", "--profile", "deep"],
+        ] {
+            assert!(Cli::try_parse_from(prefix.into_iter().chain(args)).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(
+                prefix
+                    .into_iter()
+                    .chain(["--session", "test", "--kind", "codex"])
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn the_manifest_names_only_existing_actions() {

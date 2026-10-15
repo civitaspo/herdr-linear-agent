@@ -32,19 +32,11 @@ fn start_session(record: &AgentRecord) -> String {
 /// and, for a resume, the session; a new Claude session gets its id. Codex
 /// takes its `resume <id>` words first.
 fn start_args(config: &Config, record: &AgentRecord, session: &str) -> Result<Vec<String>> {
-    let mut args = agents::profile_args(config.profile(&record.profile)?);
-    let resume = agents::resume_args(&record.kind, session).filter(|_| record.resume);
-    match resume {
-        Some(resume) if record.kind == "codex" => {
-            args.splice(0..0, resume);
-        }
-        Some(resume) => args.extend(resume),
-        None if record.kind == "claude" && !session.is_empty() => {
-            args.extend(["--session-id".to_string(), session.to_string()]);
-        }
-        None => {}
-    }
-    Ok(args)
+    Ok(agents::start_args(
+        config.profile(&record.profile)?,
+        record.resume,
+        session,
+    ))
 }
 
 /// Sets a placed coordinator open in its root pane, ready to be started.
