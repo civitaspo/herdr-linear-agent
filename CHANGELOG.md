@@ -5,11 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] - 2026-10-15
+## [0.8.0] - 2026-10-16
 
 
 ### Bug Fixes
 
+- update rust crate rusqlite to 0.40 (#161)
 - recover detached runs with comment approval (#138)
 - respect queued prompts and complete coordinator turns (#115)
 - restore the pull request number for workspace labels (#109)
@@ -24,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- keep issue agents in one Herdr workspace (#163)
 - add postmortem supervisor (#157)
 - add optional merge decision agent (#151)
 - restore the factory workflow and authorize PR merges (#146)
