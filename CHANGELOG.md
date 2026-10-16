@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.1] - 2026-10-16
 
 
+### Bug Fixes
+
+- synchronize descendant cancellation test (#168)
+
+
 ### Maintenance
 
 - update Securefix caller workflows to v0.2.20 (#167)
