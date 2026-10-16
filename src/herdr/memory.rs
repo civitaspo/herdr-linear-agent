@@ -3,12 +3,14 @@
 //! model, so callers decide from a snapshot as they do against Herdr.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::oneshot;
 
-use super::{Agent, AgentStatus, Herdr, HerdrError, Pane, PaneId, Placed, Snapshot, WorkspaceId};
+use super::{
+    Agent, AgentStatus, Herdr, HerdrError, Pane, PaneId, Placed, Snapshot, Tab, WorkspaceId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Start {
@@ -36,10 +38,12 @@ struct FakeAgent {
 
 #[derive(Default)]
 struct Model {
-    home: PathBuf,
     workspaces: u32,
+    next_tabs: BTreeMap<WorkspaceId, u32>,
+    next_panes: BTreeMap<WorkspaceId, u32>,
     panes: BTreeMap<PaneId, Pane>,
     labels: BTreeMap<WorkspaceId, String>,
+    tab_labels: BTreeMap<String, String>,
     agents: BTreeMap<PaneId, FakeAgent>,
     requests: Vec<String>,
     starts: Vec<Start>,
@@ -50,10 +54,10 @@ struct Model {
     focused: Vec<WorkspaceId>,
     notifications: Vec<(String, String)>,
     metadata: Vec<Metadata>,
-    worktrees: Vec<(String, String, String)>,
     /// The next `agent.start` fails with this code; `agent_not_ready` leaves
     /// a blocked agent in the pane.
     start_error: Option<String>,
+    pane_close_errors: BTreeMap<PaneId, String>,
     /// Snapshots a started agent stays hidden for.
     detection_lag: u32,
     /// Agents report no session, as without Herdr's agent integrations.
@@ -62,8 +66,7 @@ struct Model {
     pane_lag: u32,
     /// Panes that are not in snapshots yet, with the snapshots left.
     hidden_panes: BTreeMap<PaneId, u32>,
-    /// The next placement (`workspace.create`, `worktree.create`,
-    /// `worktree.open`) does its work, then answers `OutcomeUnknown`.
+    /// The next workspace or tab creation succeeds, then answers `OutcomeUnknown`.
     placement_unknown: bool,
     /// The next `agent.prompt` is delivered, then answers `OutcomeUnknown`.
     prompt_unknown: bool,
@@ -120,6 +123,9 @@ impl Model {
             label: None,
         };
         self.labels.insert(workspace, label.into());
+        self.tab_labels.insert(format!("w{n}:t1"), label.into());
+        self.next_tabs.insert(WorkspaceId(format!("w{n}")), 2);
+        self.next_panes.insert(WorkspaceId(format!("w{n}")), 2);
         self.panes.insert(pane.id.clone(), pane.clone());
         if self.pane_lag > 0 {
             self.hidden_panes.insert(pane.id.clone(), self.pane_lag);
@@ -127,13 +133,36 @@ impl Model {
         pane
     }
 
-    fn placed(&mut self, pane: Pane, worktree_path: Option<String>) -> Result<Placed, HerdrError> {
+    fn new_tab(&mut self, workspace: &WorkspaceId, cwd: &str, label: &str) -> Pane {
+        let tab_number = self.next_tabs.entry(workspace.clone()).or_insert(1);
+        let tab = format!("{}:t{}", workspace.0, *tab_number);
+        *tab_number += 1;
+        let pane_number = self.next_panes.entry(workspace.clone()).or_insert(1);
+        let id = PaneId(format!("{}:p{}", workspace.0, *pane_number));
+        *pane_number += 1;
+        let pane = Pane {
+            id: id.clone(),
+            workspace: workspace.clone(),
+            tab: tab.clone(),
+            terminal: format!("term-{id}"),
+            cwd: Some(cwd.into()),
+            foreground_cwd: Some(cwd.into()),
+            label: None,
+        };
+        self.tab_labels.insert(tab, label.into());
+        self.panes.insert(id.clone(), pane.clone());
+        if self.pane_lag > 0 {
+            self.hidden_panes.insert(id, self.pane_lag);
+        }
+        pane
+    }
+
+    fn placed(&mut self, pane: Pane) -> Result<Placed, HerdrError> {
         let placed = Placed {
             workspace: pane.workspace,
             tab: pane.tab,
             pane: pane.id,
             cwd: pane.cwd.unwrap_or_default(),
-            worktree_path,
         };
         if std::mem::take(&mut self.placement_unknown) {
             return Err(HerdrError::OutcomeUnknown("no answer in time".into()));
@@ -145,6 +174,9 @@ impl Model {
         self.panes.retain(|_, p| p.workspace != *workspace);
         let panes = &self.panes;
         self.agents.retain(|pane, _| panes.contains_key(pane));
+        self.labels.remove(workspace);
+        self.tab_labels
+            .retain(|tab, _| !tab.starts_with(&format!("{}:", workspace.0)));
     }
 
     fn snapshot(&mut self) -> Result<Snapshot, HerdrError> {
@@ -189,6 +221,21 @@ impl Model {
         Ok(Snapshot {
             version: "0.9.1".into(),
             protocol: 22,
+            tabs: panes
+                .values()
+                .filter_map(|pane| {
+                    self.tab_labels.get(&pane.tab).map(|label| {
+                        (
+                            pane.tab.clone(),
+                            Tab {
+                                tab_id: pane.tab.clone(),
+                                workspace_id: pane.workspace.0.clone(),
+                                label: label.clone(),
+                            },
+                        )
+                    })
+                })
+                .collect(),
             panes,
             agents,
             skipped,
@@ -204,13 +251,9 @@ impl Model {
 }
 
 impl FakeHerdr {
-    /// A fake whose worktrees are folders under `home/worktrees`.
-    pub fn new(home: &Path) -> Self {
+    pub fn new(_home: &Path) -> Self {
         FakeHerdr {
-            model: Arc::new(Mutex::new(Model {
-                home: home.to_path_buf(),
-                ..Model::default()
-            })),
+            model: Arc::new(Mutex::new(Model { ..Model::default() })),
         }
     }
 
@@ -260,17 +303,16 @@ impl FakeHerdr {
         self.model().metadata.clone()
     }
 
-    /// `(cwd, branch, base)` of every worktree created.
-    pub fn worktrees(&self) -> Vec<(String, String, String)> {
-        self.model().worktrees.clone()
-    }
-
     /// The label a workspace was created with.
     pub fn label(&self, workspace: &str) -> Option<String> {
         self.model()
             .labels
             .get(&WorkspaceId(workspace.into()))
             .cloned()
+    }
+
+    pub fn tab_label(&self, tab: &str) -> Option<String> {
+        self.model().tab_labels.get(tab).cloned()
     }
 
     pub fn omit_workspace_labels_in_snapshot(&self) {
@@ -283,6 +325,13 @@ impl FakeHerdr {
 
     pub fn fail_next_start(&self, code: &str) {
         self.model().start_error = Some(code.into());
+    }
+
+    /// Make closing this pane fail once, without removing it from the model.
+    pub fn fail_pane_close(&self, pane: &str, code: &str) {
+        self.model()
+            .pane_close_errors
+            .insert(PaneId(pane.into()), code.into());
     }
 
     /// Started agents report no session id, as without Herdr's agent
@@ -423,44 +472,22 @@ impl Herdr for FakeHerdr {
         let mut model = self.model();
         model.request("workspace.create")?;
         let pane = model.new_workspace(cwd, label);
-        model.placed(pane, None)
+        model.placed(pane)
     }
 
-    async fn worktree_create(
+    async fn tab_create(
         &self,
+        workspace: &WorkspaceId,
         cwd: &str,
-        branch: &str,
-        base: &str,
         label: &str,
     ) -> Result<Placed, HerdrError> {
         let mut model = self.model();
-        model.request("worktree.create")?;
-        let path = model.home.join("worktrees").join(branch.replace('/', "-"));
-        std::fs::create_dir_all(&path).unwrap();
-        let path = path.to_string_lossy().into_owned();
-        model
-            .worktrees
-            .push((cwd.into(), branch.into(), base.into()));
-        let pane = model.new_workspace(&path, label);
-        model.placed(pane, Some(path))
-    }
-
-    async fn worktree_open(
-        &self,
-        cwd: &str,
-        path: &str,
-        label: &str,
-    ) -> Result<Placed, HerdrError> {
-        let mut model = self.model();
-        model.request("worktree.open")?;
-        if cwd.is_empty() {
-            return Err(HerdrError::Api {
-                code: "not_git_worktree".into(),
-                message: "Herdr worktree actions require a workspace inside a Git work tree".into(),
-            });
+        model.request("tab.create")?;
+        if !model.labels.contains_key(workspace) {
+            return Err(not_found("workspace", &workspace.0));
         }
-        let pane = model.new_workspace(path, label);
-        model.placed(pane, Some(path.into()))
+        let pane = model.new_tab(workspace, cwd, label);
+        model.placed(pane)
     }
 
     async fn agent_start(
@@ -547,6 +574,27 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
+    async fn pane_close(&self, pane: &PaneId) -> Result<(), HerdrError> {
+        let mut model = self.model();
+        model.request("pane.close")?;
+        if let Some(code) = model.pane_close_errors.remove(pane) {
+            return Err(HerdrError::Api {
+                code,
+                message: format!("pane {} close failed", pane.0),
+            });
+        }
+        let Some(found) = model.panes.remove(pane) else {
+            return Err(not_found("pane", &pane.0));
+        };
+        model.agents.remove(pane);
+        model.tab_labels.remove(&found.tab);
+        if !model.panes.values().any(|p| p.workspace == found.workspace) {
+            model.labels.remove(&found.workspace);
+            model.closed.push(found.workspace);
+        }
+        Ok(())
+    }
+
     async fn agent_rename(&self, pane: &PaneId, name: &str) -> Result<(), HerdrError> {
         let mut model = self.model();
         model.request("agent.rename")?;
@@ -555,6 +603,16 @@ impl Herdr for FakeHerdr {
             agent.agent.name = Some(name.into());
         }
         model.renames.push((pane.clone(), name.into()));
+        Ok(())
+    }
+
+    async fn tab_rename(&self, tab: &str, label: &str) -> Result<(), HerdrError> {
+        let mut model = self.model();
+        model.request("tab.rename")?;
+        let Some(found) = model.tab_labels.get_mut(tab) else {
+            return Err(not_found("tab", tab));
+        };
+        *found = label.into();
         Ok(())
     }
 
@@ -672,5 +730,54 @@ mod tests {
         let snapshot = herdr.snapshot().await.unwrap();
         assert!(snapshot.agents.is_empty() && snapshot.panes.len() == 1);
         assert_eq!(herdr.closed(), [placed.workspace]);
+    }
+
+    #[tokio::test]
+    async fn tabs_are_unique_renamable_and_close_the_workspace_with_the_last_pane() {
+        let home = tempfile::tempdir().unwrap();
+        let herdr = FakeHerdr::new(home.path());
+        let coordinator = herdr.workspace_create("/run", "DATA-1 Fix").await.unwrap();
+        let worker = herdr
+            .tab_create(&coordinator.workspace, "/wt/api", "api · w1")
+            .await
+            .unwrap();
+        assert_eq!(worker.workspace, coordinator.workspace);
+        assert_ne!(worker.tab, coordinator.tab);
+        assert_ne!(worker.pane, coordinator.pane);
+        assert_eq!(worker.cwd, "/wt/api");
+        assert_eq!(herdr.tab_label(&worker.tab).as_deref(), Some("api · w1"));
+
+        herdr
+            .tab_rename(&worker.tab, "api · w1 · task")
+            .await
+            .unwrap();
+        assert_eq!(
+            herdr.tab_label(&worker.tab).as_deref(),
+            Some("api · w1 · task")
+        );
+        herdr.pane_close(&worker.pane).await.unwrap();
+        assert!(herdr.closed().is_empty());
+        herdr.pane_close(&coordinator.pane).await.unwrap();
+        assert_eq!(herdr.closed(), [coordinator.workspace]);
+        assert!(herdr.tab_label(&coordinator.tab).is_none());
+        assert!(herdr.tab_label(&worker.tab).is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_tab_creation_does_not_reuse_ids_after_a_close() {
+        let home = tempfile::tempdir().unwrap();
+        let herdr = FakeHerdr::new(home.path());
+        let coordinator = herdr.workspace_create("/run", "run").await.unwrap();
+        let first = herdr
+            .tab_create(&coordinator.workspace, "/wt/one", "one")
+            .await
+            .unwrap();
+        herdr.pane_close(&first.pane).await.unwrap();
+        let second = herdr
+            .tab_create(&coordinator.workspace, "/wt/two", "two")
+            .await
+            .unwrap();
+        assert_ne!(first.tab, second.tab);
+        assert_ne!(first.pane, second.pane);
     }
 }

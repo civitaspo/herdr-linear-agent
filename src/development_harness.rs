@@ -4,12 +4,19 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
+use serde::Serialize;
 
 use crate::files::write_atomic;
 use crate::paths::{self, Env};
+use crate::process::{Cmd, RealRunner, Runner};
+
+mod fixture;
+mod lifecycle;
+mod ordinary;
 
 const MARKER: &str = ".hla-development-session";
 const REMOVED_VARS: &[&str] = &[
@@ -38,6 +45,45 @@ pub enum Command {
     Exec(Launch),
     /// Stop the isolated ticker and delete its session, retaining all files.
     Stop { root: PathBuf },
+    /// Clone the configured scratch repository twice and write isolated test profiles.
+    Fixture {
+        root: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        team: String,
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        allowed_user: String,
+        #[arg(long, default_value = "gpt-6-luna")]
+        model: String,
+    },
+    /// Run one deterministic post-create or post-remove hook step.
+    Hook { root: PathBuf, step: String },
+    /// Run one bounded live lifecycle verification against a delegated scratch issue.
+    Verify {
+        root: PathBuf,
+        key: String,
+        #[arg(long)]
+        terminal: String,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        pause_after_workers: bool,
+    },
+    /// Resume a verifier paused for visual inspection after both workers started.
+    Resume { root: PathBuf, key: String },
+    /// Record and stop the ordinary ticker before live scratch verification.
+    OrdinarySuspend {
+        root: PathBuf,
+        #[arg(long)]
+        plugin: PathBuf,
+    },
+    /// Verify ordinary state and restart the ticker recorded by ordinary-suspend.
+    OrdinaryRestore { root: PathBuf },
 }
 
 #[derive(Args)]
@@ -47,12 +93,12 @@ pub struct Launch {
     args: Vec<OsString>,
 }
 
-struct Harness {
+pub(super) struct Harness {
     root: PathBuf,
     session: String,
 }
 
-pub fn run(env: &Env, command: Command) -> Result<()> {
+pub async fn run(env: &Env, command: Command) -> Result<()> {
     match command {
         Command::Init { root, session } => {
             let harness = Harness::init(env, &root, session)?;
@@ -62,11 +108,15 @@ pub fn run(env: &Env, command: Command) -> Result<()> {
             );
             Ok(())
         }
-        Command::Stop { root } => Harness::open(env, &root, false)?.stop(env, &paths::binary()?),
+        Command::Stop { root } => {
+            Harness::open(env, &root, false)?
+                .stop(env, &paths::binary()?)
+                .await
+        }
         Command::Plugin(launch) => {
             let harness = Harness::open(env, &launch.root, true)?;
             Err(harness
-                .command(env, paths::binary()?)
+                .raw_command(env, paths::binary()?)
                 .args(launch.args)
                 .exec())
             .context("could not execute isolated plugin")
@@ -74,7 +124,7 @@ pub fn run(env: &Env, command: Command) -> Result<()> {
         Command::Herdr(launch) => {
             let harness = Harness::open(env, &launch.root, true)?;
             Err(harness
-                .command(env, env.herdr_bin())
+                .raw_command(env, env.herdr_bin())
                 .args(["--session", &harness.session])
                 .args(launch.args)
                 .exec())
@@ -86,8 +136,70 @@ pub fn run(env: &Env, command: Command) -> Result<()> {
                 .args
                 .split_first()
                 .context("exec requires a command")?;
-            Err(harness.command(env, program).args(args).exec())
+            Err(harness.raw_command(env, program).args(args).exec())
                 .context("could not execute isolated command")
+        }
+        Command::Fixture {
+            root,
+            repository,
+            workspace,
+            team,
+            client_id,
+            allowed_user,
+            model,
+        } => {
+            let harness = Harness::open(env, &root, true)?;
+            crate::development_harness::fixture::prepare(
+                &harness,
+                env,
+                &repository,
+                &workspace,
+                &team,
+                &client_id,
+                &allowed_user,
+                &model,
+            )
+            .await
+        }
+        Command::Hook { root, step } => {
+            // Hooks already inherit isolated XDG paths; their own validation
+            // checks the marker and exact fixture paths without ordinary-path
+            // overlap checks against that same isolated environment.
+            crate::development_harness::fixture::hook(&root, &step)
+        }
+        Command::Verify {
+            root,
+            key,
+            terminal,
+            timeout_seconds,
+            pause_after_workers,
+        } => {
+            let harness = Harness::open(env, &root, true)?;
+            crate::development_harness::lifecycle::verify(
+                &harness,
+                env,
+                &key,
+                &terminal,
+                timeout_seconds,
+                pause_after_workers,
+            )
+            .await
+        }
+        Command::Resume { root, key } => {
+            let harness = Harness::open(env, &root, true)?;
+            crate::development_harness::lifecycle::resume(&harness, &key)
+        }
+        Command::OrdinarySuspend { root, plugin } => {
+            let harness = Harness::open(env, &root, true)?;
+            crate::development_harness::ordinary::suspend(&harness, env, &plugin)
+                .await
+                .map(|message| println!("{message}"))
+        }
+        Command::OrdinaryRestore { root } => {
+            let harness = Harness::open(env, &root, false)?;
+            crate::development_harness::ordinary::restore(&harness, env)
+                .await
+                .map(|message| println!("{message}"))
         }
     }
 }
@@ -190,7 +302,7 @@ impl Harness {
         Ok(Self { root, session })
     }
 
-    fn command(&self, env: &Env, program: impl AsRef<OsStr>) -> Process {
+    fn raw_command(&self, env: &Env, program: impl AsRef<OsStr>) -> Process {
         let mut child = Process::new(program);
         child
             .current_dir(&self.root)
@@ -208,35 +320,126 @@ impl Harness {
         child
     }
 
-    fn stop(&self, env: &Env, plugin: &Path) -> Result<()> {
-        let mut commands = [
-            self.command(env, plugin),
-            self.command(env, env.herdr_bin()),
-            self.command(env, env.herdr_bin()),
-        ];
-        commands[0].args(["ticker", "stop"]);
-        commands[1].args(["session", "stop", &self.session, "--json"]);
-        commands[2].args(["session", "delete", &self.session, "--json"]);
-        let mut failed = false;
-        for mut child in commands {
-            match child.status() {
-                Ok(status) if status.success() => {}
-                result => {
-                    eprintln!(
-                        "harness cleanup failed for {}: {result:?}",
-                        child.get_program().to_string_lossy()
-                    );
-                    failed = true;
-                }
+    fn command(&self, env: &Env, program: impl AsRef<OsStr>) -> Cmd {
+        let raw = self.raw_command(env, program);
+        let mut child = Cmd::new(raw.get_program().to_string_lossy(), Duration::from_secs(60))
+            .cwd(self.root.clone())
+            .max_output_bytes(1024 * 1024);
+        for arg in raw.get_args() {
+            child = child.arg(arg.to_string_lossy());
+        }
+        for (key, value) in raw.get_envs() {
+            match value {
+                Some(value) => child = child.env(key, value),
+                None => child = child.env_remove(key),
             }
         }
+        child
+    }
+
+    async fn stop(&self, env: &Env, plugin: &Path) -> Result<()> {
+        #[derive(Debug, Serialize)]
+        struct StopResult {
+            commands: Vec<(String, String)>,
+            ticker_free: bool,
+            ticker_observation: String,
+            session_absent: bool,
+            session_observation: String,
+        }
+        let mut results = Vec::new();
+        for (program, args) in [
+            (
+                plugin.to_string_lossy().into_owned(),
+                vec!["ticker", "stop"],
+            ),
+            (
+                env.herdr_bin(),
+                vec!["session", "stop", &self.session, "--json"],
+            ),
+            (
+                env.herdr_bin(),
+                vec!["session", "delete", &self.session, "--json"],
+            ),
+        ] {
+            let label = format!("{program} {}", args.join(" "));
+            let result = execute(self, env, Path::new(&program), &args).await;
+            results.push((label, result.unwrap_or_else(|e| format!("ERROR: {e:#}"))));
+        }
+        let ticker_free = matches!(
+            crate::ticker::lock_state(&self.root.join("state/herdr-linear-agent")),
+            crate::ticker::LockState::Free
+        );
+        let ticker_observation =
+            crate::ticker::describe(&self.root.join("state/herdr-linear-agent"));
+        let list = execute(
+            self,
+            env,
+            Path::new(&env.herdr_bin()),
+            &["session", "list", "--json"],
+        )
+        .await;
+        let (session_absent, session_observation) = match list {
+            Ok(text) => (
+                session_absent(&text, &self.session),
+                format!("session list output: {}", text.trim()),
+            ),
+            Err(error) => (false, format!("session list failed: {error:#}")),
+        };
+        let evidence = StopResult {
+            commands: results,
+            ticker_free,
+            ticker_observation,
+            session_absent,
+            session_observation,
+        };
+        write_atomic(
+            &self.root.join("stop-result.json"),
+            &serde_json::to_vec_pretty(&evidence)?,
+        )?;
         ensure!(
-            !failed,
-            "harness cleanup failed; retained files at {}",
+            ticker_free && session_absent,
+            "harness cleanup incomplete; observed {evidence:?}; files retained at {}",
             self.root.display()
         );
         Ok(())
     }
+}
+
+pub(super) async fn execute(
+    harness: &Harness,
+    env: &Env,
+    program: &Path,
+    args: &[&str],
+) -> Result<String> {
+    let cmd = harness.command(env, program).args(args.iter().copied());
+    let output = RealRunner.run(&cmd).await?;
+    ensure!(
+        output.success(),
+        "{} failed: {} (stdout: {}; stderr: {})",
+        std::iter::once(cmd.program.as_str())
+            .chain(cmd.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        output.error_text(),
+        output.stdout.trim(),
+        output.stderr.trim()
+    );
+    Ok(output.stdout)
+}
+
+fn session_absent(list: &str, session: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(list)
+        .ok()
+        .and_then(|v| {
+            v.get("sessions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|sessions| {
+            !sessions
+                .iter()
+                .any(|s| s.get("name").and_then(serde_json::Value::as_str) == Some(session))
+        })
 }
 
 fn valid_session(session: &str) -> Result<()> {
@@ -280,6 +483,31 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    #[tokio::test]
+    async fn hooks_use_their_own_validation_when_xdg_already_points_inside_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let ordinary = Env::for_test(&temp.path().join("ordinary"), &[]);
+        let root = temp.path().join("scratch");
+        Harness::init(&ordinary, &root, "scratch-check".into()).unwrap();
+        let isolated = Env::for_test(
+            &ordinary.home,
+            &[
+                ("XDG_CONFIG_HOME", root.join("config").to_str().unwrap()),
+                ("XDG_STATE_HOME", root.join("state").to_str().unwrap()),
+            ],
+        );
+        let error = run(
+            &isolated,
+            Command::Hook {
+                root,
+                step: "invalid".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown fixture hook"));
+    }
+
     #[test]
     fn isolated_commands_keep_the_original_environment_contract() {
         let temp = tempfile::tempdir().unwrap();
@@ -294,22 +522,26 @@ mod tests {
             );
         }
         let child = harness.command(&env, "/bin/pwd");
-        assert_eq!(child.get_current_dir(), Some(harness.root.as_path()));
-        let vars: std::collections::HashMap<_, _> = child.get_envs().collect();
+        assert_eq!(child.cwd.as_deref(), Some(harness.root.as_path()));
+        let vars: std::collections::HashMap<OsString, OsString> = child
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         assert_eq!(
-            vars[OsStr::new("XDG_CONFIG_HOME")],
-            Some(harness.root.join("config").as_os_str())
+            vars.get(OsStr::new("XDG_CONFIG_HOME")),
+            Some(&harness.root.join("config").into_os_string())
         );
         assert_eq!(
-            vars[OsStr::new("XDG_STATE_HOME")],
-            Some(harness.root.join("state").as_os_str())
+            vars.get(OsStr::new("XDG_STATE_HOME")),
+            Some(&harness.root.join("state").into_os_string())
         );
         assert_eq!(
-            vars[OsStr::new("GH_CONFIG_DIR")],
-            Some(env.home.join(".config/gh").as_os_str())
+            vars.get(OsStr::new("GH_CONFIG_DIR")),
+            Some(&env.home.join(".config/gh").into_os_string())
         );
         for var in REMOVED_VARS {
-            assert_eq!(vars[OsStr::new(var)], None);
+            assert!(child.env_remove.contains(&OsString::from(var)));
         }
         assert!(!vars.contains_key(OsStr::new("HOME")));
         let herdr: toml::Value =
@@ -374,8 +606,8 @@ mod tests {
         assert!(!env.home.exists());
     }
 
-    #[test]
-    fn stop_attempts_every_cleanup_after_a_failure_and_retains_evidence() {
+    #[tokio::test]
+    async fn stop_attempts_every_cleanup_after_a_failure_and_retains_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let fake = temp.path().join("fake");
         let log = temp.path().join("calls");
@@ -400,10 +632,10 @@ mod tests {
         )
         .unwrap();
         let harness = Harness::open(&env, &root, false).unwrap();
-        assert!(harness.stop(&env, &fake).is_err());
+        assert!(harness.stop(&env, &fake).await.is_err());
         assert_eq!(
             fs::read_to_string(log).unwrap(),
-            "ticker stop\nsession stop scratch-check --json\nsession delete scratch-check --json\n"
+            "ticker stop\nsession stop scratch-check --json\nsession delete scratch-check --json\nsession list --json\n"
         );
         assert!(root.join(MARKER).is_file());
         assert!(!env.home.exists());

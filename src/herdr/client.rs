@@ -34,8 +34,61 @@ pub struct Snapshot {
     pub version: String,
     pub protocol: u32,
     pub panes: BTreeMap<PaneId, Pane>,
+    pub tabs: BTreeMap<String, Tab>,
     pub agents: Vec<Agent>,
     pub skipped: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Tab {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub label: String,
+}
+
+impl Snapshot {
+    /// Parses a raw `session.snapshot` result using the same lenient entry
+    /// handling as the live socket client. The harness uses this to retain
+    /// the exact observed JSON while checking it against the production types.
+    pub fn from_value(value: Value) -> Result<Self, HerdrError> {
+        #[derive(Deserialize)]
+        struct Answer {
+            snapshot: Raw,
+        }
+        #[derive(Deserialize)]
+        struct Raw {
+            version: String,
+            protocol: u32,
+            panes: Vec<Value>,
+            #[serde(default)]
+            tabs: Vec<Value>,
+            agents: Vec<Value>,
+        }
+        let Answer { snapshot } = serde_json::from_value(value)
+            .map_err(|error| HerdrError::Protocol(format!("{error}")))?;
+        let mut skipped = 0;
+        let panes = lenient::<Pane>(snapshot.panes, &mut skipped)
+            .into_iter()
+            .map(|pane| (pane.id.clone(), pane))
+            .collect();
+        let agents = lenient(snapshot.agents, &mut skipped);
+        let tabs = lenient::<Tab>(snapshot.tabs, &mut skipped)
+            .into_iter()
+            .map(|tab| (tab.tab_id.clone(), tab))
+            .collect();
+        Ok(Self {
+            version: snapshot.version,
+            protocol: snapshot.protocol,
+            panes,
+            tabs,
+            agents,
+            skipped,
+        })
+    }
+
+    pub fn tab_label(&self, tab: &str) -> Option<&str> {
+        self.tabs.get(tab).map(|tab| tab.label.as_str())
+    }
 }
 
 /// An `events.subscribe` connection after its acknowledgement. Herdr closes
@@ -175,31 +228,7 @@ impl Client {
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot, HerdrError> {
-        #[derive(Deserialize)]
-        struct Answer {
-            snapshot: Raw,
-        }
-        #[derive(Deserialize)]
-        struct Raw {
-            version: String,
-            protocol: u32,
-            panes: Vec<Value>,
-            agents: Vec<Value>,
-        }
-        let Answer { snapshot } = self.call("session.snapshot", json!({})).await?;
-        let mut skipped = 0;
-        let panes = lenient::<Pane>(snapshot.panes, &mut skipped)
-            .into_iter()
-            .map(|pane| (pane.id.clone(), pane))
-            .collect();
-        let agents = lenient(snapshot.agents, &mut skipped);
-        Ok(Snapshot {
-            version: snapshot.version,
-            protocol: snapshot.protocol,
-            panes,
-            agents,
-            skipped,
-        })
+        Snapshot::from_value(self.call("session.snapshot", json!({})).await?)
     }
 
     /// Only the snapshot's `version`, for telling an old Herdr whose snapshot
@@ -433,6 +462,24 @@ mod tests {
             (snapshot.version.as_str(), snapshot.protocol),
             ("0.9.1", 22)
         );
+    }
+
+    #[tokio::test]
+    async fn snapshots_use_tab_labels_and_count_malformed_tabs() {
+        let fake = FakeHerdrServer::start().await;
+        fake.set_raw_snapshot(json!({
+            "version": "0.9.3", "protocol": 22, "panes": [], "agents": [],
+            "tabs": [
+                {"tab_id":"w1:t1", "workspace_id":"w1", "label":"coordinator",
+                 "number":1, "focused":false, "pane_count":1, "agent_status":"unknown"},
+                {"tab_id":"broken"}
+            ]
+        }));
+        let snapshot = fake.client().snapshot().await.unwrap();
+        assert_eq!(snapshot.tab_label("w1:t1"), Some("coordinator"));
+        assert_eq!(snapshot.tabs["w1:t1"].workspace_id, "w1");
+        assert_eq!(snapshot.skipped, 1);
+        assert_eq!(snapshot.tab_label("broken"), None);
     }
 
     #[tokio::test]

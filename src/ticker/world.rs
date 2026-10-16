@@ -20,7 +20,7 @@ use crate::herdr::FakeHerdr;
 use crate::linear::api::fake::FakeLinear;
 use crate::linear::task::{Decline, LinearEvent, LinearLevel, LinearTask, RunQuery};
 use crate::paths::{Ctx, Env};
-use crate::process::fake::{FakeRunner, fail, ok};
+use crate::process::fake::{FakeRunner, ok};
 use crate::run::{Run, RunRecord};
 use crate::worker::Worker;
 
@@ -123,6 +123,46 @@ fn write_router(bin: &Path, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn initialize_repositories(config: &Config) {
+    for repo in config.repositories.values() {
+        std::fs::create_dir_all(&repo.path).unwrap();
+        for args in [
+            vec!["init", "-b", &repo.base],
+            vec!["config", "core.hooksPath", "/dev/null"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Test fixture",
+            ],
+            vec!["remote", "add", "origin", repo.path.to_str().unwrap()],
+            vec![
+                "update-ref",
+                &format!("refs/remotes/origin/{}", repo.base),
+                "HEAD",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.path)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
 fn env_in(home: &Path, path: &str) -> Env {
     let root = home.to_string_lossy().into_owned();
     Env::for_test(
@@ -175,9 +215,9 @@ impl World {
         let text = edit(text);
         crate::config::tests::write_sample(&env.config_dir(), &text);
         let config = Config::load(&env.config_dir()).unwrap();
+        initialize_repositories(&config);
         write_router(&bin, &answer_with("coordinator"));
-        let runner = FakeRunner::new();
-        runner.on("git -C", fail(128, "not a git repository"));
+        let runner = FakeRunner::new().with_real_git();
         runner.on("fetch origin", ok(""));
         let (reconciler, effects, routing) = channels();
         World {
@@ -206,7 +246,9 @@ impl World {
     }
 
     /// The same World after a ticker restart: nothing kept in memory.
-    pub fn restart_ticker(&mut self) {
+    pub async fn restart_ticker(&mut self) {
+        self.reconciler.shutdown_worker_tasks().await;
+        self.reconciler.cleanup.shutdown().await;
         let (mut reconciler, effects, routing) = channels();
         #[cfg(test)]
         {
@@ -224,12 +266,12 @@ impl World {
 
     /// What a reload of a changed config does: the ticker's tasks start again
     /// with the config the files now hold.
-    pub fn reload_config(&mut self) {
+    pub async fn reload_config(&mut self) {
         self.config = Config::load(&self.env.config_dir()).unwrap();
-        self.restart_ticker();
+        self.restart_ticker().await;
     }
 
-    pub fn merge_decision_mode(&mut self, max_risk_score: u8) {
+    pub async fn merge_decision_mode(&mut self, max_risk_score: u8) {
         let path = self.env.config_dir().join(crate::config::FILE_NAME);
         let text = std::fs::read_to_string(&path).unwrap();
         let text = text.replacen(
@@ -240,7 +282,7 @@ impl World {
             1,
         );
         std::fs::write(path, text).unwrap();
-        self.reload_config();
+        self.reload_config().await;
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
@@ -354,6 +396,19 @@ impl World {
             let asked = self.herdr.requests().len();
             let queries = self.reconciler.queries().to_vec();
             self.once().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self
+                    .reconciler
+                    .worker_tasks
+                    .values()
+                    .all(|task| task.is_finished())
+                    || !self.reconciler.cleanup.tasks_finished()
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("an owned lifecycle task did not finish");
             let effects = self.herdr.requests()[asked..]
                 .iter()
                 .filter(|method| !READS.contains(&method.as_str()))
@@ -501,18 +556,22 @@ impl World {
         }
         // An effect task still out may change Herdr between the two passes;
         // then only the absence of a second effect is checked.
-        let quiet = self.reconciler.effects_in_flight() == 0;
+        let owned_tasks =
+            !self.reconciler.worker_tasks.is_empty() || self.reconciler.cleanup.is_busy();
+        let quiet = !self.reconciler.busy() && !owned_tasks;
         let before = files_under(&ctx.runs_dir());
         let asked = self.herdr.requests().len();
         let in_flight = self.reconciler.effects_in_flight();
         self.reconciler
             .pass(&deps, &levels, Wake::default(), self.now)
             .await;
-        assert_eq!(
-            in_flight,
-            self.reconciler.effects_in_flight(),
-            "a repeated pass started an effect"
-        );
+        if !owned_tasks {
+            assert_eq!(
+                in_flight,
+                self.reconciler.effects_in_flight(),
+                "a repeated pass started an effect"
+            );
+        }
         if quiet {
             let repeated: Vec<String> = self.herdr.requests()[asked..]
                 .iter()
@@ -572,6 +631,22 @@ impl World {
     pub async fn pass_alone(&mut self) {
         let level = self.task.level().clone();
         self.pass(Wake::default(), &level).await;
+    }
+
+    /// Wait until all owned worker lifecycle tasks finish their current phase.
+    pub async fn wait_worker_tasks(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !self
+                .reconciler
+                .worker_tasks
+                .values()
+                .all(|task| task.is_finished())
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("an owned worker task did not finish");
     }
 
     /// Entries per in-memory map of the reconciler.
@@ -714,16 +789,18 @@ impl World {
     }
 
     /// `worker start DATA-1` on `repo` with the `standard` profile.
-    pub async fn start_worker(&self, repo: &str) -> Worker {
+    pub async fn start_worker(&mut self, repo: &str) -> Worker {
         let args = WorkerStart {
             repo: repo.into(),
             profile: "standard".into(),
             title: format!("Change {repo}"),
             task: "Make the change and open a PR.".into(),
         };
-        commands::worker_start(&self.ctx(), &self.session(), "acme/DATA-1", &args)
+        let requested = commands::worker_start(&self.ctx(), &self.session(), "acme/DATA-1", &args)
             .await
-            .unwrap()
+            .unwrap();
+        self.settle().await;
+        self.worker("DATA-1", &requested.id)
     }
 
     /// The action names the plugin sent, oldest first.

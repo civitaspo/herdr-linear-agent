@@ -125,6 +125,8 @@ impl AgentKey {
 pub enum EffectDone {
     Placed {
         key: AgentKey,
+        operation_id: uuid::Uuid,
+        session: String,
         result: Result<Placed, HerdrError>,
     },
     Started {
@@ -182,6 +184,8 @@ impl<H: Herdr> Deps<'_, H> {
 /// The reconciler's memory between passes. Everything that must survive a
 /// restart is in the run folders.
 pub struct Reconciler {
+    pub(super) cleanup: super::cleanup::CleanupDriver,
+    pub(super) worker_tasks: BTreeMap<AgentKey, tokio::task::JoinHandle<Result<()>>>,
     pub(super) effects: mpsc::Sender<EffectDone>,
     pub(super) routing_done: mpsc::Sender<RoutingDone>,
     pub(super) bin: String,
@@ -238,6 +242,14 @@ pub struct Reconciler {
         BTreeMap<super::merge_decisions::DecisionKey, Timestamp>,
     #[cfg(test)]
     pub(super) decision_test_replies: super::merge_decisions::TestReplies,
+}
+
+impl Drop for Reconciler {
+    fn drop(&mut self) {
+        for task in self.worker_tasks.values() {
+            task.abort();
+        }
+    }
 }
 
 pub(super) async fn blocking<T: Send + 'static>(
@@ -306,6 +318,57 @@ pub(super) fn attempt_due(record: &AgentRecord) -> Option<Timestamp> {
 }
 
 impl Reconciler {
+    pub(super) async fn cancel_worker_tasks(&mut self, run_key: &str) {
+        let keys: Vec<_> = self
+            .worker_tasks
+            .keys()
+            .filter(|key| key.run == run_key)
+            .cloned()
+            .collect();
+        for key in &keys {
+            if let Some(task) = self.worker_tasks.get(key) {
+                task.abort();
+            }
+        }
+        for key in keys {
+            if let Some(task) = self.worker_tasks.remove(&key) {
+                let _ = task.await;
+            }
+        }
+    }
+
+    pub(super) async fn shutdown_worker_tasks(&mut self) {
+        let tasks = std::mem::take(&mut self.worker_tasks);
+        for task in tasks.values() {
+            task.abort();
+        }
+        for (_, task) in tasks {
+            let _ = task.await;
+        }
+    }
+
+    async fn reap_worker_tasks<H>(&mut self, d: &Deps<'_, H>) {
+        let keys: Vec<_> = self
+            .worker_tasks
+            .iter()
+            .filter(|(_, task)| task.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            if let Some(task) = self.worker_tasks.remove(&key) {
+                match task.await {
+                    Ok(Ok(())) => (),
+                    Ok(Err(error)) => d.fail(&key.run, &error),
+                    Err(error) if error.is_cancelled() => (),
+                    Err(error) => d.log.line(&format!(
+                        "{} worker lifecycle task failed: {error}",
+                        key.run
+                    )),
+                }
+            }
+        }
+    }
+
     /// Whether a placement or start of `key` must wait: for the spacing of
     /// its counted attempts, or 15 s after one that never reached Herdr.
     pub(super) fn waits(&self, key: &AgentKey, record: &AgentRecord, now: Timestamp) -> bool {
@@ -352,6 +415,8 @@ impl Reconciler {
         routing_done: mpsc::Sender<RoutingDone>,
     ) -> Result<Self> {
         Ok(Reconciler {
+            cleanup: super::cleanup::CleanupDriver::default(),
+            worker_tasks: BTreeMap::new(),
             effects,
             routing_done,
             bin: coordinator::binary_command()?,
@@ -390,6 +455,8 @@ impl Reconciler {
             || !self.keeping.is_empty()
             || !self.writing.is_empty()
             || self.decision_task.is_some()
+            || !self.cleanup.tasks_finished()
+            || self.worker_tasks.values().any(|task| !task.is_finished())
     }
 
     /// Waits for the transcript copies and postmortems still running.
@@ -517,6 +584,7 @@ impl Reconciler {
         wake: Wake,
         now: Timestamp,
     ) {
+        self.reap_worker_tasks(d).await;
         self.log_kept(d).await;
         self.postmortems(d, now).await;
         let snapshot = d.herdr.snapshot().await.ok();
@@ -555,10 +623,36 @@ impl Reconciler {
             self.apply_routing(d, done).await;
         }
         for run in Run::list(&d.ctx.runs_dir()) {
-            if !run.record().is_ok_and(|r| r.status == Status::Active) {
+            let Ok(record) = run.record() else { continue };
+            if record.status == Status::Closed {
+                if (record.coordinator_placement.is_some()
+                    || !record.coordinator_orphans.is_empty())
+                    && let Some(snapshot) = snap
+                    && let Err(error) = self.launch(d, snapshot, &run, now).await
+                {
+                    d.fail(&run.key, &error);
+                }
+                self.cancel_worker_tasks(&run.key).await;
+                if let Err(error) = self.cleanup.advance(d, snap, &run).await {
+                    d.fail(&run.key, &error);
+                }
                 continue;
             }
+            // Stop owned lifecycle effects as soon as the run becomes
+            // unavailable for work. Aborting and joining prevents a long
+            // hook or placement from continuing after stop/detach/finish;
+            // the durable operation remains available for an allowed resume.
+            if record.status != Status::Active {
+                self.cancel_worker_tasks(&run.key).await;
+                continue;
+            }
+            if record.stopped || record.finished || record.awaiting_reply.is_some() {
+                self.cancel_worker_tasks(&run.key).await;
+            }
             if let Some(snapshot) = snap {
+                if let Err(error) = self.worker_operations(d, Some(snapshot), &run).await {
+                    d.fail(&run.key, &error);
+                }
                 if let Err(error) = self.watch(d, snapshot, &run, now).await {
                     d.fail(&run.key, &error);
                 }
@@ -714,6 +808,12 @@ impl Reconciler {
     /// but held by another condition waits for the next wake.
     pub fn next_deadline<H>(&self, d: &Deps<'_, H>, now: Timestamp) -> Timestamp {
         let mut times: Vec<Timestamp> = Vec::new();
+        if self.cleanup.is_busy() {
+            times.push(now + SignedDuration::from_secs(1));
+        }
+        if !self.worker_tasks.is_empty() {
+            times.push(now + SignedDuration::from_secs(1));
+        }
         // A postmortem's answer wakes nothing: it is looked for every 5 s.
         if !self.writing.is_empty() {
             times.push(now + SignedDuration::from_secs(5));
@@ -871,6 +971,8 @@ pub async fn run<H: Herdr + Clone + 'static>(mut inputs: Inputs<'_, H>) -> Resul
             biased;
             changed = inputs.shutdown.changed() => {
                 if changed.is_err() || *inputs.shutdown.borrow() {
+                    reconciler.shutdown_worker_tasks().await;
+                    reconciler.cleanup.shutdown().await;
                     return Ok(());
                 }
             }

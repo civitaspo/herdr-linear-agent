@@ -66,11 +66,23 @@ impl Reconciler {
         };
         let mut next = record.clone();
         if let Some((workspace, tab, pane)) = &seen.moved_to {
-            next.workspace_id = workspace.clone();
+            if key.worker.is_some()
+                || record.workspace_id.is_empty()
+                || record.workspace_id == *workspace
+            {
+                next.workspace_id = workspace.clone();
+            } else {
+                // A coordinator move does not move its workers. Keep the
+                // run's recorded workspace as the placement authority.
+                next.workspace_id = record.workspace_id.clone();
+            }
             next.tab_id = tab.clone();
             next.pane_id = pane.clone();
         }
         if let Some(agent) = &seen.agent {
+            if record.herdr_session.is_empty() {
+                next.herdr_session = d.socket.to_string();
+            }
             if may_resume
                 && let Recovery::Starting {
                     attempt, session, ..
@@ -99,6 +111,32 @@ impl Reconciler {
             }
             if agent.name.as_deref().is_none_or(str::is_empty) && !record.agent_name.is_empty() {
                 let _ = d.herdr.agent_rename(&agent.pane, &record.agent_name).await;
+            }
+            if key.worker.is_none()
+                && let Some(pane) = snapshot.panes.get(&agent.pane)
+                && (!run
+                    .record()
+                    .is_ok_and(|record| record.coordinator_tab_named)
+                    || snapshot
+                        .tab_label(&pane.tab)
+                        .is_some_and(|label| label != coordinator::tab_label()))
+                && d.herdr
+                    .tab_rename(&pane.tab, coordinator::tab_label())
+                    .await
+                    .is_ok()
+            {
+                let pane_id = agent.pane.0.clone();
+                if let Err(error) = self
+                    .update_and_push(run, move |record| {
+                        if record.coordinator.pane_id == pane_id {
+                            record.coordinator_tab_named = true;
+                        }
+                        Vec::new()
+                    })
+                    .await
+                {
+                    d.fail(&run.key, &error);
+                }
             }
             if let Some(session) = agent.session.as_deref().filter(|s| !s.is_empty()) {
                 next.agent_session = session.to_string();
@@ -150,7 +188,10 @@ impl Reconciler {
         let record = run.record()?;
         let label = coordinator::workspace_label(&record);
         let c = &record.coordinator;
-        if c.status == AgentStatus::Open && self.judged(d, snapshot, c, now) {
+        if c.status == AgentStatus::Open
+            && (c.herdr_session.is_empty() || c.herdr_session == d.socket)
+            && self.judged(d, snapshot, c, now)
+        {
             let (mut next, live) = self
                 .track(
                     d,
@@ -161,6 +202,40 @@ impl Reconciler {
                     now,
                 )
                 .await;
+            let physical_workspace = snapshot
+                .panes
+                .get(&PaneId(next.pane_id.clone()))
+                .map(|pane| pane.workspace.0.clone());
+            let misplaced = !record.coordinator.workspace_id.is_empty()
+                && physical_workspace
+                    .as_deref()
+                    .is_some_and(|workspace| workspace != record.coordinator.workspace_id);
+            // A missing pane is not evidence that the person moved the tab
+            // back. Keep the placement barrier until the expected workspace
+            // is visible again.
+            let misplaced_state =
+                misplaced || (record.coordinator_misplaced && physical_workspace.is_none());
+            if misplaced {
+                next.workspace_id = record.coordinator.workspace_id.clone();
+            }
+            if misplaced_state != record.coordinator_misplaced {
+                let expected_workspace = record.coordinator.workspace_id.clone();
+                let notice = misplaced.then(|| {
+                    format!(
+                        "Coordinator for {} was moved to another Herdr workspace. Move its tab back to `{expected_workspace}` before placing or restarting workers; existing workers stay in their recorded workspace.",
+                        run.key
+                    )
+                });
+                self.update_and_push(run, move |r| {
+                    if r.coordinator_misplaced != misplaced_state {
+                        r.coordinator_misplaced = misplaced_state;
+                        notice.into_iter().map(error_activity).collect()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .await?;
+            }
             let needs = worker::needs_person(&next, &live);
             next.recovery = self
                 .recovery_state(
@@ -309,6 +384,7 @@ impl Reconciler {
         }
         for mut w in worker::list(run)
             .into_iter()
+            .filter(|w| w.operation.is_none())
             .filter(|w| matches!(w.agent.status, AgentStatus::Open | AgentStatus::Failed))
         {
             // A worker between two panes is neither gone nor anywhere yet.
@@ -814,7 +890,7 @@ impl Reconciler {
             let mut parts = Vec::new();
             for w in worker::list(run)
                 .iter()
-                .filter(|w| w.agent.status == AgentStatus::Open)
+                .filter(|w| w.operation.is_none() && w.agent.status == AgentStatus::Open)
             {
                 let group = match snap {
                     Some(snapshot) => {

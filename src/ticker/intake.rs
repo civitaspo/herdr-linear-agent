@@ -6,10 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 
-use super::reconcile::{
-    Deps, Reconciler, RoutingDone, blocking, inbox_item, thought, update_run, update_worker,
-};
-use crate::herdr::{Herdr, Snapshot, WorkspaceId};
+use super::reconcile::{Deps, Reconciler, RoutingDone, blocking, inbox_item, thought, update_run};
+use crate::herdr::{Herdr, Snapshot};
 use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUpdate};
 use crate::linear::task::{Decline, Levels, LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
@@ -881,58 +879,22 @@ impl Reconciler {
     async fn close_run<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
-        snap: Option<&Snapshot>,
+        _snap: Option<&Snapshot>,
         run: &Run,
         state: &str,
         state_type: &str,
-        now: Timestamp,
+        _now: Timestamp,
     ) -> Result<()> {
-        let record = run.record()?;
-        self.interrupt_agents(d, snap, run).await;
-        // The live workspace, or the recorded one; without a snapshot every
-        // open agent's recorded workspace.
-        let workspace_of = |agent: &AgentRecord| -> Option<String> {
-            if agent.status != AgentStatus::Open {
-                return None;
-            }
-            let Some(snapshot) = snap else {
-                return Some(agent.workspace_id.clone()).filter(|w| !w.is_empty());
-            };
-            if let Some(found) = worker::find_agent(agent, &snapshot.agents) {
-                return snapshot
-                    .panes
-                    .get(&found.pane)
-                    .map(|p| p.workspace.0.clone())
-                    .or_else(|| Some(agent.workspace_id.clone()));
-            }
-            let live = worker::live_state(agent, snapshot, now, &d.ctx.state_dir(), d.socket);
-            live.pane_exists.then(|| agent.workspace_id.clone())
-        };
-        let mut workspaces = Vec::new();
-        for w in worker::list(run) {
-            let _ = worker::copy_report_home(run, &w);
-            workspaces.extend(workspace_of(&w.agent));
-            update_worker(run, &w.id, |w| w.agent.status = AgentStatus::Stopped).await?;
-        }
-        workspaces.extend(workspace_of(&record.coordinator));
-        for workspace in workspaces {
-            if let Err(error) = d
-                .herdr
-                .workspace_close(&WorkspaceId(workspace.clone()))
-                .await
-            {
-                d.log.line(&format!(
-                    "{}: could not close workspace {workspace}: {error}",
-                    run.key
-                ));
-            }
-        }
         // Linear shows the session working until a response ends it.
         let body = format!("The issue is {state}; this run is closed.");
         let closed_state = state.to_string();
         let state_type = state_type.to_string();
         self.update_and_push(run, move |r| {
+            if r.status == Status::Closed {
+                return Vec::new();
+            }
             r.status = Status::Closed;
+            r.cleanup_pending = true;
             r.closed_state = closed_state;
             r.coordinator.status = AgentStatus::Stopped;
             if !r.workflow.postmortem_succeeded {
@@ -954,8 +916,10 @@ impl Reconciler {
             vec![Op::activity(Activity::new(Content::Response { body }))]
         })
         .await?;
-        d.log
-            .line(&format!("{}: closed (the issue is {state})", run.key));
+        d.log.line(&format!(
+            "{}: closed (the issue is {state}); cleanup is pending",
+            run.key
+        ));
         self.keep_transcripts(d, run);
         Ok(())
     }
@@ -1245,6 +1209,7 @@ impl Reconciler {
     async fn reactivate(&mut self, run: &Run, read_at: Timestamp) -> Result<()> {
         let record = run.record()?;
         if record.status == Status::Active
+            || (record.status == Status::Closed && record.cleanup_pending)
             || self
                 .changed_at
                 .get(&record.issue_id)
@@ -1252,22 +1217,27 @@ impl Reconciler {
         {
             return Ok(());
         }
-        self.changed_at.insert(record.issue_id.clone(), read_at);
-        self.update_and_push(run, |r| {
-            if r.status == Status::Active {
-                return Vec::new();
-            }
-            r.status = Status::Active;
-            if r.interrupt == Some(Interrupt::Detach) {
-                r.interrupt = None;
-            }
-            // A closed run's coordinator was stopped: bring it back.
-            if r.coordinator.status == AgentStatus::Stopped {
-                r.coordinator.repend();
-            }
-            vec![thought("The issue was delegated again; the run continues.")]
-        })
-        .await?;
+        let issue_id = record.issue_id.clone();
+        let updated = self
+            .update_and_push(run, |r| {
+                if r.status == Status::Active || (r.status == Status::Closed && r.cleanup_pending) {
+                    return Vec::new();
+                }
+                r.status = Status::Active;
+                if r.interrupt == Some(Interrupt::Detach) {
+                    r.interrupt = None;
+                }
+                // A closed run's coordinator was stopped: bring it back.
+                if r.coordinator.status == AgentStatus::Stopped {
+                    r.coordinator.repend();
+                }
+                vec![thought("The issue was delegated again; the run continues.")]
+            })
+            .await?;
+        if updated.status != Status::Active {
+            return Ok(());
+        }
+        self.changed_at.insert(issue_id, read_at);
         inbox_item(
             run,
             "issue",

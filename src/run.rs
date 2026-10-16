@@ -208,6 +208,10 @@ pub struct AgentRecord {
     pub profile: String,
     pub kind: String,
     pub agent_name: String,
+    /// The Herdr socket that owns these IDs. Blank on legacy records; once
+    /// observed in the current session, the ticker records that session.
+    #[serde(default)]
+    pub herdr_session: String,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
@@ -292,6 +296,11 @@ impl AgentRecord {
         self.last_attempt_at.clear();
     }
 
+    pub fn placed_in(&mut self, placed: &Placed, session: &str) {
+        self.placed(placed);
+        self.herdr_session = session.to_string();
+    }
+
     /// Pending again, to be placed anew and resumed when it has a session.
     pub fn repend(&mut self) {
         self.recovery = Recovery::None;
@@ -327,6 +336,10 @@ pub struct RunRecord {
     pub labels: Vec<String>,
     pub session_id: String,
     pub status: Status,
+    /// The issue is closed and owned panes/checkouts still need cleanup.
+    /// Old records default to false and keep their historical behavior.
+    #[serde(default)]
+    pub cleanup_pending: bool,
     pub created: String,
     /// The issue's `updatedAt` when `issue.md` was last written.
     pub issue_updated_at: String,
@@ -339,6 +352,13 @@ pub struct RunRecord {
     /// default, with the reason.
     pub routing_source: String,
     pub coordinator: AgentRecord,
+    /// A coordinator workspace creation whose external outcome still needs
+    /// reconciliation, or an orphan pane that must be closed.
+    #[serde(default)]
+    pub coordinator_placement: Option<CoordinatorPlacementOperation>,
+    /// Late successful placements whose original operation has been replaced.
+    #[serde(default)]
+    pub coordinator_orphans: Vec<CoordinatorPlacementRef>,
     /// Prompts created after this timestamp have not been read yet.
     pub prompt_cursor: String,
     /// Prompt IDs already observed at `prompt_cursor`; absent in old records.
@@ -371,6 +391,13 @@ pub struct RunRecord {
     pub reply_generation: u64,
     /// The coordinator's pane is gone and a resume question was asked.
     pub coordinator_lost: bool,
+    /// The coordinator tab was manually moved out of the run's canonical
+    /// workspace; new placements wait until it is moved back.
+    #[serde(default)]
+    pub coordinator_misplaced: bool,
+    /// The coordinator tab label was successfully set by Herdr.
+    #[serde(default)]
+    pub coordinator_tab_named: bool,
     /// A person pressed stop: no prompt or heartbeat goes out until they
     /// reply again. Inbox items are still written.
     pub stopped: bool,
@@ -400,6 +427,38 @@ pub struct RunRecord {
     pub workflow_state_updated_at: String,
     /// The workflow state the issue was in when the run closed.
     pub closed_state: String,
+}
+
+/// Durable intent for creating the coordinator workspace. Herdr does not
+/// accept an idempotency key, so an unknown result remains a barrier until a
+/// unique matching workspace is observed in the recorded session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", content = "placement", rename_all = "snake_case")]
+pub enum CoordinatorPlacementPhase {
+    Requested,
+    Unknown,
+    Orphan(CoordinatorPlacementRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorPlacementOperation {
+    pub id: uuid::Uuid,
+    pub session: String,
+    pub cwd: String,
+    pub label: String,
+    /// Reuse this run's surviving workspace with a new coordinator tab.
+    pub target_workspace: Option<String>,
+    pub phase: CoordinatorPlacementPhase,
+}
+
+/// The Herdr identity needed to close an orphan without closing its workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorPlacementRef {
+    pub session: String,
+    pub workspace: String,
+    pub tab: String,
+    pub pane: String,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -785,6 +844,9 @@ mod tests {
             (record.identifier.as_str(), record.routing_source.as_str()),
             ("DATA-1", "")
         );
+        assert_eq!(record.coordinator_placement, None);
+        assert!(!record.coordinator_misplaced);
+        assert!(record.coordinator.herdr_session.is_empty());
     }
 
     #[test]

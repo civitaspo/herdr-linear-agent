@@ -26,6 +26,7 @@ mod supervisor_index;
 mod ticker;
 mod transcript;
 mod worker;
+mod worktree;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
