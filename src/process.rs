@@ -619,12 +619,20 @@ mod tests {
     async fn dropping_a_running_command_kills_its_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let started = dir.path().join("started");
+        let release = dir.path().join("release");
         let marker = dir.path().join("late-write");
         let cmd = sh(
-            "printf started > \"$HLA_STARTED\"; (sleep 0.5; printf touched > \"$HLA_MARKER\") & wait",
+            r#"
+                (
+                    printf started > "$HLA_STARTED"
+                    while [ ! -e "$HLA_RELEASE" ]; do sleep 0.01; done
+                    printf touched > "$HLA_MARKER"
+                ) & wait
+            "#,
             Duration::from_secs(10),
         )
         .env("HLA_STARTED", &started)
+        .env("HLA_RELEASE", &release)
         .env("HLA_MARKER", &marker);
         let task = tokio::spawn(async move { RealRunner.run(&cmd).await });
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -634,8 +642,12 @@ mod tests {
         })
         .await
         .expect("command did not start");
+        // Simulate a stalled test thread while the descendant keeps running.
+        // The gate prevents it from writing before cancellation completes.
+        std::thread::sleep(Duration::from_millis(750));
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        std::fs::write(&release, "go").unwrap();
         tokio::time::sleep(Duration::from_millis(650)).await;
         assert!(
             !marker.exists(),
