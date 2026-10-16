@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::world::World;
 use crate::commands::{self, WorkerStart};
 use crate::coordinator::{NUDGE_INBOX, NUDGE_REPLY};
-use crate::herdr::PaneId;
+use crate::herdr::{Herdr, PaneId, WorkspaceId};
 use crate::linear::api::fake::APP_USER;
 use crate::linear::api::{IssueStatus, RunUpdate};
 use crate::linear::task::{DECLINED, LinearEvent};
@@ -92,7 +92,7 @@ fn fake_decision_github(world: &World, w: &worker::Worker, pr: &str, number: u64
 
 async fn machine_world() -> (World, worker::Worker) {
     let mut world = World::sample();
-    world.merge_decision_mode(20);
+    world.merge_decision_mode(20).await;
     world.running_issue().await;
     let w = world.start_worker("api").await;
     world.report(&w, &format!("PR: {PR}\n## Report\nReady to review.\n"));
@@ -423,7 +423,7 @@ async fn a_crashed_coordinator_resumes_the_same_session_after_a_ticker_restart()
         world.record(KEY).coordinator.recovery,
         Recovery::RetryWait { attempt: 1, .. }
     ));
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
     assert_eq!(
         world.herdr.starts().len(),
@@ -612,7 +612,7 @@ async fn a_crashed_worker_resumes_without_restarting_its_coordinator() {
 
     world.later(30);
     world.settle().await;
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
     assert_eq!(
         world.herdr.starts().len(),
@@ -834,7 +834,7 @@ async fn after_a_config_reload_the_next_worker_starts_with_the_new_profile() {
         "kind = \"claude\"\nmodel = \"sonnet\"\nargs = [\"--permission-mode\", \"plan\"]\n",
     )
     .unwrap();
-    world.reload_config();
+    world.reload_config().await;
     world.start_worker("api").await;
     world.settle().await;
     let start = world.herdr.starts().pop().unwrap();
@@ -911,7 +911,7 @@ async fn an_issue_delegated_by_someone_not_allowed_is_declined_once() {
         world.settle().await;
         world.later(5);
     }
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
 
     assert_eq!((world.runs(), world.herdr.starts().len()), (0, 0));
@@ -1062,7 +1062,7 @@ async fn a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again() 
     stored["routing"] = json!({"pid": 4242, "started": "2026-01-01T00:00:00Z", "output": ""});
     std::fs::write(&path, stored.to_string()).unwrap();
 
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
     assert_eq!(world.record(KEY).coordinator.profile, "coordinator");
 }
@@ -1082,7 +1082,14 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
     assert_eq!(w.branch, "herdr-linear-agent/acme/data-1/w1-change-api");
     assert!(world.runner.count("git -C") > 0);
     assert!(!world.brief(&w).is_empty(), "brief.md is written");
-    assert_eq!(world.herdr.worktrees()[0].2, "origin/main", "--base");
+    assert!(
+        world
+            .runner
+            .lines("worktree add")
+            .iter()
+            .any(|line| line.contains("origin/main")),
+        "the checkout is created from the configured base"
+    );
 
     world.settle().await;
     let flags = [
@@ -1392,7 +1399,7 @@ async fn switching_to_human_merge_mode_clears_unused_machine_state() {
         "merge_on_authorization = true\n# merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }",
     );
     std::fs::write(config_path, config).unwrap();
-    world.reload_config();
+    world.reload_config().await;
 
     commands::worker_request_merge(&world.ctx(), KEY, "w1")
         .await
@@ -1737,7 +1744,7 @@ async fn a_successful_machine_merge_command_stays_unknown_until_readback_confirm
         "# merge_decision = { profile = \"merge-risk\", max_risk_score = 20 }",
     );
     std::fs::write(config_path, config).unwrap();
-    world.reload_config();
+    world.reload_config().await;
     world
         .run(KEY)
         .update(|record| {
@@ -1884,31 +1891,28 @@ async fn a_restart_switches_the_profile_and_stops_at_two() {
     let again = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", Some("deep"))
         .await
         .unwrap();
+    assert_eq!(again.restarts, 0, "the command only queues the restart");
     assert_eq!(
-        (
-            again.agent.kind.as_str(),
-            again.restarts,
-            again.agent.prompt_pending
-        ),
-        ("codex", 1, true)
+        again.agent.kind, "claude",
+        "old identity stays until handoff"
     );
-    assert_eq!(
-        world.herdr.closed().len(),
-        1,
-        "the old workspace; the checkout stays"
-    );
-    assert!(world.brief(&again).contains("previous attempt"));
-
     world.settle().await;
+    let again = world.worker(KEY, "w1");
+    assert_eq!((again.agent.kind.as_str(), again.restarts), ("codex", 1));
+    assert!(world.brief(&again).contains("previous attempt"));
     assert!(
         last_args(&world)
             .iter()
             .any(|a| a == "model_reasoning_effort=xhigh")
     );
-    let (ctx, session) = (world.ctx(), world.session());
-    let restart = || commands::worker_restart(&ctx, &session, KEY, "w1", None);
-    restart().await.unwrap();
-    let third = restart().await.unwrap_err().to_string();
+    commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
+        .await
+        .unwrap();
+    world.settle().await;
+    let third = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(third.contains("limit is 2"), "{third}");
 }
 
@@ -2269,8 +2273,8 @@ async fn a_completed_issue_closes_its_run_and_a_reopened_one_resumes() {
     );
     assert_eq!(
         world.herdr.closed().len(),
-        2,
-        "the worker's and the coordinator's"
+        1,
+        "worker and coordinator tabs share the run workspace"
     );
     assert_eq!(world.worker(KEY, "w1").agent.status, AgentStatus::Stopped);
     let before = world.herdr.starts().len();
@@ -2329,9 +2333,17 @@ async fn a_removed_delegation_detaches_the_run_and_keeps_its_workspaces() {
 async fn a_dialog_is_reported_in_progress_and_a_gone_coordinator_asks_for_resume() {
     let mut world = World::sample();
     world.running_issue().await;
-    let w = world.start_worker("api").await;
+    let requested = commands::worker_start(
+        &world.ctx(),
+        &world.session(),
+        KEY,
+        &request("api", "standard", "Dialog worker"),
+    )
+    .await
+    .unwrap();
     world.herdr.fail_next_start("agent_not_ready");
     world.settle().await;
+    let w = world.worker(KEY, &requested.id);
     // Blocked for a minute and a half.
     world.later(90);
     world.settle().await;
@@ -2529,9 +2541,9 @@ fn postmortem_profile(world: &World, name: &str) {
 /// or fails it when `answer` is empty.
 /// A `review` postmortem profile, and a routing agent that picks the
 /// `coordinator` profile and the `pick` postmortem profile.
-fn postmortem_method(world: &mut World, pick: &str, answer: &str) {
+async fn postmortem_method(world: &mut World, pick: &str, answer: &str) {
     postmortem_profile(world, "review");
-    world.reload_config();
+    world.reload_config().await;
     let postmortem = if answer.is_empty() {
         "exit 1".to_string()
     } else {
@@ -2580,7 +2592,8 @@ async fn deployment_finish_runs_workflow_postmortem_then_moves_to_done() {
         &mut world,
         "review",
         r#"{"summary":"Deployment learned from.","labels":[]}"#,
-    );
+    )
+    .await;
     world.running_issue().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Ready for review.")
         .await
@@ -2618,7 +2631,8 @@ async fn a_saved_workflow_postmortem_retries_its_supervisor_feed_after_restart()
         &mut world,
         "review",
         r#"{"summary":"Deployment learned from.","labels":[]}"#,
-    );
+    )
+    .await;
     world.running_issue().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Ready for review.")
         .await
@@ -2662,7 +2676,7 @@ async fn a_saved_workflow_postmortem_retries_its_supervisor_feed_after_restart()
         .unwrap(),
     )
     .unwrap();
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
 
     let record = world.record(KEY);
@@ -2689,7 +2703,8 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
         &mut world,
         "review",
         r#"{"summary":"It went well.","labels":["Improvement","Bogus"]}"#,
-    );
+    )
+    .await;
     world.running_issue().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
         .await
@@ -2736,7 +2751,7 @@ async fn a_routing_with_one_candidate_each_asks_no_routing_agent() {
         + "\n[routing.solo]\ncoordinators = [\"coordinator-light\"]\npostmortems = [\"review\"]\nworkers = [\"standard\"]\n";
     let text = text.replacen("routing = \"default\"", "routing = \"solo\"", 1);
     std::fs::write(&config, text).unwrap();
-    world.reload_config();
+    world.reload_config().await;
     // A routing call fails; only the postmortem itself answers.
     world.router(
         "cat > /dev/null\ncase \"$*\" in\n  *'# Method'*) echo '{\"structured_output\":{\"summary\":\"Fine.\",\"labels\":[]}}' ;;\n  *) exit 1 ;;\nesac\n",
@@ -2776,7 +2791,7 @@ async fn a_routing_with_one_candidate_each_asks_no_routing_agent() {
 async fn the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes() {
     let mut world = World::sample();
     postmortem_profile(&world, "quick");
-    postmortem_method(&mut world, "quick", r#"{"summary":"Short.","labels":[]}"#);
+    postmortem_method(&mut world, "quick", r#"{"summary":"Short.","labels":[]}"#).await;
     world.running_issue().await;
     add_workflow_states(&world);
     world.move_issue(KEY, "In Deploy");
@@ -2806,7 +2821,7 @@ async fn the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes()
 #[tokio::test]
 async fn a_failed_postmortem_is_logged_and_not_tried_again() {
     let mut world = World::sample();
-    postmortem_method(&mut world, "review", "");
+    postmortem_method(&mut world, "review", "").await;
     world.running_issue().await;
     add_workflow_states(&world);
     world.move_issue(KEY, "In Deploy");
@@ -2854,7 +2869,7 @@ async fn a_ticker_started_while_herdr_is_down_judges_nothing_lost() {
     let items = world.inbox(KEY).len();
 
     world.herdr.set_down(true);
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.message(KEY, "user-1", "Status?", None);
     world.later(60);
     world.settle().await;
@@ -3038,7 +3053,7 @@ async fn a_closed_run_delegated_again_by_someone_not_allowed_stays_closed() {
         world.later(5);
         world.settle().await;
     }
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
     assert_eq!(world.record(KEY).status, Status::Closed);
     assert_eq!(count(&world.bodies(KEY, "response"), DECLINED), 1);
@@ -3050,6 +3065,98 @@ async fn a_closed_run_delegated_again_by_someone_not_allowed_stays_closed() {
         1,
         "{log}"
     );
+}
+
+#[tokio::test]
+async fn closed_worker_cleanup_resumes_after_ticker_restart_and_preserves_the_report() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.settle().await;
+    let workspace = world.record(KEY).coordinator.workspace_id;
+    let user_pane = world
+        .herdr
+        .tab_create(
+            &WorkspaceId(workspace),
+            world.config.repositories["api"].path.to_str().unwrap(),
+            "Person's tab",
+        )
+        .await
+        .unwrap();
+    world.report(
+        &worker,
+        &format!("PR: {PR}\n## Report\nKept after cleanup.\n"),
+    );
+    world.settle().await;
+    let checkout = std::path::PathBuf::from(&worker.worktree_path);
+    assert!(checkout.is_dir());
+
+    // Closing the run while Herdr is unavailable leaves the durable cleanup
+    // cursor and checkout intact. A new ticker completes it after recovery.
+    world.herdr.set_down(true);
+    world.move_issue(KEY, "Canceled");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    assert!(world.record(KEY).cleanup_pending);
+    assert!(checkout.is_dir());
+
+    world.restart_ticker().await;
+    world.herdr.set_down(false);
+    world.settle().await;
+    assert!(!world.record(KEY).cleanup_pending);
+    let cleaned = world.worker(KEY, "w1");
+    assert!(cleaned.cleanup_completed);
+    assert!(cleaned.operation.is_none());
+    assert!(!checkout.exists());
+    assert!(
+        world
+            .herdr
+            .panes()
+            .iter()
+            .any(|pane| pane.id == user_pane.pane)
+    );
+    let saved_report = world.run(KEY).workers_dir().join("w1.md");
+    assert!(
+        std::fs::read_to_string(saved_report)
+            .unwrap()
+            .contains("Kept after cleanup.")
+    );
+}
+
+#[tokio::test]
+async fn retained_worker_cleanup_blocks_reopen_until_manual_retry_finishes() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.settle().await;
+    let checkout = std::path::PathBuf::from(&worker.worktree_path);
+    world.herdr.fail_pane_close(&worker.agent.pane_id, "busy");
+
+    world.move_issue(KEY, "Canceled");
+    world.later(5);
+    world.settle().await;
+    let retained = world.worker(KEY, "w1");
+    assert!(world.record(KEY).cleanup_pending);
+    assert!(
+        matches!(retained.operation, Some(worker::WorkerOperation::Cleanup(ref op)) if op.retained_reason.is_some())
+    );
+    assert!(checkout.is_dir());
+
+    world.fake().redelegate_by("DATA-1", "user-1");
+    world.move_issue(KEY, "Todo");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+
+    commands::worker_retry_cleanup(&world.ctx(), KEY, "w1").unwrap();
+    world.settle().await;
+    assert!(!world.record(KEY).cleanup_pending);
+    assert!(!checkout.exists());
+
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Active);
 }
 
 #[tokio::test]
@@ -3301,7 +3408,7 @@ async fn a_queued_prompt_is_relayed_once_when_dequeued_after_its_cursor() {
         Some(queued_id.as_str())
     );
 
-    world.restart_ticker();
+    world.restart_ticker().await;
 
     world.later(60);
     let sent_at = world.now().to_string();
@@ -3798,9 +3905,12 @@ async fn a_placement_without_an_answer_is_adopted_after_a_title_edit() {
 async fn a_restart_between_a_snapshot_and_its_pass_keeps_the_new_pane() {
     let mut world = World::sample();
     world.running_issue().await;
-    world.start_worker("api").await;
-    world.settle().await;
-    let again = world.restart_worker_mid_pass("w1").await;
+    let first = world.start_worker("api").await;
+    let queued = world.restart_worker_mid_pass("w1").await;
+    assert_eq!(
+        queued.agent.pane_id, first.agent.pane_id,
+        "restart returns before external work"
+    );
     world.settle().await;
     world.later(5);
     world.settle().await;
@@ -3811,7 +3921,7 @@ async fn a_restart_between_a_snapshot_and_its_pass_keeps_the_new_pane() {
     );
     assert!(!mentions(&world.inbox(KEY), "closed before"));
     let w = world.worker(KEY, "w1");
-    assert_eq!(w.agent.pane_id, again.agent.pane_id);
+    assert_ne!(w.agent.pane_id, first.agent.pane_id);
     assert_eq!(
         to(&world, &w.agent.pane_id).len(),
         1,
@@ -3841,26 +3951,24 @@ async fn a_worker_without_a_pane_is_never_judged_gone() {
 }
 
 #[tokio::test]
-async fn a_start_result_for_a_pane_the_worker_left_is_dropped() {
+async fn a_restart_hands_off_to_a_new_pane_before_reporting_success() {
     let mut world = World::sample();
     world.running_issue().await;
     let first = world.start_worker("api").await;
-    world.herdr.fail_next_start("startup_failed");
-    world.once().await;
-    // The start in the first pane is out when the coordinator restarts it.
-    let again = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
+    let queued = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
         .await
         .unwrap();
-    assert_ne!(again.agent.pane_id, first.agent.pane_id);
+    assert_eq!(queued.agent.pane_id, first.agent.pane_id);
     world.settle().await;
     let w = world.worker(KEY, "w1");
-    assert_eq!(w.agent.launch_attempts, 0);
+    assert_ne!(w.agent.pane_id, first.agent.pane_id);
+    assert_eq!(w.restarts, 1);
     let in_new: Vec<PaneId> = world
         .herdr
         .starts()
         .into_iter()
         .map(|s| s.pane)
-        .filter(|p| p.0 == again.agent.pane_id)
+        .filter(|p| p.0 == w.agent.pane_id)
         .collect();
     assert_eq!(in_new.len(), 1);
 }
@@ -3897,9 +4005,23 @@ async fn panes_left_out_of_a_partly_parsed_snapshot_are_not_judged() {
 async fn an_agent_whose_entry_does_not_parse_is_not_started_again() {
     let mut world = World::sample();
     world.running_issue().await;
-    let w = world.start_worker("api").await;
-    // The started agent is there, but its one entry does not parse.
-    world.herdr.unparsed_agent(&w.agent.pane_id, true);
+    let request = commands::worker_start(
+        &world.ctx(),
+        &world.session(),
+        KEY,
+        &WorkerStart {
+            repo: "api".into(),
+            profile: "standard".into(),
+            title: "Change api".into(),
+            task: "Make the change and open a PR.".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // The queued start creates the second pane in the coordinator workspace.
+    // Mark its agent entry unparsed before the first placement observation.
+    let pane = "w1:p2";
+    world.herdr.unparsed_agent(pane, true);
     world.settle().await;
     for _ in 0..3 {
         world.later(61);
@@ -3915,16 +4037,14 @@ async fn an_agent_whose_entry_does_not_parse_is_not_started_again() {
     };
     assert_eq!(starts(&world), 1);
     assert_eq!(world.worker(KEY, "w1").agent.launch_attempts, 0);
-    assert!(
-        to(&world, &w.agent.pane_id).is_empty(),
-        "not found, not prompted"
-    );
+    assert!(to(&world, pane).is_empty(), "not found, not prompted");
 
-    world.herdr.unparsed_agent(&w.agent.pane_id, false);
+    world.herdr.unparsed_agent(pane, false);
     world.later(5);
     world.settle().await;
     assert_eq!(starts(&world), 1);
-    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+    assert_eq!(to(&world, pane).len(), 1);
+    assert_eq!(world.worker(KEY, &request.id).agent.pane_id, pane);
 }
 
 fn self_report(world: &World, w: &worker::Worker, activity: &str) {
@@ -3933,8 +4053,13 @@ fn self_report(world: &World, w: &worker::Worker, activity: &str) {
         &crate::progress::Record {
             socket: super::world::SOCKET.into(),
             pane_id: w.agent.pane_id.clone(),
-            // The fake's pane `w<n>:p1` runs terminal `term-<n>`.
-            terminal_id: w.agent.pane_id.replace(":p1", "").replace('w', "term-"),
+            terminal_id: world
+                .herdr
+                .panes()
+                .into_iter()
+                .find(|pane| pane.id.0 == w.agent.pane_id)
+                .expect("worker pane exists")
+                .terminal,
             activity: activity.into(),
             reported_at: world.now().as_second(),
             ..crate::progress::Record::default()
@@ -4350,7 +4475,7 @@ async fn comment_consent_restores_delegation_and_keeps_the_native_agents_and_wor
     assert_eq!(world.record(KEY).status, Status::Detached);
     assert_eq!(posted(&world).len(), 1);
     assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 0);
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.later(5);
     world.settle().await;
     assert_eq!(
@@ -4423,7 +4548,7 @@ async fn hidden_sessions_pause_even_with_a_delegate_and_ignore_untrusted_or_stal
         world.later(5);
         world.settle().await;
         assert_ne!(world.record(KEY).resume_request.unwrap().token, token);
-        world.restart_ticker();
+        world.restart_ticker().await;
         world.later(5);
         world.settle().await;
         assert_eq!(
@@ -4480,7 +4605,7 @@ async fn consent_requires_both_team_policies_and_a_refusal_wins() {
         world.record(KEY).resume_request.unwrap().decision,
         crate::run::ResumeDecision::Denied
     ));
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.later(5);
     world.settle().await;
     assert_eq!(world.fake().count("HerdrLinearAgentRestoreDelegate"), 0);
@@ -4493,7 +4618,8 @@ async fn detached_runs_still_close_and_get_a_final_postmortem_without_a_linear_s
         &mut world,
         "review",
         r#"{"summary":"Cleanup completed.","labels":[]}"#,
-    );
+    )
+    .await;
     world.running_issue().await;
     world.start_worker("api").await;
     world.settle().await;
@@ -4501,12 +4627,12 @@ async fn detached_runs_still_close_and_get_a_final_postmortem_without_a_linear_s
     world.later(5);
     world.settle().await;
     world.fake().sessions.clear();
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.move_issue(KEY, "Done");
     world.later(5);
     world.settle().await;
     assert_eq!(world.record(KEY).status, Status::Closed);
-    assert_eq!(world.herdr.closed().len(), 2);
+    assert_eq!(world.herdr.closed().len(), 1);
     assert_eq!(
         posted(&world)
             .iter()
@@ -4517,7 +4643,7 @@ async fn detached_runs_still_close_and_get_a_final_postmortem_without_a_linear_s
     assert!(world.record(KEY).resume_request.is_none());
     world.later(10);
     world.settle().await;
-    assert_eq!(world.herdr.closed().len(), 2, "cleanup is not repeated");
+    assert_eq!(world.herdr.closed().len(), 1, "cleanup is not repeated");
     assert_eq!(world.fake().count("HerdrLinearAgentResumeSession"), 0);
     assert_eq!(
         world.fake().count("HerdrLinearAgentSessionCreate"),
@@ -4632,7 +4758,7 @@ async fn persisted_consent_recovers_a_crash_before_its_restore_request_was_queue
             };
         })
         .unwrap();
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.later(5);
     world.settle().await;
     assert_eq!(world.record(KEY).status, Status::Active);
@@ -4727,7 +4853,7 @@ async fn supervisor_starts_once_adopts_on_restart_and_replaces_a_changed_profile
         .unwrap()[1]
         .clone();
 
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
     assert_eq!(
         world.herdr.starts().len(),
@@ -4749,7 +4875,7 @@ async fn supervisor_starts_once_adopts_on_restart_and_replaces_a_changed_profile
         .herdr
         .set_status("herdr-linear-agent-supervisor", "working");
     world.config.supervisor.as_mut().unwrap().profile = "standard".into();
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
     let draining = store.record().unwrap();
     assert_eq!(
@@ -4810,7 +4936,7 @@ async fn supervisor_adopts_its_saved_workspace_when_snapshot_omits_the_label() {
     assert_eq!(original.status, crate::supervisor::SupervisorStatus::Idle);
 
     world.herdr.omit_workspace_labels_in_snapshot();
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
 
     let adopted = store.record().unwrap();
@@ -4866,7 +4992,7 @@ async fn disabling_supervisor_closes_only_its_managed_workspace() {
     let original = store.record().unwrap();
     let scratch = world.herdr.add_pane("/tmp/unmanaged-workspace");
     world.config.supervisor = None;
-    world.restart_ticker();
+    world.restart_ticker().await;
     world.settle().await;
     world.settle().await;
 

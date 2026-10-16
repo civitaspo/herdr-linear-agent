@@ -120,7 +120,6 @@ fn placed(pane: &Pane, cwd: &str) -> Placed {
         tab: pane.tab.clone(),
         pane: pane.id.clone(),
         cwd: cwd.into(),
-        worktree_path: None,
     }
 }
 

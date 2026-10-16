@@ -120,6 +120,425 @@ supervisor behavior were not exercised. The harness ticker was stopped and
 its Herdr session deleted afterward. The unchanged installed 0.7.0 ticker
 was restored and reported running.
 
+## Shared issue workspace and durable setup with Linear (2026-10-16)
+
+The signed development build `0.7.1+35db7cc.1792077418` was checked with
+Herdr 0.9.3, Codex 0.160.0 and `gpt-6-luna` in the integration harness at
+`/private/tmp/hla-issue140-linear-live`. Existing repository
+`civitaspo/testing-herdr-linear-agent` was cloned twice under that root and
+configured as `api` and `web`. No GitHub repository, commit, push or PR was
+created. This was a read-only lifecycle check, not a PR/merge/deployment workflow.
+
+[THLA-37](https://linear.app/civitaspo/issue/THLA-37/verify-issue-140-shared-workspace-and-durable-worker-setup)
+was delegated through Linear and picked up by the isolated ticker. Its real
+coordinator started two real workers. The following checks passed:
+
+- While both workers were blocked in their second setup hook, their persisted
+  setup cursors were 3 and no worker pane or agent existed. Stopping and
+  restarting the ticker preserved the cursors. Completed copy, symlink and
+  first-hook steps were not repeated; the interrupted hook ran again.
+- After setup was released, the coordinator and workers occupied three tabs
+  in one workspace. Both workers independently checked the actual checkout,
+  branch, copied file, symlink target and setup marker, then wrote their real
+  reports. The ticker copied both reports to the run directory.
+- `worker restart` replaced only w1's pane, retained its checkout and branch,
+  and did not repeat setup hooks. An operator-created user tab survived.
+- A real Linear Done transition closed the owned panes. The clean checkout
+  was removed and its removal hook ran. A deliberately untracked file made
+  Git refuse the other checkout's removal; its saved phase and error survived
+  another ticker restart. Both reports and the user pane remained.
+- After the operator removed that disposable file, `worker retry-cleanup`
+  started a stopped ticker and completed removal. Each worker's removal hook
+  ran once.
+
+[THLA-38](https://linear.app/civitaspo/issue/THLA-38/verify-cancellation-during-issue-140-worker-setup)
+was canceled through Linear while both workers were blocked in setup, before
+worker agents started. The ticker aborted setup, closed the coordinator,
+removed both checkouts and their Git registrations, and ran both removal hooks.
+The unrelated user pane remained. Both runs produced their normal final
+postmortems; no worker reports or lifecycle records were fabricated.
+
+Operator assistance was limited to scratch configuration and fixture setup,
+accepting Codex's trust dialogs for the two scratch clones, stopping/restarting
+the isolated ticker, releasing blocked hooks, requesting worker restart,
+changing the scratch issues to Done/Canceled, and resolving/retrying deliberate
+dirty-checkout cleanup. The fixture initially ignored `node_modules/`, which
+does not ignore a symlink named `node_modules`; the operator added the exact
+`node_modules` exclusion before exercising cleanup.
+
+Evidence includes `before-setup-restart.json`, `resumed-setup.json`,
+`after-worker-restart.json`, `retained-dirty-cleanup.json`,
+`retained-after-ticker-restart.json`, `completed-cleanup.json`,
+`canceled-cleanup.json`, `hooks.log` and `live-check-results.json` under the
+harness root. The ordinary ticker was temporarily stopped to prevent competing
+scratch-team intake. Hashes of 670 existing ordinary configuration, run and
+supervisor files matched before restoration. The harness ticker was stopped,
+its named session deleted, and the exact installed 0.7.0 ticker restored and
+verified running. Native Codex data and OS credentials remained shared.
+
+This check covers new-layout runs, recovery during setup, normal worker restart,
+Done/cancellation cleanup and manual cleanup retry. Lost Herdr responses,
+legacy-layout migration and failing removal-hook recovery were not forced in
+this live run; their regression scenarios remain automated checks.
+
+## Repeatable issue 140 live check
+
+The Rust development harness can prepare and verify the two issue 140 Linear
+scenarios without an auxiliary Python program. This is a real service check, not
+part of the ordinary test suite. It reads Linear issue identity, delegation and state;
+the operator creates and delegates disposable issues and changes their terminal
+state in Linear. The harness does not create issues, change issue state, post
+comments, create a GitHub repository, push, or open a PR.
+
+Prerequisites:
+
+- macOS with the signed development binary built by `mise run build-development`
+  and the signing setup in [development signing](development-signing.md).
+- Herdr 0.9.1 or newer and a dedicated non-default session. Codex CLI 0.160.0
+  must be available and logged in. Accept trust prompts for both scratch clones
+  when the harness asks.
+- A scratch Linear workspace and team, the app's OAuth client ID, and the user
+  ID allowed to delegate. The app's Linear credential must already be available
+  in the OS credential store. `HOME`, Keychain or Secret Service, and native
+  Codex data remain shared with ordinary use.
+- An existing scratch Git repository with a `main` branch and clone access.
+  The harness clones that same URL into isolated `api` and `web` repositories.
+  It writes only ignored fixture paths and the local `.git/info/exclude` file.
+- If an ordinary ticker also watches the scratch team, its exact installed
+  binary path so the harness can stop and restore that ticker.
+
+Use a fresh root and fresh Linear issues for each run. Run every command below
+with the same signed binary because its absolute path is embedded in the setup
+and removal hooks:
+
+```bash
+export HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true
+BIN=/absolute/path/to/target/release/herdr-linear-agent
+ROOT=/private/tmp/hla-issue140-rerun
+SESSION=hla-issue140-rerun
+
+"$BIN" development harness init "$ROOT" --session "$SESSION"
+"$BIN" development harness fixture "$ROOT" \
+  --repository git@github.com:OWNER/EXISTING-SCRATCH-REPOSITORY.git \
+  --workspace civitaspo --team THLA \
+  --client-id LINEAR_OAUTH_CLIENT_ID --allowed-user LINEAR_USER_ID
+```
+
+The `fixture` command clones the repository twice, creates `.env.integration`
+and `node_modules/fixture.txt`, adds exact local excludes for those files and
+`.setup-ready`, writes the profiles and hooks, and saves
+`fixture-manifest.json`. Replace the workspace, team, client ID and user ID
+with the real scratch values. Review the manifest for the issue text and paths.
+
+If an ordinary ticker polls this team, suspend it now with the exact binary
+that currently owns its ticker lock:
+
+```bash
+"$BIN" development harness ordinary-suspend "$ROOT" \
+  --plugin /absolute/path/to/installed/herdr-linear-agent
+```
+
+Start the dedicated Herdr session in another terminal and check connectivity:
+
+```bash
+"$BIN" development harness herdr "$ROOT" server
+# In another terminal:
+"$BIN" development harness plugin "$ROOT" action doctor
+```
+
+Create a disposable issue in the configured scratch team using the first case
+in `fixture-manifest.json`, then delegate it to the app user while the isolated
+ticker is still stopped. This prevents intake from launching the coordinator
+before the verifier captures its clean baseline. In the terminal with the
+harness environment, run:
+
+```bash
+"$BIN" development harness verify "$ROOT" civitaspo/THLA-123 \
+  --terminal done --timeout-seconds 300
+```
+
+The verifier starts the isolated ticker, then waits with a deadline for both real workers to enter setup,
+records the saved run state and Herdr snapshot, stops and restarts the isolated
+ticker, releases the hooks, checks both real reports and their Git checkouts,
+restarts one worker, and asks the operator to move the issue to Done. It then
+checks the terminal Linear state, saved cleanup records, hook counts, pane
+preservation, report hashes and Git worktree registrations. Follow each printed
+`ACTION` promptly, including accepting a Codex trust prompt if one appears.
+Each checkpoint is bounded by `--timeout-seconds` (1–1800, default 300); timeout errors include the
+last observed state and save the latest observation. The setup hook itself has
+a separate 300-second deadline; complete the restart checkpoint within it.
+Doctor may report that the ticker is stopped before verification; that is expected.
+
+To inspect the worker tabs before the verifier restarts a worker or begins
+cleanup, add `--pause-after-workers` to the `--terminal done` case:
+
+```bash
+"$BIN" development harness verify "$ROOT" civitaspo/THLA-123 \
+  --terminal done --pause-after-workers --timeout-seconds 1800
+```
+
+The verifier checks both workers' saved records against their live Herdr panes,
+agents and tabs, then prints `PAUSED`. Attach to the dedicated session in another
+terminal with `"$BIN" development harness herdr "$ROOT"`. The ticker and worker
+processes remain running. Worker turns can finish while the verifier waits, but
+the verifier does not restart workers or advance to cleanup. After inspection,
+resume from another terminal:
+
+```bash
+"$BIN" development harness resume "$ROOT" civitaspo/THLA-123
+```
+
+The inspection wait uses the same checkpoint deadline, measured from the start
+of the pause. A pause is not a full scenario pass. If the deadline expires, the
+verifier saves the failed checkpoint and stops the isolated ticker. Tabs remain
+for inspection until `harness stop`. A timed-out verifier cannot resume and
+requires a fresh issue for another run. Keep the ordinary ticker suspended while
+the scratch issue remains delegated and the isolated ticker owns it.
+
+For cancellation recovery, create and delegate a second fresh issue using the
+`cancel-during-setup` case in the manifest. Run the verifier on it with
+`--terminal canceled`, then change the issue to Canceled when prompted. The
+verifier confirms that setup did not start worker agents and that owned panes
+and checkouts were cleaned up.
+
+Always finish cleanup, including after a failed checkpoint:
+
+```bash
+"$BIN" development harness stop "$ROOT"
+"$BIN" development harness ordinary-restore "$ROOT"
+```
+
+`harness stop` attempts isolated ticker and named-session cleanup and retains
+`stop-result.json`. `ordinary-restore` compares protected ordinary config, run
+and supervisor files to the suspended baseline, then starts the exact recorded
+binary. Check `ordinary.json` before considering restoration complete. If no
+ordinary ticker watched the scratch team, skip both ordinary commands.
+
+The harness saves `fixture-manifest.json`, per-worker hook logs under `hooks/`,
+and checkpoint JSON plus `result.json` under `evidence/<workspace>/<issue>/`.
+On failure, retain the root for diagnosis; a new attempt needs a new root and
+new issues. This workflow checks issue 140's setup recovery, normal worker
+restart, Done cleanup and cancellation during setup. It does not check agent
+quality, a GitHub PR or merge workflow, arbitrary lost network responses, legacy
+layout migration, or all possible hook failures.
+
+Ordinary fake tests remain separate and need no credentials or live services:
+
+```bash
+cargo test --workspace --locked development_harness
+```
+
+## Rust harness rerun (2026-10-16 JST)
+
+The signed build `0.7.1+35db7cc.1792079471` ran the procedure above with
+Herdr 0.9.3, Codex 0.160.0 and `gpt-6-luna`. The fresh root and session were
+`/private/tmp/hla-issue140-rust-live-3` and `hla-issue140-rust-live-3`.
+The fixture command cloned the existing
+`https://github.com/civitaspo/testing-herdr-linear-agent.git` twice. No GitHub
+repository, source commit, push or PR was created.
+
+The executed scenario commands, from the source checkout, were:
+
+```bash
+export HERDR_LINEAR_AGENT_DEVELOPMENT_MODE=true
+# Select the installed Herdr 0.9.3 executable with HERDR_BIN_PATH.
+target/release/herdr-linear-agent development harness verify \
+  /private/tmp/hla-issue140-rust-live-3 civitaspo/THLA-40 \
+  --terminal done --timeout-seconds 300
+target/release/herdr-linear-agent development harness verify \
+  /private/tmp/hla-issue140-rust-live-3 civitaspo/THLA-41 \
+  --terminal canceled --timeout-seconds 300
+target/release/herdr-linear-agent development harness stop \
+  /private/tmp/hla-issue140-rust-live-3
+target/release/herdr-linear-agent development harness ordinary-restore \
+  /private/tmp/hla-issue140-rust-live-3
+```
+
+These commands record this execution. For another run, follow the preparation
+procedure above with a new root/session and two newly delegated scratch issues;
+the verifier refuses to overwrite an issue's evidence directory.
+
+[THLA-40](https://linear.app/civitaspo/issue/THLA-40/verify-rust-harness-setup-recovery-and-cleanup)
+passed the Done scenario: blocked setup and saved cursors survived ticker
+restart; completed hooks ran once and the interrupted hook ran twice; the two
+workers used the distinct fixture clones and shared the coordinator's
+workspace; real reports were copied home with matching SHA-256 hashes; worker
+restart replaced its pane while keeping its checkout and branch; dirty cleanup
+was retained across another ticker restart; retry from a stopped ticker removed
+the checkout. Both removal hooks ran once, reports survived cleanup, Git kept
+only each main checkout, and the operator-created user pane remained.
+
+[THLA-41](https://linear.app/civitaspo/issue/THLA-41/verify-rust-harness-cancellation-during-setup)
+passed cancellation while both hooks were blocked. Neither worker acquired an
+agent pane or report. Both saved cleanup operations completed, both checkout
+paths and Git registrations disappeared, each removal hook ran once, and the
+existing user pane remained. Both `result.json` files contain `passed: true`.
+
+Fixture preparation, deadlines, ticker control, filesystem/Git/Herdr/Linear
+cross-checks, report hashing, assertions, checkpoint evidence and cleanup used
+the Rust harness. Operator assistance was limited to creating/delegating the
+two issues, accepting the two observed Codex trust dialogs, and changing the
+issues to Done/Canceled at the printed checkpoints. No auxiliary Python or
+shell test runner was used. The workers observed regular `fixture.txt` files
+through the linked `node_modules` directories; the Rust check independently
+verified the directory symlink targets. The fixture wording was clarified to
+distinguish the directory symlink from the regular file reached through it.
+
+Evidence is retained under the root: `fixture-manifest.json`, `hooks/`,
+`evidence/civitaspo/THLA-40/` and `evidence/civitaspo/THLA-41/` contain checkpoint
+observations and results. `stop-result.json` verifies the isolated ticker lock
+is free and its named session is absent. `ordinary.json` records matching
+ordinary config/run/supervisor hashes and restoration of the exact installed
+`0.7.0+c1ca582.1790986249` binary (PID 44264). Ordinary agent panes were not
+stopped; native Codex data and OS credentials remained shared.
+
+Initial fixture attempts exposed missing directory creation and an inherited
+XDG-path overlap check in the hook entry point. Those were fixed and covered by
+offline regressions. The failed
+[THLA-39](https://linear.app/civitaspo/issue/THLA-39/verify-issue-140-with-rust-lifecycle-harness)
+attempt was canceled and its checkouts/session cleaned up; its ordinary ticker
+was restored before the fresh run. Its diagnostic root
+`/private/tmp/hla-issue140-rust-live-2` is retained and is not passing evidence.
+
+Separately, `mise run --skip-tools lint`, `mise run --skip-tools test` and
+`mise run --skip-tools build` passed using the pinned tools already installed.
+The ordinary suite reported 520 passed and one ignored: `routing_live` invokes
+real agent CLIs and was not part of this lifecycle check. The live evidence
+covers the two scenarios above, not PR/merge/deployment, final postmortem
+completion, legacy layout migration, unknown Herdr responses or every hook
+failure mode. Those limits do not become live results merely because offline
+regressions pass.
+
+## Worker tab inspection pause (2026-10-16 JST)
+
+The signed `0.7.1+35db7cc.1792103448` build added the optional inspection
+checkpoint. Offline checks passed with `mise run --skip-tools lint`,
+`mise run --skip-tools test` and `mise run --skip-tools build-development`
+with `HLA_SIGN_IDENTITY` set. The ordinary suite reported 521 passed and one
+ignored `routing_live` test. The resume command test covers missing, invalid,
+active, repeated, expired and finished inspection requests. Existing bounded
+wait tests cover the last observed state and a hung observation.
+
+The live inspection used the fresh root
+`/private/tmp/hla-issue140-inspection`, session `hla-issue140-inspection`,
+Herdr 0.9.3, Codex 0.160.0 and `gpt-6-luna`. The current Rust `fixture` command
+cloned the existing `civitaspo/testing-herdr-linear-agent` repository twice.
+An earlier preparation under `/private/tmp/hla-issue140-visual-live` used the
+previous binary, was stopped before delegation, and is not the inspection run.
+
+After the fixture preparation, dedicated server startup, doctor check, ordinary
+ticker suspension and creation/delegation of
+[THLA-42](https://linear.app/civitaspo/issue/THLA-42/inspect-issue-140-worker-tabs-before-harness-continuation),
+the executed command was:
+
+```bash
+target/release/herdr-linear-agent --development-mode development harness verify \
+  /private/tmp/hla-issue140-inspection civitaspo/THLA-42 \
+  --terminal done --pause-after-workers --timeout-seconds 1800
+```
+
+`setup-blocked`, `setup-resumed` and `workers-started` passed. At
+2026-10-16 07:32:53 JST the verifier printed `PAUSED`. The coordinator is in
+`w1:t1`; the `api` and `web` worker tabs are `w1:t2` and `w1:t3` in the same
+workspace. Both worker panes show Codex's repository trust prompt. Those prompts
+were left for the user's visual inspection. This proves worker process presence
+and placement, not completed worker turns or reports.
+
+The verifier waited at `inspection-resumed` until an explicit resume, with a
+deadline of 2026-10-16 08:02:53 JST. At that checkpoint, worker restart and
+cleanup had not run, and there was no full-scenario `result.json`. Evidence remains in
+`evidence/civitaspo/THLA-42/`, and verifier output is in `verify.log` under the
+root. Attach and resume from separate terminals in the source checkout:
+
+```bash
+target/release/herdr-linear-agent --development-mode development harness herdr \
+  /private/tmp/hla-issue140-inspection
+# After inspecting the tabs and accepting the scratch repository trust prompts:
+target/release/herdr-linear-agent --development-mode development harness resume \
+  /private/tmp/hla-issue140-inspection civitaspo/THLA-42
+```
+
+At this checkpoint the isolated ticker remained running. The ordinary
+`0.7.0+c1ca582.1790986249` ticker was stopped with `ordinary-suspend` before
+delegation and remained suspended to prevent competing intake. Its custody and
+protected-file baseline are in `ordinary.json`. After completing or canceling
+the scratch issue, run `harness stop` and `ordinary-restore` as described above.
+The inspection checkpoint did not establish a complete scenario pass.
+
+After the user opened the session and requested worker progress, the operator
+accepted the two observed Codex trust prompts for the isolated `api` and `web`
+fixture repositories. Herdr then reported both workers as `working`, with
+`interactive_ready: true` and the title `Read and follow brief`. The verifier
+remained at `inspection-resumed`; worker restart and cleanup were still paused
+so the user could watch the worker turns.
+
+The inspection deadline expired before the user requested the rest of the
+scenario. `result.json` records `passed: false` and the failed
+`inspection-resumed` checkpoint. The verifier stopped its ticker and left the
+tabs intact as designed. The evidence was not reset or relabeled as a pass.
+Both workers had produced real read-only reports. After the user requested
+continuation, the operator marked THLA-42 Done and restarted its isolated ticker
+for cleanup. The saved run reached `closed` with `cleanup_pending: false`, both
+workers recorded `cleanup_completed: true`, and Git listed only the two main
+fixture checkouts. `harness stop` then stopped and deleted the inspection session.
+Its `stop-result.json` confirms a free ticker lock and absent session. The
+remaining scenario is rerun below with a fresh issue and root.
+
+## Inspection resume and completed lifecycle (2026-10-16 JST)
+
+The same signed `0.7.1+35db7cc.1792103448` binary completed the Done scenario on
+[THLA-43](https://linear.app/civitaspo/issue/THLA-43/verify-issue-140-after-visual-inspection-with-rust-harness).
+The fresh root and dedicated session were `/private/tmp/hla-issue140-resumed-live`
+and `hla-issue140-resumed-live`. The Rust `init` and `fixture` commands prepared
+the two clones of the existing scratch repository using the prerequisites and
+procedure above. Doctor confirmed Herdr 0.9.3, Codex 0.160.0 and the existing
+Linear credential. No repository, commit, push or PR was created.
+
+The ordinary ticker remained suspended under the existing custody record at
+`/private/tmp/hla-issue140-inspection/ordinary.json` throughout this continuation.
+After creating and delegating the fresh scratch issue, the executed commands
+were:
+
+```bash
+target/release/herdr-linear-agent --development-mode development harness verify \
+  /private/tmp/hla-issue140-resumed-live civitaspo/THLA-43 \
+  --terminal done --pause-after-workers --timeout-seconds 300
+# After the verifier printed PAUSED, from another terminal:
+target/release/herdr-linear-agent --development-mode development harness resume \
+  /private/tmp/hla-issue140-resumed-live civitaspo/THLA-43
+# After the verifier finished:
+target/release/herdr-linear-agent --development-mode development harness stop \
+  /private/tmp/hla-issue140-resumed-live
+target/release/herdr-linear-agent --development-mode development harness ordinary-restore \
+  /private/tmp/hla-issue140-inspection
+```
+
+Every checkpoint passed, including explicit inspection resume, both real worker
+reports with matching persisted hashes, worker pane replacement with unchanged
+checkout and branch, and dirty checkout retention. The retained cleanup
+operation survived a ticker restart. Explicit retry from a stopped ticker
+removed the checkout. Removal hooks ran once, reports survived cleanup, Git
+registrations returned to only the main checkouts, and the unrelated operator
+pane remained. At 09:55:20 JST, `evidence/civitaspo/THLA-43/result.json` recorded
+`passed: true` with no failure or ticker-stop failure. Checkpoint JSON, hook logs,
+fixture manifest and `verify.log` remain under the root.
+
+Operator actions were the fresh issue's creation and delegation, accepting the
+two observed scratch repository trust prompts, invoking `harness resume`, and
+setting the issue Done at the printed action. The rest used the Rust harness.
+No auxiliary Python or shell test runner was used. This run verifies the Done
+scenario and inspection resume. It does not extend the earlier cancellation
+evidence or verify a PR/merge workflow, final postmortem completion, legacy
+migration, lost network responses or arbitrary hook failures.
+
+`stop-result.json` confirms the isolated ticker lock is free and its session is
+absent. `ordinary-restore` verified matching protected config/run/supervisor
+hashes and restored the exact `0.7.0+c1ca582.1790986249` binary as PID 96932.
+The custody record contains `Restored` with no errors. No implementation code
+changed during this continuation; the preceding ordinary checks remain 521
+passed, one ignored `routing_live` test, successful lint and signed build.
+Documentation changes passed `git diff --check`.
+
 ## Open questions
 
 | # | Question | Result |
@@ -700,3 +1119,28 @@ The implementation was verified against the repository's fake Herdr, fake Linear
 The `mise run lint`, `mise run test`, and `mise run build` wrappers could not start because mise attempted to install `aqua:DataDog/pup@latest` and the environment returned `Operation not permitted`. The locked Rust checks and shell/workflow lint commands listed above were run directly.
 
 An isolated live attempt used Herdr 0.9.3 and the supervisor build against one private scratch Linear issue and repository. The single read-only worker completed and the issue reached Done. The final postmortem attempt exited with code 1. The supervisor pane remained `launch_pending`: its shell resolved `opencode` through a mise shim with no version selected in the temporary workspace. The failed postmortem artifact was saved, but no supervisor decision was committed. The test session was stopped and deleted, and the installed ticker was restored. This attempt does not verify successful final-postmortem generation or live supervisor report consumption and decision persistence. Re-run those checks with an OpenCode CLI path available to the isolated Herdr session before treating the feature as live-verified. Profile replacement, long-idle behavior, and performance targets also remain unverified against live services; no throughput measurements were taken.
+
+## Shared issue workspace primitives (2026-10-15)
+
+An isolated, headless Herdr 0.9.3 session checked the socket operations used by
+issue #140. `workspace.create`, `tab.rename` and two `tab.create` requests produced
+one workspace with coordinator, worker and user tabs. `session.snapshot` exposed
+their distinct labels in `tabs`, independently of pane workspace labels.
+Closing the worker and coordinator through `pane.close` preserved the user tab
+and workspace. Closing the final user pane removed the workspace.
+
+The repository integration harness isolated configuration and state under
+`/private/tmp/hla-issue140-layout-live`; its named session was stopped and deleted
+afterward. Request/response evidence remains in `layout-protocol-evidence.json`
+under that root. The requests were sent directly to this isolated session's
+socket using the production request shapes. This checks Herdr protocol and
+pane ownership primitives, not a complete plugin, agent or Linear workflow.
+No ticker, agent CLI or Linear request was started, and ordinary sessions were
+not modified. Git checkout and recovery behavior are covered separately by
+real temporary Git repositories and the fake lifecycle scenarios.
+
+The minimum supported Herdr 0.9.1 release binary was also checked offline with
+`api schema --json`. Its protocol 22 schema includes `tab.create`, `tab.rename`,
+`pane.close` and snapshot `tabs` with labels. The downloaded macOS arm64 binary
+matched the SHA-256 digest in GitHub's release metadata. This was a schema
+compatibility check; the live primitive checks above used 0.9.3.

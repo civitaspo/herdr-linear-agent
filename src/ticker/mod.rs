@@ -3,6 +3,7 @@
 //! run. `ticker start` (the startup hook, and every agent-facing command)
 //! keeps one of this version running; `ticker run` is the process itself.
 
+mod cleanup;
 mod intake;
 mod launch;
 mod merge_decisions;
@@ -12,6 +13,7 @@ pub mod reconcile;
 mod scenarios;
 mod supervisor;
 mod watching;
+mod worker_ops;
 #[cfg(test)]
 mod world;
 

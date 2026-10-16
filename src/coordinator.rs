@@ -156,6 +156,11 @@ pub fn workspace_label(record: &RunRecord) -> String {
     )
 }
 
+/// A coordinator always occupies a clearly named tab inside the run workspace.
+pub fn tab_label() -> &'static str {
+    "coordinator"
+}
+
 pub fn launch_prompt(key: &str, resume: bool) -> String {
     if resume {
         format!(
@@ -351,6 +356,11 @@ pub fn digest(
             let _ = write!(text, ", PR {}", row.pr_url);
         }
         text.push('\n');
+    }
+    for worker in worker::list_checked(run)? {
+        if !worker.agent.error.is_empty() {
+            let _ = writeln!(text, "- {} lifecycle: {}", worker.id, worker.agent.error);
+        }
     }
     if team.is_some_and(|team| team.merge_decision.is_some()) {
         text.push_str("\n## Machine merge decisions\n\n");
@@ -630,6 +640,7 @@ mod tests {
 
         let f = folder(&format!("Tab\there {}", "z".repeat(80)));
         let label = workspace_label(&f.record);
+        assert_eq!(tab_label(), "coordinator");
         assert_eq!(
             label,
             format!("acme/DATA-1 · coordinator · Tabhere {}", "z".repeat(52))
@@ -896,6 +907,7 @@ mod tests {
         let snapshot = Snapshot {
             version: "0.9.1".into(),
             protocol: 22,
+            tabs: BTreeMap::new(),
             panes: BTreeMap::from([pane_row("p1:1")]),
             agents: vec![claude_in("p1:1", "data-1-w1", "/wt/repo1", Seen::Idle)],
             skipped: 0,

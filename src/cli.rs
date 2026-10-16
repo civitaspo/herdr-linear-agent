@@ -181,6 +181,8 @@ enum WorkerCommand {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Retry a retained cleanup phase after resolving its cause.
+    RetryCleanup { key: String, id: String },
     /// Request one-time Linear authorization to merge this worker's PR.
     RequestMerge { key: String, id: String },
     /// Squash-merge an authorized worker PR.
@@ -291,7 +293,7 @@ pub async fn run() -> Result<()> {
                     crate::agent_smoke::run(&env, options).await
                 }
                 DevelopmentCommand::Harness { command } => {
-                    crate::development_harness::run(&env, command)
+                    crate::development_harness::run(&env, command).await
                 }
                 DevelopmentCommand::HerdrWatch { socket } => herdr_watch(socket).await,
             };
@@ -447,6 +449,10 @@ async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
             commands::worker_restart(ctx, &session, &key, &id, profile.as_deref())
                 .await
                 .map(|_| ())
+        }
+        WorkerCommand::RetryCleanup { key, id } => {
+            commands::worker_retry_cleanup(ctx, &key, &id)?;
+            ticker::start(ctx).await
         }
         WorkerCommand::RequestMerge { key, id } => {
             commands::worker_request_merge(ctx, &key, &id).await

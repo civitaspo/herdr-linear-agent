@@ -341,7 +341,7 @@ An empty session id, or one starting with `-`, gives none. `tests/agents:resume_
 
 Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as child processes under `tokio::process`.
 
-- The runner captures stdout, stderr and the exit code. A program that does not exist is an error. A child that runs past its deadline is killed and reported as timed out; its output keeps being drained so a chatty child cannot block the deadline. Timeouts: git 10 s, `git fetch` 60 s, `open` 10 s. `tests/runner:captures_output_and_exit_code`, `tests/runner:missing_program_is_an_error`, `tests/runner:times_out_a_chatty_child`
+- The runner captures stdout, stderr and the exit code. A program that does not exist is an error. A child that runs past its deadline is killed and reported as timed out; its output keeps being drained so a chatty child cannot block the deadline. Worker checkout Git commands have a 60 s timeout and a 1 MiB combined output limit. Hook timeouts are configured per repository. Other command timeouts remain unchanged. On Unix, timeout, output overflow and cancellation kill the command’s process group, including its descendants. This group ownership applies to runner-backed commands; routing retains its separate child collector. `tests/runner:captures_output_and_exit_code`, `tests/runner:missing_program_is_an_error`, `tests/runner:times_out_a_chatty_child`
 - Tests fake these child processes.
 
 ## Herdr access
@@ -383,10 +383,10 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 | Request | Params | Used by |
 | --- | --- | --- |
 | `workspace.create` | `cwd`, `label`, `focus: false` | coordinator placement |
-| `workspace.close` | `workspace_id` | run close, worker restart |
 | `workspace.focus` | `workspace_id` | focus-run action |
-| `worktree.create` | `cwd`, `branch`, `base`, `label`, `focus: false` | worker start; result has `root_pane` and `worktree.path` |
-| `worktree.open` | `cwd` (the repository checkout), `path`, `label`, `focus: false` | worker restart in the kept checkout. Without `cwd` Herdr 0.9.1 refuses the request (`not_git_worktree`, or `worktree_not_found`), measured in THLA-10. |
+| `tab.create` | `workspace_id`, `cwd`, `label`, `focus: false` | worker placement and coordinator recovery in the run workspace |
+| `tab.rename` | `tab_id`, `label` | label the initial coordinator tab |
+| `pane.close` | `pane_id` | close managed panes during restart and run cleanup |
 | `agent.start` | `name`, `kind`, `pane_id`, `args` | launch |
 | `agent.prompt` | `target` (pane id), `text` | launch prompt, nudge, worker prompt |
 | `agent.send_keys` | `target`, `keys: ["esc"]` | stop, close, detach |
@@ -398,7 +398,9 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 
 `agent.start` args follow the CLI form `agent start <name> --kind <kind> --pane <pane> -- <args...>`; the arguments after `--` go to the agent CLI unchanged. `tests/herdr:errors_carry_herdrs_code_and_calls_carry_the_socket`
 
-Workspace labels identify ticket membership without changing Herdr's repository-based worktree groups. A coordinator uses `<KEY> · coordinator · <title>`; its title drops control characters and keeps at most 60 characters. A worker uses `<KEY> · <id>`. Both use the workspace-qualified run key, so identical issue keys in different Linear workspaces stay distinguishable. Worker creation, recovery of a creation whose answer was lost, and manual restart pass the same label through Herdr's existing `worktree.create` and `worktree.open` methods. Branch names, checkout paths, and workspace close behavior are unchanged. Existing open workspaces are not automatically renamed. Routing and postmortem remain outside this labeling scheme.
+A run's workspace is the coordinator's recorded workspace. Its label is `<KEY> · <title>`, with control characters removed from the title and at most 60 title characters. The coordinator tab is `coordinator`. Worker tabs are `<id> · <repo> · <title>`, with at most 40 title characters. `<KEY>` includes the Linear workspace, such as `acme/DATA-1`. All new workers use tabs of that workspace, including runs involving several repositories. Moving the coordinator into another workspace sets `coordinator_misplaced`, reports the conflict once and gates new placements. The canonical run workspace does not change; returning the coordinator clears the conflict. Their Git checkouts live under `<state dir>/worktrees/<KEY>/<id>-<repo>`.
+
+Existing workers keep their recorded checkouts and panes until explicitly restarted or closed. Restart opens a tab in the run workspace before closing the old pane. The new agent starts only after closure succeeds. Existing workspace labels are kept. Closing the last pane can close its workspace, so cleanup closes recorded plugin panes rather than an entire workspace that may contain a person's extra panes. External Herdr cleanup plugins may still have registrations for legacy checkouts or Git hooks that register new ones; plugin-owned Git operations do not disable those policies.
 
 ### Identity of an agent
 
@@ -651,14 +653,13 @@ For every active or detached run, per update, in this order. Detached runs remai
 
 `refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no edit item. Workflow state names have a separate persisted cursor: an active run writes an `issue`/`state` inbox item when the state name changes, including transitions between states of the same type. Claim seeds the cursor with the observed state in the same lock as the configured InProgress-state outbox request. During the first detailed read, `finish_claim` also suppresses the exact configured pickup state if Linear already moved the issue before that read; other state names remain visible. Repeated and older issue reads do not move the cursor backward. Older run records without a cursor initialize from their first issue detail without a notice. The hash leaves out state as well as comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:workflow_state_changes_reach_the_coordinator_once_including_same_type_changes`, `tests/scenarios:pickup_state_already_started_before_the_first_detail_is_silent`, `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
 
-`close_run`:
+`close_run` persists the closed status and a cleanup barrier before external work. It queues the final response in the same run-lock critical section. A closed run starts no agents, but continues reconciling its durable cleanup operations.
 
-1. Interrupt the agents (Escape).
-2. For each worker: copy its report home; when it is `open` and its pane exists, collect its workspace (the live one, or the recorded one); set it `stopped`.
-3. When the coordinator is `open` and its pane exists, collect its workspace.
-4. Close every collected workspace; log failures.
-5. Set the run `closed` and the coordinator `stopped` and, when the run has a session, queue the response ``The issue is <state name>; this run is closed.`` in the same critical section, since Linear shows a session as working until a response ends it (the flush covers closed runs). Log the close line.
-6. A closed run is left alone: nothing is started for it. Reopened and still delegated, it becomes active with the coordinator resumed from its session (`--resume sess-...`). `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it` (two workspaces closed, worker `stopped`).
+Each worker cleanup saves an available report before closing its managed panes, copies the final report home again after closure, removes the verified checkout with `git worktree remove` without force, and runs the captured `post_remove` commands. A failed pane close or unreadable report prevents checkout deletion. Missing reports are allowed. A dirty, locked or otherwise unverified checkout is retained with a persisted reason. Branches are never deleted. Reports copied into `workers/<id>.md` survive checkout removal. The pre-close copy also preserves an available report if an external legacy Herdr cleanup policy removes the checkout when its last pane closes. Each acknowledged hook advances a persisted cursor; a crash before acknowledgment can repeat a command.
+
+The worker's `cleanup_completed` marker prevents repeating completed cleanup. A terminal refusal retains its operation and error, visible in `context` and the worker TOML. `worker retry-cleanup KEY ID` requires a closed run and a retained failure; it assigns a fresh UUID, keeps the failed phase and hook cursor, and reactivates the cleanup barrier. A refusal after all panes are confirmed closed releases the reopen barrier while retaining its checkout and failure; an uncertain placement or unclosed pane keeps the barrier.
+
+Cleanup continues after ticker restart. Reopening a still-delegated issue waits for outstanding cleanup before resuming its coordinator. Detach, stop, a lost pane and a person closing a workspace do not remove checkouts.
 
 `detach_run`: under the run lock, queue one ordinary issue comment with a UUID approval code and persist `resume_request`, set `detached` and `interrupt = detach`, and clear any session-native wait. The first pass with a snapshot interrupts the agents; workspaces and native agent sessions stay. The consent record survives ticker restarts. Existing detached records without a request acquire one on their next read. Old queued session activities/plans/URLs and issue-state moves are discarded while consent is pending; ordinary comments and postmortem labels can still be delivered without opening a session.
 
@@ -673,7 +674,7 @@ Comment consent:
 
 Regression evidence uses `World`/`FakeLinear`, including restart, hidden sessions, removed sessions, policy enforcement, old codes, declined requests, other-agent ownership, lost write responses and completion while detached. These are fake integration scenarios, not a check against a real Linear workspace. See `src/ticker/scenarios.rs:comment_consent_restores_delegation_and_keeps_the_native_agents_and_worktrees`, `hidden_sessions_pause_even_with_a_delegate_and_ignore_untrusted_or_stale_consent`, `detached_runs_still_close_and_get_a_final_postmortem_without_a_linear_session` and `src/outbox.rs:a_lost_recovery_response_is_verified_before_retrying_either_write`.
 
-Checkouts and branches are never removed.
+Detachment keeps checkouts and branches. Completion and cancellation use the cleanup sequence above.
 
 When comment-authorized recovery switches to a new Linear session, it resets the prompt cursor boundary IDs, clears queued prompt IDs from the old session, and clears the old coordinator-turn completion marker. New-session replies and coordinator recovery use the existing run and native agent history. Turn-completion responses require a usable session and are discarded with other session writes while recovery is pending.
 
@@ -808,13 +809,12 @@ For an active run whose coordinator is `pending`:
    - `.claude/settings.local.json`: `{"permissions":{"allow":["Bash(<bin> skill:*)", "Bash(<bin> context:*)", "Bash(<bin> inbox done:*)", "Bash(<bin> plan:*)", "Bash(<bin> say:*)", "Bash(<bin> ask:*)", "Bash(<bin> worker:*)", "Bash(<bin> finish:*)"]}}`. `startup`, `action` and `ticker` are never allowed.
    - `.cursor/cli.json`: `{"permissions":{"allow":["Shell(<bin>)"],"deny":[]}}`. Cursor Agent matches the command as typed, so the entry is the path the sheet gives; without it every `herdr-linear-agent` command waits for approval (measured with Cursor Agent 2026.09.26). `src/coordinator.rs:priming_points_the_coordinator_at_the_binary_and_allows_only_agent_commands`
    - `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
-2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused.
+2. Persist a UUID-bound placement operation and its requested session, cwd and target workspace before the external request. Use `workspace.create` for the initial workspace, or `tab.create` when the recorded run workspace still exists.
 3. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` from the root pane; set `status open`, `prompt_pending true`, `launch_attempts 0`.
-4. `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane whose cwd is `canonical_dir` and that is empty or holds our agent (kind and name) is adopted instead of creating a second workspace; the label is not compared, since a title edit changes it. With our agent in it, the adopted coordinator is prompted, not started. `tests/scenarios:a_placement_without_an_answer_is_adopted_after_a_title_edit` Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
+4. Placement runs as an effect task. Its intent is marked `unknown` before the request. After an unknown outcome or ticker restart, only a unique pane with the canonical cwd and our agent identity (or no agent), in the requested session and workspace when one was specified, can be adopted. Zero or multiple candidates leave the operation pending; elapsed time never authorizes another create. The workspace label is not identity. The initial coordinator tab is renamed to `coordinator`.
 
-A placement failure counts as a launch attempt (see below); `NotSent` and `OutcomeUnknown` do not.
+Acknowledgments update only the matching operation UUID under the run lock. A successful placement no longer eligible for use is retained as an orphan operation until its pane is confirmed closed. Cleanup closes that pane, preserving other tabs. A start or failure only updates an active agent still in the original pane. Unknown coordinator placement operations continue reconciling for closed runs so late resources can be reclaimed.
 
-Effect results are applied only to records that did not move on, decided under the run lock when the result is applied: a placement only while the run is active and the coordinator still `pending` (otherwise the new workspace is closed), a start or its failure only while the run is active and the agent is still `open` in the pane the start went to. Other results are dropped. `tests/scenarios:a_start_result_for_a_pane_the_worker_left_is_dropped`
 
 ### Start
 
@@ -997,7 +997,7 @@ Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `wor
 
 ### Worker record (`workers/<id>.toml`)
 
-Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, optional `merge_authorization`, `merge_attempt` and `merge_decision`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`). Older worker TOML defaults the new fields to absent; `merge_attempt.attempted_at` defaults to an empty string for older attempts and keeps merge receipts stable when finalization retries.
+Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, optional `merge_authorization`, `merge_attempt` and `merge_decision`, `gone_reported`, `restarting` (legacy restart compatibility), `cleanup_completed`, optional captured `worktree_hooks` and UUID-bound `operation` (start, restart or cleanup phase, setup/hook cursor, placement intent and retained reason), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`). Older worker TOML defaults the new fields to absent; `merge_attempt.attempted_at` defaults to an empty string for older attempts and keeps merge receipts stable when finalization retries.
 
 | Operation | Behavior |
 | --- | --- |
@@ -1025,18 +1025,21 @@ A worker counts against `max_agents` when its status is `pending` or `open`.
 
 ### `worker start <KEY> --repo --profile --title --task-file`
 
-1. `ticker start`; load the config; load the run; it must be active, else ``run <KEY> is <Status>; nothing more is done for it`` (`Active`, `Detached`, `Closed`).
-2. Checks, in this order: the repository is in the catalog; the profile is a worker profile (`not a worker profile`); no other worker of the run uses the repository (message contains `one worker per repository`); the run has fewer than `max_workers_per_run` workers (message contains `max_workers_per_run`); the agent count leaves room under `max_agents`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold`
-3. Allocate the id. Branch: `branch_name(KEY, id, title)`.
-4. `git -C <repo path> fetch origin <base>` (60 s).
-5. `worktree.create` with `cwd` = repo path, `branch`, `base` = `origin/<base>`, not focused. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` and `worktree_path` from the result. When its answer is lost (`OutcomeUnknown`), look for the branch's worktree in `git -C <repo path> worktree list --porcelain` (10 s); when it exists, open it with `worktree.open` and go on, else mark the worker failed. `src/commands.rs:a_worktree_created_without_an_answer_is_opened_not_failed`
-6. Add `.herdr-linear-agent/` to the repository's shared `info/exclude` (the common git dir, so every worktree is covered), once. A failure here does not fail the command. `tests/commands:exclude_is_added_once_to_the_shared_file` (git status stays clean with files under `.herdr-linear-agent/`); the scenario World fails every `git -C` except the fetch and the command still succeeds.
-7. Write `workers/<id>.task.md` and `<brief_dir>/brief.md`.
-8. Set the agent `open`, `prompt_pending`, `profile`, `kind`, `agent_name = <key>-<id>`.
-9. Queue the action `Start worker` with a parameter naming the repository and the profile.
-10. Return the worker. The ticker starts the agent in a later pass.
+The command validates the active run, its placed coordinator workspace, the repository and worker profile, one worker per repository, `max_workers_per_run` and `max_agents`. It rechecks the run under its lock and allocates a worker with a UUID operation, the task payload, captured hooks and a deterministic checkout path. It returns after persisting that intent. It performs no Git or Herdr placement call.
 
-`tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (branch `herdr-linear-agent/data-1/w1-change-api`, `--base origin/main`, `brief.md` exists).
+The ticker advances the operation through task-file storage, checkout creation or verified reuse, setup, tab creation and brief preparation. The worker becomes launchable only after all stages succeed. Setup runs before any agent starts. A setup error is persisted and reported; restart retries it. An uncertain tab-create outcome is persisted and may adopt a unique pane matching the captured tab label, canonical checkout directory, agent identity and intended workspace in the original session. An absent pane in one snapshot does not authorize another create request after an unknown outcome.
+
+The plugin uses the Git CLI, requiring Git 2.17 or later. It checks the exact checkout path, branch and Git common directory before reuse or removal. A branch checked out elsewhere and an existing unregistered path are refused. Only the worker's exact missing worktree registration may be repaired; there is no global prune. New branches use `--no-track`; existing worker branches are preserved and reused without an unnecessary fetch. `.herdr-linear-agent/` is excluded through the repository's shared Git exclude file before the brief is written.
+
+### Worktree hooks
+
+`[repositories.<name>.worktree]` accepts `copy`, `symlink`, `post_create`, `post_remove`, `post_create_timeout_seconds` and `post_remove_timeout_seconds`. All lists default to empty. Both timeouts default to 600 seconds per command and accept 1 through 86400. Unknown fields, blank commands, absolute or parent-traversing paths, and conflicting destinations are rejected.
+
+Setup copies regular files from the main checkout, creates absolute symlinks to files or directories there, then runs `post_create` commands in order. A missing source is skipped and an existing destination, including a dangling symlink, is preserved. Copies are published atomically without overwriting. Resolved sources and destination parents must remain within their respective checkouts. Directory copies are unsupported.
+
+Commands come only from trusted plugin configuration and run as `sh -c` with the ticker's environment. They additionally receive `HLA_RUN_KEY`, `HLA_WORKER_ID`, `HLA_REPO`, `HLA_REPO_PATH`, `HLA_WORKTREE`, `HLA_BRANCH` and `HLA_BASE`. `post_create` runs in the worker checkout; `post_remove` runs in the main repository after successful checkout removal. Hooks are captured in the operation record, so a config reload does not silently replace an accepted operation's commands. Legacy workers have no post-create hook snapshot.
+
+Hook delivery is at least once. Commands must tolerate repetition after a crash between external completion and cursor persistence. Use the run key or branch as well as the worker ID when naming external resources, because different runs each have a `w1`. Per-command output is capped at 64 KiB and logs are capped at 1 MiB. See the README for configuration examples.
 
 ### Brief (`compose_brief`)
 
@@ -1058,16 +1061,13 @@ Input: issue key, title, URL, worker, task, restart flag, binary. Order in the t
 
 ### `worker restart <KEY> <id> [--profile]`
 
-- At most 2 restarts per worker; the third fails with a message containing `limit is 2`.
-- A new profile must be a worker profile; without one the profile stays.
-- Under the run lock, before the old workspace is closed, the worker is marked `restarting`: its pane is cleared, `prompt_pending` set, `gone_reported`, `last_group` and `blocked_reported` reset. Only then are the workspace closed and the new pane opened. A failure there leaves the worker `failed`, no longer restarting. `tests/scenarios:a_restart_between_a_snapshot_and_its_pass_keeps_the_new_pane`
-- A worker without a `worktree_path` first looks for its branch's worktree (`git worktree list --porcelain`) and opens it when it exists; otherwise it is placed again from its base. `src/commands.rs:a_restart_opens_the_worktree_a_lost_answer_left_behind`
-- Close the old workspace (the checkout stays), open the kept worktree again with `worktree.open` and `path` = `worktree_path`, record the new pane, rewrite the brief with the restart note, set `restarts += 1`, `kind` of the profile, `open`, `prompt_pending`, `launch_attempts = 0`. The ticker starts it in a later pass with the new profile's arguments.
-- `tests/scenarios:restarts_switch_profiles_and_are_limited` (kind `codex`, restarts 1, one workspace closed, `previous attempt` in the brief, `model_reasoning_effort=xhigh` in the next start).
+A worker can be restarted twice. A replacement profile must be a worker profile; otherwise the current profile is retained. The command persists a UUID operation under the run lock, preserving the previous pane identity until closure is acknowledged. A worker with an unresolved operation cannot start a conflicting one. A failed start or restart can be resumed by this command: it receives a new UUID, consumes one restart slot, and preserves the saved phase, setup cursor, hooks and placement identity. The saved task payload is sufficient to retry a task-file write that never completed. A replacement profile takes effect after the previous pane is closed; an already placed replacement cannot change profile during this retry.
+
+The ticker verifies or recreates the recorded checkout, performs required setup, creates a replacement tab in the run workspace, closes the previous managed pane and rewrites the brief with the restart note. A recreated checkout records its setup requirement before creation, so a crash after Git succeeds cannot skip setup. A preserved checkout whose setup already succeeded is reused. The new agent remains gated until the previous pane has closed. Failed or unknown outcomes remain visible in the worker record rather than discarding their resource identities.
 
 ## Coordinator commands and the digest
 
-All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands require an active run and run `ticker start` first. None reads the Keychain.
+All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands except `worker retry-cleanup` require an active run and run `ticker start` first. `worker retry-cleanup` requires a closed run with a retained cleanup failure and starts the ticker after persisting its retry barrier. None reads the Keychain.
 
 | Command | Behavior | Output |
 | --- | --- | --- |
@@ -1251,6 +1251,7 @@ finish KEY --text-file <path|->
 worker start KEY --repo R --profile P --title T --task-file <path|->
 worker prompt KEY ID --text-file <path|->
 worker restart KEY ID [--profile P]
+worker retry-cleanup KEY ID
 worker request-merge KEY ID
 worker merge KEY ID
 supervisor context --generation N

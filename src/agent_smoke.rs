@@ -536,7 +536,6 @@ mod tests {
             workspace: WorkspaceId("w1".into()),
             tab: "w1:t1".into(),
             cwd: "/tmp/smoke".into(),
-            worktree_path: None,
         };
         let profile = crate::config::tests::sample()
             .profile("deep")

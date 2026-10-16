@@ -8,9 +8,9 @@ herdr-linear-agent is a [Herdr](https://github.com/herdrdev/herdr) plugin that p
 > [!NOTE]
 > herdr-linear-agent is not [Linear Agent](https://linear.app/docs/linear-agent), the assistant built into Linear (`@Linear`, ⌘J). It is an independent Herdr plugin, not made by or affiliated with Linear, that connects to your workspace as its own OAuth app through Linear's public Agents API, the same way other third-party agents do.
 
-For each issue, the plugin starts one coordinator agent. The coordinator reads the issue, splits the work, and starts one worker agent per repository in its own Herdr worktree. Workers implement the change, open pull requests and check CI. The plugin reports progress, questions and results to the issue's Agent Session in Linear, and people reply there.
+For each issue, the plugin starts one coordinator agent. The coordinator reads the issue, splits the work, and starts one worker agent per repository in a separate Git worktree. The coordinator and its workers occupy tabs of one Herdr workspace. Workers implement the change, open pull requests and check CI. The plugin reports progress, questions and results to the issue's Agent Session in Linear, and people reply there.
 
-Workspace labels put the ticket first. A coordinator is labeled `acme/DATA-1 · coordinator · Fix the API`, and its workers are labeled `acme/DATA-1 · w1`, `acme/DATA-1 · w2`, and so on. Workers remain under their repository's worktree group in Herdr's Spaces sidebar; the shared ticket prefix identifies their coordinator even across repositories. Herdr continues to create and open the worktrees, and branch names remain unchanged. The labels apply when workspaces are created or workers are reopened; existing open workspaces are not automatically renamed.
+The run workspace is labeled `acme/DATA-1 · Fix the API`. Its coordinator tab is named `coordinator`; worker tabs are named `w1 · api · Add the endpoint`. Worker checkouts live under `$XDG_STATE_HOME/herdr-linear-agent/worktrees/<workspace>/<ISSUE-KEY>/<id>-<repository>`. The plugin uses Git directly to create them. Existing workers in separate Herdr workspaces move into the run workspace when explicitly restarted; existing open workspaces are not renamed. Moving the coordinator into another workspace pauses new placements and reports a layout conflict. Move it back into the run workspace to continue.
 
 - **Linear is the front door.** Delegate an issue to the app user; talk to the run in the issue's Agent Session. The plugin opens no endpoint and polls Linear; the webhook Linear requires can point at an endpoint that discards what it receives (see [Set up](#set-up)).
 - **One writer.** Only the plugin's background ticker writes to Linear. Agents call plugin subcommands that queue requests; they never hold a Linear token.
@@ -22,7 +22,7 @@ Workspace labels put the ticket first. A coordinator is labeled `acme/DATA-1 · 
 
 - macOS or Linux, and Herdr 0.9.1 or later
 - On Linux: a Secret Service provider (GNOME Keyring, KWallet) for the token, and `xdg-open`
-- The agent CLIs your profiles use (`claude`, `codex`, `cursor-agent`, ...) and `git`
+- The agent CLIs your profiles use (`claude`, `codex`, `cursor-agent`, ...) and Git 2.17 or later
 - `gh` on the ticker's `PATH` when any team enables either merge mode
 - One or more Linear workspaces where you can install an OAuth application (workspace admin)
 
@@ -99,6 +99,14 @@ auto_accept_trust_dialog = false         # true: accept Claude Code's trust dial
 path = "/Users/me/src/github.com/acme/api"
 base = "main"                            # workers branch from origin/<base>; never guessed
 description = "The API server"
+
+[repositories.api.worktree]               # optional trusted setup and teardown
+copy = [".env", "apps/web/.env.local"]    # regular files, never overwrite existing destinations
+symlink = ["node_modules"]               # files or directories in the main checkout
+post_create = ["mise trust", "pnpm install"]
+post_create_timeout_seconds = 600         # per command, 1..86400
+post_remove = []                          # commands in the main checkout after removal
+post_remove_timeout_seconds = 600         # per command, 1..86400
 
 [routing.default]                        # a routing; teams name one (see Coordinator routing)
 agent = "router"                         # the profile of the routing agent; needed only when a list below has several profiles
@@ -458,11 +466,11 @@ Other kinds are not registered.
 1. The ticker (a background process the startup hook starts) polls each workspace every 5 seconds (`intake_interval_seconds`) for issues delegated to its app user in the configured teams that are neither completed nor canceled.
 2. It checks who delegated each new issue. An issue that someone outside the team's `allowed_delegator_ids` delegated gets no run: the ticker answers its session once, logs the delegator's name and ID and shows a Herdr notification.
 3. For a new issue it creates a run folder, creates an Agent Session, posts a first thought, moves the issue to the team's configured started state, picks the coordinator profile, and opens a Herdr workspace with the coordinator in the run folder.
-4. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. If a worker is still working, it says what it is waiting for and ends its turn. Once all workers have reported, `herdr-linear-agent wait` can end a completed turn while keeping the issue active; `finish` moves work ready for review. Each worker gets a worktree created by `herdr worktree create` on a branch `herdr-linear-agent/<workspace>/<issue-key>/<id>-<title>`.
+4. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. If a worker is still working, it says what it is waiting for and ends its turn. Once all workers have reported, `herdr-linear-agent wait` can end a completed turn while keeping the issue active; `finish` moves work ready for review. The command durably queues the request. The ticker creates the Git worktree, prepares it, and opens its tab on a branch `herdr-linear-agent/<workspace>/<issue-key>/<id>-<title>`.
 5. Workers report what they are doing (`herdr-linear-agent report --activity`) and write a report (`PR: <url>`, `## Report`, `## Next`). The ticker shows each new activity in the session, posts a worker that waits on someone, its report and its pull requests, copies the report into the run folder, and tells the coordinator through its inbox. After 10 quiet minutes it posts what each worker is doing and for how long.
 6. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. Changes to the issue's Linear workflow state create inbox items for the coordinator. A stop signal interrupts the run's agents.
 7. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported. A confirmed worker merge moves the issue to deployment and resumes the coordinator. After deployment work, a later `finish` moves the issue to its postmortem state. A successful workflow postmortem advances it to the completed state.
-8. When the issue is completed or canceled, the ticker stops the agents, closes their workspaces and ends the session with a short response. Checkouts and branches are kept.
+8. When the issue is completed or canceled, the ticker records the close request and ends the session with a short response. It closes managed panes, preserves reports and removes clean worker checkouts without forcing removal. Branches remain. Interrupted cleanup resumes after a ticker restart; refused removals retain their checkout and reason.
 
 If Linear removes the delegate or archives/dismisses the run's session, the ticker pauses the run, interrupts its agents and keeps its worktrees and history. It posts an ordinary issue comment with an incident-specific code. To authorize restoration, add an issue comment containing exactly `resume <code>`; `stop <code>` declines that request and leaves the run paused. The author must be a human in both the team's `allowed_user_ids` and `allowed_delegator_ids` (which defaults to `allowed_user_ids`). Restoring the delegate in the UI does not bypass a pending comment request.
 
@@ -510,17 +518,26 @@ The screens use only the terminal's 16 ANSI colors, so they follow the Herdr the
 | --- | --- |
 | `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` | Your config |
 | `$XDG_STATE_HOME/herdr-linear-agent/runs/<workspace>/<ISSUE-KEY>/` | A run: `issue.md`, `conversation.md`, worker records and reports, the coordinator's inbox, the outbox |
+| `$XDG_STATE_HOME/herdr-linear-agent/worktrees/<workspace>/<ISSUE-KEY>/` | Worker Git checkouts |
 | `$XDG_STATE_HOME/herdr-linear-agent/ticker.log` | The ticker's log |
 | `$XDG_STATE_HOME/herdr-linear-agent/supervisor/` | Supervisor lifecycle, reports, decisions, checkpoints, generated catalog and knowledge; `memory/index.sqlite3` is a rebuildable search index |
 | `<worktree>/.herdr-linear-agent/<workspace>-<ISSUE-KEY>-<id>/` | A worker's brief and report (see below) |
 
 `$XDG_STATE_HOME` defaults to `~/.local/state` on Linux and macOS alike.
 
-A worker's brief and report live inside its worktree because the worker runs there: sandboxed agents, such as Codex with `-s workspace-write`, can write freely only inside their working directory. To keep that folder out of commits, `worker start` adds `.herdr-linear-agent/` to the repository's `info/exclude`. Every worktree of a repository shares that file with the main checkout, so the rule covers all of them, and it never changes a tracked file such as `.gitignore`. `git add -A`, `git add .` and `git commit -a` all leave the folder out; only a forced `git add -f` would stage it. The ticker copies each report into the run folder (`workers/<id>.md`), so it outlives the worktree.
+A worker's brief and report live inside its worktree because the worker runs there: sandboxed agents, such as Codex with `-s workspace-write`, can write freely only inside their working directory. To keep that folder out of commits, the ticker adds `.herdr-linear-agent/` to the repository's `info/exclude`. Every worktree of a repository shares that file with the main checkout, so the rule covers all of them, and it never changes a tracked file such as `.gitignore`. `git add -A`, `git add .` and `git commit -a` all leave the folder out; only a forced `git add -f` would stage it. The ticker copies each report into the run folder (`workers/<id>.md`), so it outlives the worktree.
 
-## Working with other plugins
+## Worktree preparation and cleanup
 
-- Worktree setup and cleanup are left to other plugins. [lamngockhuong/herdr-worktree-setup](https://github.com/lamngockhuong/herdr-worktree-setup) can copy `.env` files and run setup commands for new worktrees. [poislagarde/herdr-worktree-cleanup](https://github.com/poislagarde/herdr-worktree-cleanup) removes clean checkouts when their space closes; add `.herdr-linear-agent/` to its `disposable.gitignore`, or worker checkouts stay.
+The optional `[repositories.<name>.worktree]` table configures setup in the plugin config. An absent table runs no hooks. `copy` accepts regular files and `symlink` accepts files or directories. Entries are relative paths inside the main checkout. Missing sources are skipped, existing destinations are preserved, and overlapping destinations are rejected. Copies become visible only after the complete file has been written.
+
+Setup runs before the worker agent starts. `post_create` commands run in the worker checkout, in order. `post_remove` commands run in the main checkout after checkout removal. Each command runs through `sh -c` with the ticker environment plus `HLA_RUN_KEY`, `HLA_WORKER_ID`, `HLA_REPO`, `HLA_REPO_PATH`, `HLA_WORKTREE`, `HLA_BRANCH`, and `HLA_BASE`. These values contain no Linear credential. Hook output is bounded and recorded in the worker's setup log in the run folder.
+
+An operation retains its accepted hook configuration and progress across reloads. A crash after a command takes effect but before its completion is saved can repeat the command. Make hooks idempotent. A worker ID such as `w1` repeats across runs; use a run-specific identifier for external resources. For Docker Compose, hash `HLA_BRANCH` into a valid project name and use the same name for creation and teardown.
+
+Completion or cancellation requests cleanup. Detaching, losing a coordinator, or manually closing the workspace does not request checkout removal by this plugin. Git refuses removal of checkouts with tracked changes or untracked files. Git-ignored files, including copied configuration and worker briefs, can be deleted with a clean checkout. Reports are copied to the run folder before removal. A refused cleanup retains its phase and error in `workers/<id>.toml` and in `context`. After resolving the cause, run `herdr-linear-agent worker retry-cleanup acme/DATA-1 w1` while the run is closed. The retry resumes the failed phase and keeps completed hook cursors.
+
+Other plugins retain their own policies. In particular, [herdr-worktree-cleanup](https://github.com/poislagarde/herdr-worktree-cleanup) can remove registered checkouts when their owner space closes. Legacy Herdr worktrees already have that registration; ordinary Git hooks can also register new checkouts. The plugin does not assume that using the Git CLI prevents registration. Check external cleanup configuration before relying on checkout retention.
 
 ## Security notes
 
@@ -594,6 +611,11 @@ the group is hidden from the top-level command list.
 | `harness herdr ROOT [ARGS...]` | Starts or attaches Herdr using the dedicated non-default session. `HERDR_BIN_PATH` can select the executable. |
 | `harness plugin ROOT ARGS...` | Runs the same plugin executable with isolated XDG paths and the root as its working directory. |
 | `harness exec ROOT /absolute/command [ARGS...]` | Runs another tool in that same environment. |
+| `harness fixture ROOT --repository URL --workspace NAME --team KEY --client-id ID --allowed-user ID [--model MODEL]` | Clones the same explicit scratch repository into `api` and `web`, creates ignored fixture files, writes read-only profiles and a `fixture-manifest.json`. |
+| `harness verify ROOT workspace/TEAM-N --terminal done\|canceled [--timeout-seconds 300] [--pause-after-workers]` | Runs the bounded real Linear, Herdr and saved-state issue 140 scenario. It stops the isolated ticker at completion and retains per-checkpoint evidence. For `done`, the optional pause keeps worker tabs and the ticker running for visual inspection until explicit resume or the checkpoint deadline. |
+| `harness resume ROOT workspace/TEAM-N` | Resumes a verifier waiting at the worker inspection checkpoint. Rejects missing, expired or completed inspection checkpoints. |
+| `harness ordinary-suspend ROOT --plugin PATH` / `harness ordinary-restore ROOT` | Records and stops the exact ordinary ticker binary before a live check, then verifies protected ordinary files and restarts that binary. |
+| `harness hook ROOT STEP` | Internal fixture hook used by worker setup/removal. `STEP` is `first`, `wait` or `remove`. |
 | `harness stop ROOT` | Attempts to stop the isolated ticker, stop and delete its session, and retains all files as evidence. Attempts all cleanup steps even if one fails. |
 | `agent-smoke --session NAME --kind KIND` | Starts a real agent in a temporary coordinator workspace in an already running non-default test session, checks interactive readiness without sending a prompt, then removes the workspace. Accepts `codex`, `claude`, `cursor` and `opencode`. |
 | `agent-smoke --session NAME --profile PROFILE [--config-dir DIR]` | Checks a configured profile with inherited instructions and arguments. Defaults to the ordinary config directory; refuses arguments not audited for prompt-free startup. Both smoke forms accept `--timeout-seconds 5..300` (default 30). |
@@ -621,8 +643,8 @@ inherit those XDG paths. `HOME`, native agent data, OS credentials and GitHub
 authentication remain shared; profile permissions control the agent sandbox.
 Use scratch teams and repositories, and retain the dedicated session settings.
 See the [integration-harness skill](.agents/skills/integration-harness/SKILL.md)
-for live-check procedures and cleanup, and [verification](docs/verification.md)
-for the evidence and limits of existing checks.
+for general live-check safety. The [issue 140 verification procedure](docs/verification.md#repeatable-issue-140-live-check)
+records the exact prerequisites, commands, operator actions, evidence and limits.
 
 ## License
 

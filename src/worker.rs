@@ -9,6 +9,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::config::WorktreeHooks;
 use crate::files::{self, write_atomic};
 use crate::herdr::{Agent, AgentStatus as HerdrStatus, Snapshot};
 use crate::linear::api::{Activity, Content};
@@ -19,6 +20,17 @@ use crate::run::{AgentRecord, AgentStatus, Run, RunLock, Status};
 /// Workers write their brief and report under this folder of the worktree.
 pub const BRIEF_FOLDER: &str = ".herdr-linear-agent";
 pub const MAX_RESTARTS: u32 = 2;
+
+/// A concise tab label that keeps the stable worker id visible and treats
+/// titles as untrusted display text.
+pub fn tab_label(id: &str, repo: &str, title: &str) -> String {
+    let title: String = title.chars().filter(|c| !c.is_control()).take(40).collect();
+    if title.is_empty() {
+        format!("{id} · {repo}")
+    } else {
+        format!("{id} · {repo} · {title}")
+    }
+}
 /// A blocked agent needs a person after this long.
 pub const BLOCKED_SECS: i64 = 30;
 /// A launch whose status stays unknown this long is stuck on a dialog.
@@ -41,10 +53,18 @@ pub struct Worker {
     pub branch: String,
     pub base: String,
     pub worktree_path: String,
+    /// The hooks captured when this checkout was first requested. Legacy
+    /// workers have no snapshot and are never given post-create hooks retroactively.
+    #[serde(default)]
+    pub worktree_hooks: Option<WorktreeHooks>,
     pub brief_dir: String,
     pub restarts: u32,
     /// The hash of the report the ticker last copied home.
     pub report_hash: String,
+    /// Cleanup completed for a terminal run; prevents converting the record
+    /// into a new cleanup attempt on every reconciliation pass.
+    #[serde(default)]
+    pub cleanup_completed: bool,
     /// The hash of the report the coordinator was told about.
     pub announced_report_hash: String,
     pub pr_url: String,
@@ -60,9 +80,132 @@ pub struct Worker {
     /// `worker restart` is moving it to a new pane: the watcher leaves it
     /// alone until a snapshot shows the recorded pane.
     pub restarting: bool,
+    /// A durable operation that the ticker is advancing. This is absent on
+    /// records written before lifecycle operations became durable.
+    #[serde(default)]
+    pub operation: Option<WorkerOperation>,
     pub created: String,
     pub updated: String,
     pub agent: AgentRecord,
+}
+
+/// Persisted work that may be interrupted between any two external effects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "operation", rename_all = "snake_case")]
+pub enum WorkerOperation {
+    Start(StartOperation),
+    Restart(RestartOperation),
+    Cleanup(CleanupOperation),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartPhase {
+    SaveTask,
+    CreateCheckout,
+    Setup,
+    CreateTab,
+    PrepareBrief,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartOperation {
+    pub id: uuid::Uuid,
+    /// The bounded manual retry already consumed a restart slot.
+    #[serde(default)]
+    pub retry_counted: bool,
+    pub phase: StartPhase,
+    /// Kept until the task file is atomically written, so allocation can be
+    /// resumed after a crash before that write.
+    pub task: Option<String>,
+    pub setup_cursor: usize,
+    pub hooks: WorktreeHooks,
+    pub instructions: Vec<crate::config::Instructions>,
+    pub placement: PlacementIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPhase {
+    CreateCheckout,
+    Setup,
+    CreateTab,
+    ClosePreviousPane,
+    PrepareBrief,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartOperation {
+    pub id: uuid::Uuid,
+    /// The bounded manual retry already consumed a restart slot.
+    #[serde(default)]
+    pub retry_counted: bool,
+    pub phase: RestartPhase,
+    pub previous: PlacementRef,
+    pub placement: PlacementIntent,
+    pub profile: String,
+    pub kind: String,
+    pub repo_path: String,
+    pub base: String,
+    pub branch: String,
+    pub hooks: WorktreeHooks,
+    pub instructions: Vec<crate::config::Instructions>,
+    pub create_checkout: bool,
+    pub setup_cursor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupPhase {
+    ClosePanes,
+    CopyReport,
+    RemoveCheckout,
+    PostRemove,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CleanupOperation {
+    pub id: uuid::Uuid,
+    pub phase: CleanupPhase,
+    pub hook_cursor: usize,
+    pub hooks: WorktreeHooks,
+    pub placement: Option<PlacementRef>,
+    /// Every known pane owned by this worker when cleanup began, including
+    /// the previous pane during a restart handoff.
+    #[serde(default)]
+    pub placements: Vec<PlacementRef>,
+    /// A pending or uncertain placement that must be adopted or retained
+    /// before the checkout can be removed.
+    #[serde(default)]
+    pub placement_intent: Option<PlacementIntent>,
+    pub retained_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PlacementIntent {
+    Requested {
+        session: String,
+        workspace: String,
+        cwd: String,
+        label: String,
+    },
+    Unknown {
+        session: String,
+        workspace: String,
+        cwd: String,
+        label: String,
+    },
+    Placed(PlacementRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementRef {
+    pub session: String,
+    pub workspace: String,
+    pub tab: String,
+    pub pane: String,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,19 +404,62 @@ pub fn list(run: &Run) -> Vec<Worker> {
     workers
 }
 
+/// Reads every authoritative worker record or fails closed. Lifecycle and
+/// allocation code must never treat a malformed record as absent.
+pub fn list_checked(run: &Run) -> Result<Vec<Worker>> {
+    let entries = std::fs::read_dir(run.workers_dir())
+        .with_context(|| format!("could not list workers for {}", run.key))?;
+    let mut workers = Vec::new();
+    for entry in entries {
+        let entry = entry.context("could not read a worker directory entry")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("worker filename is not UTF-8"))?;
+        let Some(id) = name.strip_suffix(".toml") else {
+            continue;
+        };
+        validate_id(id)?;
+        let worker = read(&entry.path())?;
+        anyhow::ensure!(
+            worker.id == id,
+            "worker record {} contains mismatched id {}",
+            entry.path().display(),
+            worker.id
+        );
+        workers.push(worker);
+    }
+    workers.sort_by_key(|w| number(&w.id));
+    Ok(workers)
+}
+
 fn number(id: &str) -> u64 {
     id.trim_start_matches('w').parse().unwrap_or(0)
 }
 
 /// Gives the next id under the run lock. `check` sees every existing worker
 /// and may refuse; `init` fills the new record before it is written.
+#[cfg(test)]
 pub fn allocate(
     run: &Run,
     check: impl FnOnce(&[Worker]) -> Result<()>,
     init: impl FnOnce(&mut Worker),
 ) -> Result<Worker> {
+    allocate_with(run, check, |worker| {
+        init(worker);
+        Ok(())
+    })
+}
+
+/// Gives the next id under the run lock and initializes it before the first
+/// durable write. Use when initialization derives values from the allocated id.
+pub fn allocate_with(
+    run: &Run,
+    check: impl FnOnce(&[Worker]) -> Result<()>,
+    init: impl FnOnce(&mut Worker) -> Result<()>,
+) -> Result<Worker> {
     let _lock = run.lock()?;
-    let workers = list(run);
+    let workers = list_checked(run)?;
     check(&workers)?;
     let next = workers.iter().map(|w| number(&w.id)).max().unwrap_or(0) + 1;
     let now = files::now();
@@ -283,7 +469,7 @@ pub fn allocate(
         updated: now,
         ..Worker::default()
     };
-    init(&mut worker);
+    init(&mut worker)?;
     write(run, &worker)?;
     Ok(worker)
 }
@@ -377,6 +563,27 @@ fn read_report(worker: &Worker) -> Option<Vec<u8>> {
     std::fs::read(&path).ok()
 }
 
+/// Reads a report for terminal cleanup without hiding I/O failures. Missing
+/// reports and symlinks are ignored, but a regular file that cannot be read
+/// must keep cleanup pending so checkout removal cannot destroy its only copy.
+pub fn read_report_checked(worker: &Worker) -> Result<Option<Vec<u8>>> {
+    let path = report_path(worker);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not inspect report {}", path.display()));
+        }
+    };
+    if !meta.file_type().is_file() {
+        return Ok(None);
+    }
+    std::fs::read(&path)
+        .map(Some)
+        .with_context(|| format!("could not read report {}", path.display()))
+}
+
 pub fn report_hash(worker: &Worker) -> Option<String> {
     read_report(worker).map(|bytes| files::sha256_hex(&bytes))
 }
@@ -384,7 +591,7 @@ pub fn report_hash(worker: &Worker) -> Option<String> {
 /// Copies the worker's report to `workers/<id>.md` and returns its text;
 /// `None` when there is no report.
 pub fn copy_report_home(run: &Run, worker: &Worker) -> Result<Option<String>> {
-    let Some(bytes) = read_report(worker) else {
+    let Some(bytes) = read_report_checked(worker)? else {
         return Ok(None);
     };
     write_atomic(&home_report_path(run, &worker.id), &bytes)?;
@@ -842,6 +1049,7 @@ mod tests {
         Snapshot {
             version: "0.9.1".into(),
             protocol: 22,
+            tabs: BTreeMap::new(),
             panes: panes.iter().map(|p| listed_pane(p)).collect(),
             agents,
             skipped: 0,

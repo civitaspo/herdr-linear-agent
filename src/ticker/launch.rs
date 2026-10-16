@@ -2,7 +2,7 @@
 //! prompt, and launch prompts. Placements and starts are slow, so they run
 //! as effect tasks; their results come back as [`EffectDone`].
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use jiff::Timestamp;
 
 use super::reconcile::{
@@ -10,8 +10,11 @@ use super::reconcile::{
     error_activity, update_run,
 };
 use crate::config::Config;
-use crate::herdr::{Herdr, HerdrError, PaneId, Placed, Snapshot};
-use crate::run::{AgentRecord, AgentStatus, Run, RunRecord, Status};
+use crate::herdr::{Herdr, HerdrError, PaneId, Placed, Snapshot, WorkspaceId};
+use crate::run::{
+    AgentRecord, AgentStatus, CoordinatorPlacementOperation, CoordinatorPlacementPhase,
+    CoordinatorPlacementRef, Run, RunRecord, Status,
+};
 use crate::supervisor::{Scope as SupervisorScope, SupervisorStore};
 use crate::{agents, claude_trust, coordinator, worker};
 
@@ -40,19 +43,28 @@ fn start_args(config: &Config, record: &AgentRecord, session: &str) -> Result<Ve
 }
 
 /// Sets a placed coordinator open in its root pane, ready to be started.
-fn place_coordinator(record: &mut RunRecord, placed: &Placed) {
+fn place_coordinator(record: &mut RunRecord, placed: &Placed, session: &str) {
     let c = &mut record.coordinator;
-    c.placed(placed);
+    c.placed_in(placed, session);
     c.last_state.clear();
     c.last_state_change.clear();
     c.last_state_seq = 0;
     c.blocked_reported = false;
+    record.coordinator_tab_named = false;
 }
 
-/// A pane in the run folder that is empty or holds our agent: a placement
-/// whose answer did not arrive. The label is not compared, since a title
-/// edit changes it.
-fn placed_before(snapshot: &Snapshot, record: &AgentRecord, cwd: &str) -> Option<Placed> {
+/// Canonical matches for an uncertain placement. Never choose arbitrarily
+/// when two workspaces contain the same run directory.
+fn placed_before(
+    snapshot: &Snapshot,
+    record: &AgentRecord,
+    cwd: &str,
+    target_workspace: Option<&str>,
+    tab_label: &str,
+) -> Vec<Placed> {
+    let Ok(cwd) = std::path::Path::new(cwd).canonicalize() else {
+        return Vec::new();
+    };
     let ours = |agent: &crate::herdr::Agent| {
         agent.kind.as_deref() == Some(record.kind.as_str())
             && agent
@@ -63,15 +75,26 @@ fn placed_before(snapshot: &Snapshot, record: &AgentRecord, cwd: &str) -> Option
     snapshot
         .panes
         .values()
-        .filter(|p| p.cwd.as_deref() == Some(cwd) || p.foreground_cwd.as_deref() == Some(cwd))
-        .find(|p| snapshot.agents.iter().filter(|a| a.pane == p.id).all(ours))
+        .filter(|p| target_workspace.is_none_or(|workspace| p.workspace.0 == workspace))
+        .filter(|p| snapshot.tab_label(&p.tab) == Some(tab_label))
+        .filter(|p| {
+            [p.cwd.as_deref(), p.foreground_cwd.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|path| {
+                    std::path::Path::new(path)
+                        .canonicalize()
+                        .is_ok_and(|p| p == cwd)
+                })
+        })
+        .filter(|p| snapshot.agents.iter().filter(|a| a.pane == p.id).all(ours))
         .map(|p| Placed {
             workspace: p.workspace.clone(),
             tab: p.tab.clone(),
             pane: p.id.clone(),
-            cwd: cwd.to_string(),
-            worktree_path: None,
+            cwd: cwd.to_string_lossy().into_owned(),
         })
+        .collect()
 }
 
 /// A prompt whose answer was lost counts as delivered: a missed one is
@@ -101,12 +124,40 @@ impl Reconciler {
         let Ok(run) = Run::load(&d.ctx.runs_dir(), &key.run) else {
             return;
         };
+        if let EffectDone::Placed {
+            operation_id,
+            session,
+            result,
+            ..
+        } = done
+        {
+            let current = run
+                .record()
+                .ok()
+                .and_then(|record| record.coordinator_placement)
+                .is_some_and(|operation| operation.id == operation_id);
+            if current && matches!(self.in_flight.get(&key), Some(Effect::Place)) {
+                self.in_flight.remove(&key);
+            }
+            let result = if current {
+                self.placed(d, &run, &key, operation_id, result, now).await
+            } else if let Ok(placed) = result {
+                self.persist_late_placement(d, &run, operation_id, &session, &placed)
+                    .await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result {
+                d.fail(&run.key, &error);
+            }
+            return;
+        }
         let effect_matches = match &done {
-            EffectDone::Placed { .. } => matches!(self.in_flight.get(&key), Some(Effect::Place)),
             EffectDone::Started { recovery_id, .. } => matches!(
                 self.in_flight.get(&key),
                 Some(Effect::Start { request_id }) if request_id == recovery_id
             ),
+            EffectDone::Placed { .. } => unreachable!(),
         };
         if !effect_matches {
             return;
@@ -123,7 +174,6 @@ impl Reconciler {
             }
         }
         let result = match done {
-            EffectDone::Placed { result, .. } => self.placed(d, &run, &key, result, now).await,
             EffectDone::Started {
                 pane,
                 recovery_id,
@@ -133,10 +183,64 @@ impl Reconciler {
                 self.started(d, &run, &key, (pane, recovery_id, result), now)
                     .await
             }
+            EffectDone::Placed { .. } => unreachable!(),
         };
         if let Err(error) = result {
             d.fail(&run.key, &error);
         }
+    }
+
+    async fn persist_late_placement<H: Herdr>(
+        &self,
+        d: &Deps<'_, H>,
+        run: &Run,
+        operation_id: uuid::Uuid,
+        session: &str,
+        placed: &Placed,
+    ) -> Result<()> {
+        let orphan = CoordinatorPlacementRef {
+            session: session.to_string(),
+            workspace: placed.workspace.0.clone(),
+            tab: placed.tab.clone(),
+            pane: placed.pane.0.clone(),
+            cwd: placed.cwd.clone(),
+        };
+        let saved = orphan.clone();
+        let saved_for_update = saved.clone();
+        let saved_for_slot = orphan.clone();
+        let operation = CoordinatorPlacementOperation {
+            id: operation_id,
+            session: session.to_string(),
+            cwd: placed.cwd.clone(),
+            label: coordinator::tab_label().into(),
+            target_workspace: Some(placed.workspace.0.clone()),
+            phase: CoordinatorPlacementPhase::Orphan(orphan),
+        };
+        let updated = update_run(run, move |r| {
+            if r.coordinator_placement.is_none() {
+                r.coordinator_placement = Some(operation);
+            } else if r.coordinator_placement.as_ref().is_some_and(|current| {
+                current.id == operation_id
+                    && matches!(&current.phase, CoordinatorPlacementPhase::Orphan(existing) if existing == &saved_for_slot)
+            }) {
+                // The same late result was already durably queued.
+            } else if !r.coordinator_orphans.contains(&saved_for_update) {
+                r.coordinator_orphans.push(saved_for_update);
+            }
+        })
+        .await?;
+        if let Some(CoordinatorPlacementOperation {
+            id,
+            phase: CoordinatorPlacementPhase::Orphan(orphan),
+            ..
+        }) = updated.coordinator_placement
+            && id == operation_id
+        {
+            self.close_orphan(d, run, operation_id, &orphan).await?;
+        } else {
+            self.close_orphan(d, run, uuid::Uuid::nil(), &saved).await?;
+        }
+        Ok(())
     }
 
     async fn placed<H: Herdr>(
@@ -144,37 +248,28 @@ impl Reconciler {
         d: &Deps<'_, H>,
         run: &Run,
         key: &AgentKey,
+        operation_id: uuid::Uuid,
         result: Result<Placed, HerdrError>,
         now: Timestamp,
     ) -> Result<()> {
         match result {
             Ok(placed) => {
-                let found = placed.clone();
-                // Decided under the lock: the run may have moved on while
-                // the workspace was created.
-                let applied = self
-                    .guarded(run, move |run, lock| {
-                        let record = run.record()?;
-                        if record.status != Status::Active
-                            || record.coordinator.status != AgentStatus::Pending
-                        {
-                            return Ok((false, Vec::new()));
-                        }
-                        run.update_held(lock, |r| place_coordinator(r, &found))?;
-                        Ok((true, Vec::new()))
-                    })
-                    .await?;
-                if !applied {
-                    let _ = d.herdr.workspace_close(&placed.workspace).await;
-                }
-                Ok(())
+                let operation = run
+                    .record()?
+                    .coordinator_placement
+                    .filter(|operation| operation.id == operation_id)
+                    .context("coordinator placement result no longer has its durable intent")?;
+                self.accept_observed_placement(d, run, &operation, &placed)
+                    .await
             }
             // The next snapshot shows whether it was placed.
             Err(HerdrError::OutcomeUnknown(_)) => {
-                let at = now.to_string();
+                let _ = now;
                 update_run(run, move |r| {
-                    if r.status == Status::Active && r.coordinator.status == AgentStatus::Pending {
-                        r.coordinator.last_attempt_at = at;
+                    if let Some(operation) = &mut r.coordinator_placement
+                        && operation.id == operation_id
+                    {
+                        operation.phase = CoordinatorPlacementPhase::Unknown;
                     }
                 })
                 .await?;
@@ -182,10 +277,28 @@ impl Reconciler {
             }
             // Herdr down is not an attempt; the next one waits 15 s.
             Err(HerdrError::NotSent(_)) => {
+                update_run(run, move |r| {
+                    if r.coordinator_placement
+                        .as_ref()
+                        .is_some_and(|operation| operation.id == operation_id)
+                    {
+                        r.coordinator_placement = None;
+                    }
+                })
+                .await?;
                 self.not_sent.insert(key.clone(), now);
                 Ok(())
             }
             Err(error) => {
+                update_run(run, move |r| {
+                    if r.coordinator_placement
+                        .as_ref()
+                        .is_some_and(|operation| operation.id == operation_id)
+                    {
+                        r.coordinator_placement = None;
+                    }
+                })
+                .await?;
                 self.attempt_failed(run, key, None, &error.to_string(), now)
                     .await
             }
@@ -738,7 +851,69 @@ impl Reconciler {
         now: Timestamp,
     ) -> Result<()> {
         let record = run.record()?;
+        if let Some(orphan) = record.coordinator_orphans.first() {
+            self.close_orphan(d, run, uuid::Uuid::nil(), orphan).await?;
+            return Ok(());
+        }
+        if let Some(operation) = &record.coordinator_placement
+            && let CoordinatorPlacementPhase::Orphan(placement) = &operation.phase
+        {
+            self.close_orphan(d, run, operation.id, placement).await?;
+            return Ok(());
+        }
+        if !record.coordinator.herdr_session.is_empty()
+            && record.coordinator.herdr_session != d.socket
+        {
+            d.log.line(&format!(
+                "{}: coordinator belongs to Herdr socket {}; refusing to reinterpret its pane IDs in {}",
+                run.key, record.coordinator.herdr_session, d.socket
+            ));
+            return Ok(());
+        }
         if record.status != Status::Active {
+            if let Some(operation) = &record.coordinator_placement
+                && operation.session == d.socket
+                && matches!(
+                    &operation.phase,
+                    CoordinatorPlacementPhase::Requested | CoordinatorPlacementPhase::Unknown
+                )
+            {
+                let matches = placed_before(
+                    snapshot,
+                    &record.coordinator,
+                    &operation.cwd,
+                    operation.target_workspace.as_deref(),
+                    if operation.target_workspace.is_some() {
+                        coordinator::tab_label()
+                    } else {
+                        &operation.label
+                    },
+                );
+                if let [placed] = matches.as_slice() {
+                    let id = operation.id;
+                    let orphan = CoordinatorPlacementRef {
+                        session: operation.session.clone(),
+                        workspace: placed.workspace.0.clone(),
+                        tab: placed.tab.clone(),
+                        pane: placed.pane.0.clone(),
+                        cwd: placed.cwd.clone(),
+                    };
+                    update_run(run, move |r| {
+                        if let Some(current) = &mut r.coordinator_placement
+                            && current.id == id
+                        {
+                            current.phase = CoordinatorPlacementPhase::Orphan(orphan);
+                        }
+                    })
+                    .await?;
+                    if let Some(current) = run.record()?.coordinator_placement
+                        && current.id == id
+                        && let CoordinatorPlacementPhase::Orphan(orphan) = current.phase
+                    {
+                        self.close_orphan(d, run, id, &orphan).await?;
+                    }
+                }
+            }
             return Ok(());
         }
         // Placing and starting judge panes absent or empty.
@@ -751,6 +926,7 @@ impl Reconciler {
         let c = &record.coordinator;
         if trusted
             && c.status == AgentStatus::Pending
+            && !record.coordinator_misplaced
             && !c.profile.is_empty()
             && !self.in_flight.contains_key(&coordinator_key)
         {
@@ -758,7 +934,10 @@ impl Reconciler {
         }
 
         let record = run.record()?;
-        let workers = worker::list(run);
+        let workers: Vec<_> = worker::list(run)
+            .into_iter()
+            .filter(|w| w.operation.is_none())
+            .collect();
         let mut candidates: Vec<(AgentKey, AgentRecord, Vec<String>)> = vec![(
             coordinator_key,
             record.coordinator.clone(),
@@ -773,6 +952,9 @@ impl Reconciler {
         }));
         if trusted && !self.start_in_flight(&run.key) {
             for (key, agent, trusted) in &candidates {
+                if record.coordinator_misplaced {
+                    break;
+                }
                 self.start_recovery(d, snapshot, key, agent, trusted, now)
                     .await?;
                 if self.in_flight.contains_key(key) {
@@ -783,7 +965,9 @@ impl Reconciler {
                 }
             }
         }
-        self.prompt_coordinator(d, snapshot, run, now).await?;
+        if !record.coordinator_misplaced {
+            self.prompt_coordinator(d, snapshot, run, now).await?;
+        }
         for w in &workers {
             self.prompt_worker(d, snapshot, run, &record, w, now)
                 .await?;
@@ -809,27 +993,245 @@ impl Reconciler {
             .map_or(&[][..], |p| p.instructions.as_slice());
         coordinator::write_priming(run, record, &self.bin, instructions)?;
         let cwd = run.canonical_dir().to_string_lossy().into_owned();
-        let label = coordinator::workspace_label(record);
-        if let Some(found) = placed_before(snapshot, &record.coordinator, &cwd) {
-            update_run(run, move |r| {
-                if r.coordinator.status == AgentStatus::Pending {
-                    place_coordinator(r, &found);
+        let existing_target = (!record.coordinator.workspace_id.is_empty()
+            && snapshot
+                .panes
+                .values()
+                .any(|pane| pane.workspace.0 == record.coordinator.workspace_id))
+        .then(|| record.coordinator.workspace_id.clone());
+        let operation = record.coordinator_placement.clone();
+        if let Some(mut operation) = operation {
+            if operation.session != d.socket {
+                d.log.line(&format!(
+                    "{}: coordinator placement belongs to Herdr socket {}; waiting for that session",
+                    run.key, operation.session
+                ));
+                return Ok(());
+            }
+            if matches!(operation.phase, CoordinatorPlacementPhase::Requested) {
+                // A process restart cannot tell whether the request was sent.
+                // Reconcile by identity and never issue a duplicate create.
+                operation.phase = CoordinatorPlacementPhase::Unknown;
+                let id = operation.id;
+                update_run(run, move |r| {
+                    if let Some(current) = &mut r.coordinator_placement
+                        && current.id == id
+                    {
+                        current.phase = CoordinatorPlacementPhase::Unknown;
+                    }
+                })
+                .await?;
+            }
+            if matches!(operation.phase, CoordinatorPlacementPhase::Unknown) {
+                let matches = placed_before(
+                    snapshot,
+                    &record.coordinator,
+                    &operation.cwd,
+                    operation.target_workspace.as_deref(),
+                    if operation.target_workspace.is_some() {
+                        coordinator::tab_label()
+                    } else {
+                        &operation.label
+                    },
+                );
+                if matches.len() == 1 {
+                    self.accept_observed_placement(d, run, &operation, &matches[0])
+                        .await?;
+                } else if matches.len() > 1 {
+                    d.log.line(&format!(
+                        "{}: coordinator placement is ambiguous ({} matching panes); refusing to create another workspace",
+                        run.key,
+                        matches.len()
+                    ));
+                }
+                return Ok(());
+            }
+            return Ok(());
+        }
+        let matches = placed_before(
+            snapshot,
+            &record.coordinator,
+            &cwd,
+            existing_target.as_deref(),
+            coordinator::tab_label(),
+        );
+        if matches.len() == 1 {
+            let observed = CoordinatorPlacementOperation {
+                id: uuid::Uuid::new_v4(),
+                session: d.socket.to_string(),
+                cwd: cwd.clone(),
+                label: coordinator::workspace_label(record),
+                target_workspace: Some(matches[0].workspace.0.clone()),
+                phase: CoordinatorPlacementPhase::Requested,
+            };
+            update_run(run, {
+                let observed = observed.clone();
+                move |r| {
+                    if r.coordinator_placement.is_none() {
+                        r.coordinator_placement = Some(observed);
+                    }
                 }
             })
             .await?;
+            self.accept_observed_placement(d, run, &observed, &matches[0])
+                .await?;
+            return Ok(());
+        }
+        if matches.len() > 1 {
+            d.log.line(&format!(
+                "{}: found {} matching coordinator panes; refusing to choose one",
+                run.key,
+                matches.len()
+            ));
             return Ok(());
         }
         let key = AgentKey::coordinator(&run.key);
         if self.waits(&key, &record.coordinator, now) {
             return Ok(());
         }
+        let operation = CoordinatorPlacementOperation {
+            id: uuid::Uuid::new_v4(),
+            session: d.socket.to_string(),
+            cwd: cwd.clone(),
+            label: coordinator::workspace_label(record),
+            target_workspace: existing_target,
+            phase: CoordinatorPlacementPhase::Requested,
+        };
+        let operation_id = operation.id;
+        let operation_session = operation.session.clone();
+        let operation_to_store = operation.clone();
+        let updated = update_run(run, move |r| {
+            if r.status == Status::Active
+                && r.coordinator.status == AgentStatus::Pending
+                && r.coordinator_placement.is_none()
+            {
+                r.coordinator_placement = Some(operation_to_store);
+            }
+        })
+        .await?;
+        if updated
+            .coordinator_placement
+            .as_ref()
+            .is_none_or(|current| current.id != operation_id)
+        {
+            return Ok(());
+        }
         self.not_sent.remove(&key);
         self.in_flight.insert(key.clone(), Effect::Place);
         let (herdr, done) = (d.herdr.clone(), self.effects.clone());
+        let target_workspace = operation.target_workspace.map(WorkspaceId);
+        let workspace_label = operation.label;
         tokio::spawn(async move {
-            let result = herdr.workspace_create(&cwd, &label).await;
-            let _ = done.send(EffectDone::Placed { key, result }).await;
+            let result = match target_workspace {
+                Some(workspace) => {
+                    herdr
+                        .tab_create(&workspace, &cwd, coordinator::tab_label())
+                        .await
+                }
+                None => herdr.workspace_create(&cwd, &workspace_label).await,
+            };
+            let _ = done
+                .send(EffectDone::Placed {
+                    key,
+                    operation_id,
+                    session: operation_session,
+                    result,
+                })
+                .await;
         });
+        Ok(())
+    }
+
+    async fn accept_observed_placement<H: Herdr>(
+        &self,
+        d: &Deps<'_, H>,
+        run: &Run,
+        operation: &CoordinatorPlacementOperation,
+        placed: &Placed,
+    ) -> Result<()> {
+        let id = operation.id;
+        let placed = placed.clone();
+        let accepted_placed = placed.clone();
+        let session = operation.session.clone();
+        let orphan = CoordinatorPlacementRef {
+            session: session.clone(),
+            workspace: placed.workspace.0.clone(),
+            tab: placed.tab.clone(),
+            pane: placed.pane.0.clone(),
+            cwd: placed.cwd.clone(),
+        };
+        let updated = update_run(run, move |r| {
+            if let Some(current) = &mut r.coordinator_placement
+                && current.id == id
+            {
+                if r.status == Status::Active && r.coordinator.status == AgentStatus::Pending {
+                    place_coordinator(r, &accepted_placed, &session);
+                    r.coordinator_placement = None;
+                } else {
+                    current.phase = CoordinatorPlacementPhase::Orphan(orphan);
+                }
+            }
+        })
+        .await?;
+        if !updated.coordinator_tab_named
+            && updated.coordinator.herdr_session == d.socket
+            && updated.coordinator.pane_id == placed.pane.0
+            && d.herdr
+                .tab_rename(&placed.tab, coordinator::tab_label())
+                .await
+                .is_ok()
+        {
+            let pane = placed.pane.0.clone();
+            update_run(run, move |r| {
+                if r.coordinator.pane_id == pane {
+                    r.coordinator_tab_named = true;
+                }
+            })
+            .await?;
+        }
+        if let Some(current) = updated.coordinator_placement
+            && current.id == id
+            && let CoordinatorPlacementPhase::Orphan(orphan) = current.phase
+        {
+            self.close_orphan(d, run, id, &orphan).await?;
+        }
+        Ok(())
+    }
+
+    async fn close_orphan<H: Herdr>(
+        &self,
+        d: &Deps<'_, H>,
+        run: &Run,
+        operation_id: uuid::Uuid,
+        orphan: &CoordinatorPlacementRef,
+    ) -> Result<()> {
+        let pane = PaneId(orphan.pane.clone());
+        let result = if orphan.session == d.socket {
+            d.herdr.pane_close(&pane).await
+        } else if let Some(herdr) = d.herdr.for_socket(&orphan.session) {
+            herdr.pane_close(&pane).await
+        } else {
+            return Ok(());
+        };
+        let closed = match result {
+            Ok(()) => true,
+            Err(HerdrError::Api { code, .. }) if code == "pane_not_found" => true,
+            Err(_) => false,
+        };
+        if closed {
+            let orphan = orphan.clone();
+            update_run(run, move |r| {
+                if operation_id.is_nil() {
+                    r.coordinator_orphans.retain(|saved| saved != &orphan);
+                } else if r.coordinator_placement.as_ref().is_some_and(|operation| {
+                    operation.id == operation_id
+                        && matches!(operation.phase, CoordinatorPlacementPhase::Orphan(_))
+                }) {
+                    r.coordinator_placement = None;
+                }
+            })
+            .await?;
+        }
         Ok(())
     }
 
@@ -1042,4 +1444,72 @@ fn block_revoked_profile(run: &Run, key: &AgentKey) -> Result<()> {
         }
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use crate::herdr::{Pane, WorkspaceId};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn coordinator_adoption_is_canonical_unique_and_workspace_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("run");
+        std::fs::create_dir(&cwd).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&cwd, &alias).unwrap();
+        let pane = |workspace: &str, id: &str, path: &std::path::Path| Pane {
+            id: PaneId(id.into()),
+            workspace: WorkspaceId(workspace.into()),
+            tab: format!("{workspace}:tab"),
+            terminal: format!("term-{id}"),
+            cwd: Some(path.to_string_lossy().into_owned()),
+            foreground_cwd: None,
+            label: None,
+        };
+        let mut snapshot = Snapshot {
+            version: "0.9.1".into(),
+            protocol: 22,
+            tabs: BTreeMap::new(),
+            panes: BTreeMap::from([
+                (PaneId("w1:p1".into()), pane("w1", "w1:p1", &alias)),
+                (PaneId("w2:p1".into()), pane("w2", "w2:p1", &cwd)),
+            ]),
+            agents: Vec::new(),
+            skipped: 0,
+        };
+        let record = AgentRecord {
+            kind: "claude".into(),
+            agent_name: "coordinator".into(),
+            ..AgentRecord::default()
+        };
+        let cwd = cwd.to_string_lossy();
+        snapshot.tabs = BTreeMap::from([
+            (
+                "w1:tab".into(),
+                crate::herdr::Tab {
+                    tab_id: "w1:tab".into(),
+                    workspace_id: "w1".into(),
+                    label: "coordinator".into(),
+                },
+            ),
+            (
+                "w2:tab".into(),
+                crate::herdr::Tab {
+                    tab_id: "w2:tab".into(),
+                    workspace_id: "w2".into(),
+                    label: "coordinator".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            placed_before(&snapshot, &record, &cwd, None, "coordinator").len(),
+            2
+        );
+        let only = placed_before(&snapshot, &record, &cwd, Some("w2"), "coordinator");
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].workspace.0, "w2");
+        assert!(placed_before(&snapshot, &record, &cwd, Some("missing"), "coordinator").is_empty());
+    }
 }

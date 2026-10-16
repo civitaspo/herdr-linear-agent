@@ -11,10 +11,7 @@ use super::{Client, HerdrError, Pane, PaneId, Snapshot, WorkspaceId};
 
 /// Herdr waits this long for a started agent to become ready.
 const AGENT_START_TIMEOUT_MS: u64 = 30_000;
-/// A worktree checkout can take a while on a large repository.
-const WORKTREE_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Where a new workspace or worktree placed its root pane.
+/// Where a new workspace or tab placed its root pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placed {
     pub workspace: WorkspaceId,
@@ -22,8 +19,6 @@ pub struct Placed {
     pub pane: PaneId,
     /// The root pane's working directory.
     pub cwd: String,
-    /// The worktree's path, for `worktree.create` and `worktree.open`.
-    pub worktree_path: Option<String>,
 }
 
 pub trait Herdr: Send + Sync {
@@ -45,20 +40,10 @@ pub trait Herdr: Send + Sync {
         label: &str,
     ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
 
-    fn worktree_create(
+    fn tab_create(
         &self,
+        workspace: &WorkspaceId,
         cwd: &str,
-        branch: &str,
-        base: &str,
-        label: &str,
-    ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
-
-    /// `cwd` is the repository checkout: Herdr refuses to open a worktree
-    /// without it (`not_git_worktree`).
-    fn worktree_open(
-        &self,
-        cwd: &str,
-        path: &str,
         label: &str,
     ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
 
@@ -78,10 +63,19 @@ pub trait Herdr: Send + Sync {
 
     fn send_escape(&self, pane: &PaneId) -> impl Future<Output = Result<(), HerdrError>> + Send;
 
+    /// A missing pane returns `pane_not_found`; callers may treat that as already closed.
+    fn pane_close(&self, pane: &PaneId) -> impl Future<Output = Result<(), HerdrError>> + Send;
+
     fn agent_rename(
         &self,
         pane: &PaneId,
         name: &str,
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
+
+    fn tab_rename(
+        &self,
+        tab: &str,
+        label: &str,
     ) -> impl Future<Output = Result<(), HerdrError>> + Send;
 
     fn workspace_close(
@@ -121,30 +115,20 @@ pub trait Herdr: Send + Sync {
 #[derive(Deserialize)]
 struct PlacedAnswer {
     root_pane: Pane,
-    #[serde(default)]
-    worktree: Option<Worktree>,
-}
-
-#[derive(Deserialize)]
-struct Worktree {
-    path: String,
 }
 
 impl PlacedAnswer {
     fn placed(self, requested_cwd: &str) -> Placed {
-        let worktree_path = self.worktree.map(|w| w.path);
         let pane = self.root_pane;
         let cwd = pane
             .cwd
             .or(pane.foreground_cwd)
-            .or_else(|| worktree_path.clone())
             .unwrap_or_else(|| requested_cwd.to_string());
         Placed {
             workspace: pane.workspace,
             tab: pane.tab,
             pane: pane.id,
             cwd,
-            worktree_path,
         }
     }
 }
@@ -187,30 +171,20 @@ impl Herdr for Client {
         Ok(answer.placed(cwd))
     }
 
-    async fn worktree_create(
+    async fn tab_create(
         &self,
+        workspace: &WorkspaceId,
         cwd: &str,
-        branch: &str,
-        base: &str,
         label: &str,
     ) -> Result<Placed, HerdrError> {
-        let params =
-            json!({"cwd": cwd, "branch": branch, "base": base, "label": label, "focus": false});
-        let answer: PlacedAnswer = self
-            .call_with_timeout("worktree.create", params, WORKTREE_CREATE_TIMEOUT)
-            .await?;
+        let params = json!({
+            "workspace_id": workspace,
+            "cwd": cwd,
+            "label": label,
+            "focus": false,
+        });
+        let answer: PlacedAnswer = self.call("tab.create", params).await?;
         Ok(answer.placed(cwd))
-    }
-
-    async fn worktree_open(
-        &self,
-        cwd: &str,
-        path: &str,
-        label: &str,
-    ) -> Result<Placed, HerdrError> {
-        let params = json!({"cwd": cwd, "path": path, "label": label, "focus": false});
-        let answer: PlacedAnswer = self.call("worktree.open", params).await?;
-        Ok(answer.placed(path))
     }
 
     async fn agent_start(
@@ -240,8 +214,17 @@ impl Herdr for Client {
             .await
     }
 
+    async fn pane_close(&self, pane: &PaneId) -> Result<(), HerdrError> {
+        self.ok("pane.close", json!({"pane_id": pane})).await
+    }
+
     async fn agent_rename(&self, pane: &PaneId, name: &str) -> Result<(), HerdrError> {
         self.ok("agent.rename", json!({"target": pane, "name": name}))
+            .await
+    }
+
+    async fn tab_rename(&self, tab: &str, label: &str) -> Result<(), HerdrError> {
+        self.ok("tab.rename", json!({"tab_id": tab, "label": label}))
             .await
     }
 
@@ -336,24 +319,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn placements_come_from_the_root_pane_and_the_worktree() {
+    async fn workspace_placement_comes_from_the_root_pane() {
         let fake = FakeHerdrServer::start().await;
         fake.answer(
             "workspace.create",
             json!({"type": "workspace_created", "workspace": {}, "tab": {},
                    "root_pane": pane_json("w3:p1", "/state/runs/DATA-1")}),
-        );
-        fake.answer(
-            "worktree.create",
-            json!({"type": "worktree_created", "workspace": {}, "tab": {},
-                   "root_pane": pane_json("w4:p1", "/wt/api"),
-                   "worktree": {"path": "/wt/api", "label": "api"}}),
-        );
-        fake.answer(
-            "worktree.open",
-            json!({"type": "worktree_opened", "workspace": {}, "tab": {},
-                   "root_pane": pane_json("w5:p1", "/wt/api"),
-                   "worktree": {"path": "/wt/api", "label": "api"}}),
         );
         let client = fake.client();
         let placed = client
@@ -367,40 +338,59 @@ mod tests {
                 tab: "w3:t1".into(),
                 pane: PaneId("w3:p1".into()),
                 cwd: "/state/runs/DATA-1".into(),
-                worktree_path: None,
             }
         );
         assert_eq!(
             last_request(&fake, "workspace.create")["params"],
             json!({"cwd": "/state/runs/DATA-1", "label": "DATA-1 Fix", "focus": false})
         );
+    }
+
+    #[tokio::test]
+    async fn tab_operations_use_the_0_9_1_socket_shapes() {
+        let fake = FakeHerdrServer::start().await;
+        fake.answer(
+            "tab.create",
+            json!({"type": "tab_created", "tab": {},
+                   "root_pane": pane_json("w3:p2", "/wt/api")}),
+        );
+        fake.answer("tab.rename", json!({"type": "tab_info", "tab": {}}));
+        fake.answer("pane.close", json!({"type": "ok"}));
+        let client = fake.client();
         let placed = client
-            .worktree_create(
-                "/src/api",
-                "herdr-linear-agent/data-1/w1",
-                "origin/main",
-                "acme/DATA-1 · w1",
-            )
+            .tab_create(&WorkspaceId("w3".into()), "/wt/api", "api · w1")
             .await
             .unwrap();
-        assert_eq!(placed.worktree_path.as_deref(), Some("/wt/api"));
-        assert_eq!(placed.pane, PaneId("w4:p1".into()));
+        assert_eq!(placed.workspace, WorkspaceId("w3".into()));
+        assert_eq!(placed.tab, "w3:t1");
+        assert_eq!(placed.pane, PaneId("w3:p2".into()));
         assert_eq!(
-            last_request(&fake, "worktree.create")["params"]["base"],
-            "origin/main"
+            last_request(&fake, "tab.create")["params"],
+            json!({"workspace_id": "w3", "cwd": "/wt/api", "label": "api · w1", "focus": false})
         );
+        client.tab_rename("w3:t1", "coordinator").await.unwrap();
         assert_eq!(
-            last_request(&fake, "worktree.create")["params"]["label"],
-            "acme/DATA-1 · w1"
+            last_request(&fake, "tab.rename")["params"],
+            json!({"tab_id": "w3:t1", "label": "coordinator"})
         );
-        client
-            .worktree_open("/src/api", "/wt/api", "acme/DATA-1 · w1")
+        let pane = PaneId("w3:p2".into());
+        client.pane_close(&pane).await.unwrap();
+        assert_eq!(
+            last_request(&fake, "pane.close")["params"],
+            json!({"pane_id": "w3:p2"})
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_close_preserves_herdr_not_found_errors() {
+        let fake = FakeHerdrServer::start().await;
+        fake.fail("pane.close", "pane_not_found", "pane w1:p9 not found");
+        let error = fake
+            .client()
+            .pane_close(&PaneId("w1:p9".into()))
             .await
-            .unwrap();
-        assert_eq!(
-            last_request(&fake, "worktree.open")["params"]["label"],
-            "acme/DATA-1 · w1"
-        );
+            .unwrap_err();
+        assert!(matches!(error, HerdrError::Api { ref code, .. } if code == "pane_not_found"));
     }
 
     #[tokio::test]

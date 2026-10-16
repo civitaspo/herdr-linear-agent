@@ -1,7 +1,9 @@
 //! Child processes (git, `open`) under tokio, behind a trait so tests can
 //! answer them.
 
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -20,6 +22,9 @@ const EXIT_DRAIN: Duration = Duration::from_millis(500);
 pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(OsString, OsString)>,
+    pub env_remove: Vec<OsString>,
     pub timeout: Duration,
     /// Optional combined stdout/stderr byte cap. Output at or below the cap
     /// is retained; exceeding it kills and reaps the child.
@@ -31,6 +36,9 @@ impl Cmd {
         Cmd {
             program: program.into(),
             args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
             timeout,
             max_output_bytes: None,
         }
@@ -43,6 +51,22 @@ impl Cmd {
 
     pub fn args<S: Into<String>>(mut self, args: impl IntoIterator<Item = S>) -> Self {
         self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.env
+            .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
+        self
+    }
+
+    pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.env_remove.push(key.as_ref().to_os_string());
         self
     }
 
@@ -120,24 +144,84 @@ impl Runner for RealRunner {
 }
 
 async fn run(cmd: &Cmd) -> Result<Output> {
-    let child = tokio::process::Command::new(&cmd.program)
+    let mut command = tokio::process::Command::new(&cmd.program);
+    command
         .args(&cmd.args)
+        .envs(cmd.env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    for key in &cmd.env_remove {
+        command.env_remove(key);
+    }
+    if let Some(cwd) = &cmd.cwd {
+        command.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    let child = command
         .spawn()
         .with_context(|| format!("could not run `{}`", cmd.program))?;
-    collect_child(child, cmd.timeout, cmd.max_output_bytes).await
+    #[cfg(unix)]
+    let mut group = ProcessGroup::new(child.id());
+    #[cfg(unix)]
+    let result =
+        collect_child_inner(child, cmd.timeout, cmd.max_output_bytes, Some(&mut group)).await;
+    #[cfg(not(unix))]
+    let result = collect_child(child, cmd.timeout, cmd.max_output_bytes).await;
+    result
+}
+
+#[cfg(unix)]
+struct ProcessGroup {
+    id: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl ProcessGroup {
+    fn new(id: Option<u32>) -> Self {
+        ProcessGroup {
+            id: id.map(|id| id as libc::pid_t),
+        }
+    }
+
+    fn kill(&mut self) {
+        if let Some(id) = self.id.take() {
+            unsafe {
+                libc::kill(-id, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// Drains a child's output without retaining more than `max_output_bytes`.
-/// Routing shares this loop so headless calls have the same kill/reap and
-/// drain behavior as runner-backed commands.
+/// This only owns the direct child; callers that need descendant cleanup
+/// must also own and kill the child's process group.
 pub(crate) async fn collect_child(
+    child: tokio::process::Child,
+    timeout: Duration,
+    max_output_bytes: Option<usize>,
+) -> Result<Output> {
+    collect_child_inner(child, timeout, max_output_bytes, None).await
+}
+
+async fn collect_child_inner(
     mut child: tokio::process::Child,
     timeout: Duration,
     max_output_bytes: Option<usize>,
+    #[cfg(unix)] mut group: Option<&mut ProcessGroup>,
+    #[cfg(not(unix))] _group: Option<&mut ()>,
 ) -> Result<Output> {
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -183,8 +267,14 @@ pub(crate) async fn collect_child(
                 // A process the child left behind may keep the pipes open.
                 deadline = deadline.min(Instant::now() + EXIT_DRAIN);
             }
-            () = sleep_until(deadline), if status.is_some() => break,
+            () = sleep_until(deadline), if status.is_some() => {
+                #[cfg(unix)]
+                if let Some(group) = group.as_deref_mut() { group.kill(); }
+                break
+            },
             () = sleep_until(deadline), if status.is_none() => {
+                #[cfg(unix)]
+                if let Some(group) = group.as_deref_mut() { group.kill(); }
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 let (stdout, capped_stdout_bytes) = captured_stdout(out, max_output_bytes.is_some());
@@ -198,6 +288,10 @@ pub(crate) async fn collect_child(
             }
         }
         if exceeded {
+            #[cfg(unix)]
+            if let Some(group) = group.as_deref_mut() {
+                group.kill();
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
             anyhow::bail!("child output exceeded the configured byte limit");
@@ -230,11 +324,17 @@ pub mod fake {
     pub struct FakeRunner {
         rules: Arc<Mutex<Vec<(String, Output)>>>,
         pub calls: Arc<Mutex<Vec<Cmd>>>,
+        real_git: bool,
     }
 
     impl FakeRunner {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        pub fn with_real_git(mut self) -> Self {
+            self.real_git = true;
+            self
         }
 
         pub fn on(&self, needle: &str, output: Output) -> &Self {
@@ -284,9 +384,14 @@ pub mod fake {
                 .iter()
                 .rev()
                 .find(|(needle, _)| line.contains(needle.as_str()))
-                .map(|(_, output)| output.clone())
-                .ok_or_else(|| anyhow::anyhow!("FakeRunner: no rule for `{line}`"));
-            Box::pin(std::future::ready(answer))
+                .map(|(_, output)| output.clone());
+            Box::pin(async move {
+                match answer {
+                    Some(output) => Ok(output),
+                    None if self.real_git && cmd.program == "git" => super::run(cmd).await,
+                    None => Err(anyhow::anyhow!("FakeRunner: no rule for `{line}`")),
+                }
+            })
         }
 
         fn shared(&self) -> Arc<dyn Runner> {
@@ -314,6 +419,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_child_collection_without_a_process_group_still_kills_on_timeout_or_cap() {
+        for (program, args, cap) in [
+            ("sleep", vec!["30"], None),
+            ("yes", vec!["flood"], Some(64)),
+        ] {
+            let child = tokio::process::Command::new(program)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                collect_child(child, Duration::from_millis(30), cap),
+            )
+            .await
+            .expect("collector failed to kill its direct child");
+            if cap.is_some() {
+                assert!(result.unwrap_err().to_string().contains("output exceeded"));
+            } else {
+                assert!(result.unwrap().timed_out);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_removes_inherited_environment_keys() {
+        let output = RealRunner
+            .run(
+                &Cmd::new("sh", Duration::from_secs(2))
+                    .args(["-c", "test -z \"${SHOULD_BE_REMOVED+x}\""])
+                    .env("SHOULD_BE_REMOVED", "present")
+                    .env_remove("SHOULD_BE_REMOVED"),
+            )
+            .await
+            .unwrap();
+        assert!(output.success(), "{}", output.stderr);
+    }
+
+    #[tokio::test]
     async fn both_streams_and_the_exit_status_are_captured() {
         let script = "printf 'on stdout'; printf 'on stderr' >&2; exit 3";
         let (result, _) = timed(sh(script, PROMPT)).await;
@@ -333,6 +479,24 @@ mod tests {
 
         let (result, _) = timed(sh("true", PROMPT)).await;
         assert!(result.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn command_receives_its_working_directory_and_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = RealRunner
+            .run(
+                &sh("printf '%s:%s' \"$HLA_TEST_VALUE\" \"$PWD\"", PROMPT)
+                    .cwd(dir.path())
+                    .env("HLA_TEST_VALUE", "value"),
+            )
+            .await
+            .unwrap();
+        assert!(output.success());
+        assert_eq!(
+            output.stdout,
+            format!("value:{}", dir.path().canonicalize().unwrap().display())
+        );
     }
 
     #[tokio::test]
@@ -429,5 +593,70 @@ mod tests {
             assert!(!output.success(), "{shown}");
             assert!(took < PROMPT, "{shown} took {took:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_a_descendant_before_it_can_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("late-write");
+        let cmd = sh(
+            "(sleep 0.4; printf touched > \"$HLA_MARKER\") & wait",
+            Duration::from_millis(100),
+        )
+        .env("HLA_MARKER", &marker);
+        let output = RealRunner.run(&cmd).await.unwrap();
+        assert!(output.timed_out);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !marker.exists(),
+            "a descendant outlived the command timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_running_command_kills_its_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let marker = dir.path().join("late-write");
+        let cmd = sh(
+            "printf started > \"$HLA_STARTED\"; (sleep 0.5; printf touched > \"$HLA_MARKER\") & wait",
+            Duration::from_secs(10),
+        )
+        .env("HLA_STARTED", &started)
+        .env("HLA_MARKER", &marker);
+        let task = tokio::spawn(async move { RealRunner.run(&cmd).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("command did not start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(
+            !marker.exists(),
+            "a descendant outlived command cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_limit_kills_a_descendant_before_it_can_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("late-write");
+        let cmd = sh(
+            "(sleep 0.4; printf touched > \"$HLA_MARKER\") & printf too-much; wait",
+            PROMPT,
+        )
+        .env("HLA_MARKER", &marker)
+        .max_output_bytes(2);
+        let error = RealRunner.run(&cmd).await.unwrap_err();
+        assert!(error.to_string().contains("output exceeded"));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!marker.exists(), "a descendant outlived the output limit");
     }
 }

@@ -9,6 +9,8 @@ mod memory;
 mod requests;
 mod wake;
 
+#[cfg(test)]
+pub use client::Tab;
 pub use client::{Client, Snapshot, Subscription, invoking_socket, session_socket};
 #[cfg(test)]
 pub(crate) use fake::FakeHerdrServer;

@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::config::{Config, Limits, Repository};
+use crate::config::{Config, Limits};
 use crate::coordinator::{self, View};
-use crate::herdr::{self, AgentStatus as HerdrStatus, Herdr, Placed, WorkspaceId};
+use crate::herdr::{self, AgentStatus as HerdrStatus, Herdr};
 use crate::linear::api::{Activity, Content};
 use crate::outbox::{self, Op, StateTarget};
 use crate::paths::Ctx;
@@ -18,7 +18,9 @@ use crate::process::{Cmd, Runner};
 use crate::run::{AgentStatus, Run, RunRecord, Status};
 use crate::supervisor::{self, DecisionProposal, SupervisorStore};
 use crate::worker::{
-    self, DecisionRequest, Group, MergeAttempt, MergeAuthorization, MergeDecisionState, Worker,
+    self, DecisionRequest, Group, MergeAttempt, MergeAuthorization, MergeDecisionState,
+    PlacementIntent, PlacementRef, RestartOperation, RestartPhase, StartOperation, StartPhase,
+    Worker, WorkerOperation,
 };
 use crate::{files, inbox, names, ticker};
 
@@ -622,7 +624,13 @@ pub async fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
     let common = Path::new(out.stdout.trim());
     let exclude = Path::new(cwd).join(common).join("info/exclude");
     let line = format!("{}/", worker::BRIEF_FOLDER);
-    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let mut text = match std::fs::read_to_string(&exclude) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", exclude.display()));
+        }
+    };
     if text.lines().any(|l| l.trim() == line) {
         return Ok(());
     }
@@ -635,71 +643,6 @@ pub async fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     files::write_atomic(&exclude, text.as_bytes())
-}
-
-async fn fetch(runner: &dyn Runner, repo: &Repository) -> Result<()> {
-    let path = repo.path.to_string_lossy();
-    let out = runner
-        .run(&Cmd::new("git", FETCH_TIMEOUT).args(["-C", &path, "fetch", "origin", &repo.base]))
-        .await
-        .context("git fetch failed")?;
-    if !out.success() {
-        bail!("git fetch failed: {}", out.error_text());
-    }
-    Ok(())
-}
-
-/// The path of the worktree that has `branch` checked out, from
-/// `git worktree list --porcelain` (blocks of `worktree <path>` and
-/// `branch refs/heads/<name>` lines).
-fn worktree_of(listing: &str, branch: &str) -> Option<String> {
-    let wanted = format!("branch refs/heads/{branch}");
-    listing.split("\n\n").find_map(|block| {
-        let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
-        block
-            .lines()
-            .any(|l| l.trim() == wanted)
-            .then(|| path.to_string())
-    })
-}
-
-fn worker_label(run: &Run, id: &str) -> String {
-    format!("{} · {id}", run.key)
-}
-
-async fn find_worktree(runner: &dyn Runner, repo_path: &str, branch: &str) -> Option<String> {
-    let out = runner
-        .run(&Cmd::new("git", GIT_TIMEOUT).args([
-            "-C",
-            repo_path,
-            "worktree",
-            "list",
-            "--porcelain",
-        ]))
-        .await
-        .ok()?;
-    out.success().then(|| worktree_of(&out.stdout, branch))?
-}
-
-/// `worktree.create`, except that a creation whose answer was lost is
-/// found by its branch and opened instead of failing or creating a second.
-async fn create_worktree<H: Herdr>(
-    runner: &dyn Runner,
-    herdr: &H,
-    repo_path: &str,
-    branch: &str,
-    base: &str,
-    label: &str,
-) -> Result<Placed, herdr::HerdrError> {
-    match herdr.worktree_create(repo_path, branch, base, label).await {
-        Err(herdr::HerdrError::OutcomeUnknown(detail)) => {
-            match find_worktree(runner, repo_path, branch).await {
-                Some(path) => herdr.worktree_open(repo_path, &path, label).await,
-                None => Err(herdr::HerdrError::OutcomeUnknown(detail)),
-            }
-        }
-        other => other,
-    }
 }
 
 pub struct WorkerStart {
@@ -753,6 +696,23 @@ pub async fn worker_start<H: Herdr>(
     args: &WorkerStart,
 ) -> Result<Worker> {
     let (config, run, record) = load_active(ctx, key).await?;
+    ensure!(
+        !record.coordinator.workspace_id.is_empty(),
+        "the coordinator has no Herdr workspace yet"
+    );
+    ensure!(
+        record.coordinator.herdr_session.is_empty()
+            || record.coordinator.herdr_session == session.socket,
+        "the coordinator belongs to a different Herdr session"
+    );
+    ensure!(
+        record.coordinator_placement.is_none(),
+        "the coordinator is still being placed"
+    );
+    ensure!(
+        !record.coordinator_misplaced,
+        "the coordinator pane is outside its recorded workspace; move it back before starting a worker"
+    );
     let repo = config.repository(&args.repo)?.clone();
     let profile = config
         .worker_profile_for(&record.workspace, &record.team_key, &args.profile)?
@@ -766,159 +726,87 @@ pub async fn worker_start<H: Herdr>(
         true,
     )?;
     let limits = config.limits;
-    check_room(&worker::list(&run), &args.repo, limits)?;
+    check_room(&worker::list_checked(&run)?, &args.repo, limits)?;
     check_agents(ctx, &config)?;
-    fetch(ctx.runner, &repo).await?;
     let repo_path = repo.path.to_string_lossy().into_owned();
-    let worker = worker::allocate(
+    let socket = session.socket.clone();
+    let run_key = run.key.clone();
+    let hooks = repo.worktree.clone();
+    let task = args.task.trim().to_string();
+    let worker = worker::allocate_with(
         &run,
         |workers| {
+            ensure!(
+                run.record()?.status == Status::Active,
+                "run {key} is no longer active"
+            );
+            let current = run.record()?;
+            ensure!(
+                !current.coordinator.workspace_id.is_empty(),
+                "the coordinator has no Herdr workspace yet"
+            );
+            ensure!(
+                current.coordinator_placement.is_none(),
+                "the coordinator is still being placed"
+            );
+            ensure!(
+                !current.coordinator_misplaced,
+                "the coordinator pane is outside its recorded workspace; move it back before starting a worker"
+            );
+            ensure!(
+                current.coordinator.workspace_id == record.coordinator.workspace_id,
+                "the coordinator workspace changed; retry worker start"
+            );
+            ensure!(
+                current.coordinator.herdr_session.is_empty()
+                    || current.coordinator.herdr_session == socket,
+                "the coordinator belongs to a different Herdr session"
+            );
             check_room(workers, &args.repo, limits)?;
             check_agents(ctx, &config)
         },
-        |w| {
+        |w| -> Result<()> {
             w.title = args.title.clone();
             w.repo = args.repo.clone();
             w.repo_path = repo_path.clone();
             w.base = repo.base.clone();
             w.branch = worker::branch_name(key, &w.id, &args.title);
             w.agent.status = AgentStatus::Pending;
+            w.cleanup_completed = false;
             w.agent.profile = args.profile.clone();
             w.agent.kind = profile.kind.clone();
             w.agent.waiting_episodes = Some(0);
             w.agent.agent_name = names::agent_name(key, &record.issue_id, &w.id);
+            let path = crate::worktree::path(ctx, &run_key, &w.id, &args.repo)?
+                .to_string_lossy()
+                .into_owned();
+            w.worktree_path = path.clone();
+            w.brief_dir = worker::brief_dir(&path, &run_key, &w.id);
+            w.operation = Some(WorkerOperation::Start(StartOperation {
+                id: uuid::Uuid::new_v4(),
+                retry_counted: false,
+                phase: StartPhase::SaveTask,
+                task: Some(task.clone()),
+                setup_cursor: 0,
+                hooks: hooks.clone(),
+                instructions: profile.instructions.clone(),
+                placement: PlacementIntent::Requested {
+                    session: socket.clone(),
+                    workspace: record.coordinator.workspace_id.clone(),
+                    cwd: path,
+                    label: worker::tab_label(&w.id, &w.repo, &w.title),
+                },
+            }));
+            Ok(())
         },
     )?;
     outbox::clear_turn_complete(&run)?;
-    let task_path = worker::task_path(&run, &worker.id);
-    if let Err(error) =
-        files::write_atomic(&task_path, format!("{}\n", args.task.trim()).as_bytes())
-    {
-        let worker_id = worker.id.clone();
-        let message = format!("could not persist the task: {error:#}");
-        if let Err(state_error) = worker::update(&run, &worker_id, |w| {
-            w.agent.status = AgentStatus::Stopped;
-            w.agent.error = message;
-            w.agent.prompt_pending = false;
-            w.restarting = false;
-        }) {
-            return Err(error).context(format!(
-                "could not record failed task persistence for worker {worker_id}: {state_error:#}"
-            ));
-        }
-        ticker::poke(&ctx.state_dir());
-        return Err(error).context(format!("could not persist the task for worker {worker_id}"));
-    }
-    let base = format!("origin/{}", repo.base);
-    let placed = match create_worktree(
-        ctx.runner,
-        &session.herdr,
-        &repo_path,
-        &worker.branch,
-        &base,
-        &worker_label(&run, &worker.id),
-    )
-    .await
-    {
-        Ok(placed) => placed,
-        Err(error) => {
-            worker::update(&run, &worker.id, |w| {
-                w.agent.status = AgentStatus::Failed;
-                w.agent.error = format!("could not create the worktree: {error}");
-            })?;
-            ticker::poke(&ctx.state_dir());
-            bail!("could not create the worktree for {}: {error}", worker.id);
-        }
-    };
-    let instructions = profile.instructions.as_slice();
-    let worker = place(
-        ctx,
-        &run,
-        &record,
-        worker,
-        &placed,
-        args.task.trim(),
-        false,
-        instructions,
-    )
-    .await?;
     ticker::poke(&ctx.state_dir());
     println!(
-        "{} is placed in {} on branch {}; herdr-linear-agent starts its agent shortly",
-        worker.id, worker.worktree_path, worker.branch
+        "{} is queued for placement in {}",
+        worker.id, worker.worktree_path
     );
     Ok(worker)
-}
-
-/// Writes the brief into the new pane's worktree and records the placement.
-/// The agent's own fields are reset for a fresh launch.
-#[allow(clippy::too_many_arguments)]
-async fn place(
-    ctx: &Ctx<'_>,
-    run: &Run,
-    record: &RunRecord,
-    mut worker: Worker,
-    placed: &Placed,
-    task: &str,
-    restart: bool,
-    instructions: &[crate::config::Instructions],
-) -> Result<Worker> {
-    let worktree = placed
-        .worktree_path
-        .clone()
-        .unwrap_or_else(|| placed.cwd.clone());
-    // Only the brief folder goes unignored without it; the worker still works.
-    let _ = exclude_from_git(ctx.runner, &worktree).await;
-    worker.worktree_path = worktree.clone();
-    worker.brief_dir = worker::brief_dir(&worktree, &run.key, &worker.id);
-    let prepare = || -> Result<()> {
-        std::fs::create_dir_all(&worker.brief_dir)
-            .with_context(|| format!("could not create {}", worker.brief_dir))?;
-        let brief = worker::compose_brief(&worker::BriefInput {
-            issue_key: &record.identifier,
-            issue_title: &record.title,
-            issue_url: &record.url,
-            worker: &worker,
-            task,
-            restart,
-            binary: &coordinator::binary_command()?,
-            instructions,
-        });
-        files::write_atomic(
-            &Path::new(&worker.brief_dir).join("brief.md"),
-            brief.as_bytes(),
-        )?;
-        Ok(())
-    };
-    if let Err(error) = prepare() {
-        let worker_id = worker.id.clone();
-        let worktree_path = worker.worktree_path.clone();
-        let brief_dir = worker.brief_dir.clone();
-        let message = format!("{error:#}");
-        if let Err(state_error) = worker::update(run, &worker_id, |w| {
-            w.worktree_path = worktree_path;
-            w.brief_dir = brief_dir;
-            w.agent.placed(placed);
-            w.agent.status = AgentStatus::Failed;
-            w.agent.error = message;
-            w.agent.prompt_pending = false;
-            w.restarting = false;
-        }) {
-            return Err(error).context(format!(
-                "could not record failed placement for worker {worker_id}: {state_error:#}"
-            ));
-        }
-        ticker::poke(&ctx.state_dir());
-        return Err(error);
-    }
-    worker::update(run, &worker.id, |w| {
-        w.worktree_path = worker.worktree_path.clone();
-        w.brief_dir = worker.brief_dir.clone();
-        if restart {
-            w.restarts += 1;
-        }
-        w.agent.placed(placed);
-    })
 }
 
 /// Sends a worker a follow-up and records it in its task file.
@@ -1737,57 +1625,6 @@ fn record_merge_result(
     Ok(())
 }
 
-/// The restarted worker's new pane: its kept worktree opened again, or a
-/// worktree placed from its base when it never had one.
-async fn reopen<H: Herdr>(
-    ctx: &Ctx<'_>,
-    config: &Config,
-    session: &Session<H>,
-    w: &Worker,
-    label: &str,
-) -> Result<Placed> {
-    let id = &w.id;
-    if !w.worktree_path.is_empty() {
-        if !w.agent.workspace_id.is_empty() {
-            // The checkout stays; a workspace that is already gone is fine.
-            let _ = session
-                .herdr
-                .workspace_close(&WorkspaceId(w.agent.workspace_id.clone()))
-                .await;
-        }
-        return session
-            .herdr
-            .worktree_open(&w.repo_path, &w.worktree_path, label)
-            .await
-            .with_context(|| format!("could not open the worktree of {id}"));
-    }
-    let repo = config.repository(&w.repo)?.clone();
-    let repo_path = repo.path.to_string_lossy().into_owned();
-    match find_worktree(ctx.runner, &repo_path, &w.branch).await {
-        // A creation whose answer was lost left the checkout behind.
-        Some(path) => session
-            .herdr
-            .worktree_open(&repo_path, &path, label)
-            .await
-            .with_context(|| format!("could not open the worktree of {id}")),
-        // The worktree was never created: place it again from its base.
-        None => {
-            fetch(ctx.runner, &repo).await?;
-            let base = format!("origin/{}", repo.base);
-            create_worktree(
-                ctx.runner,
-                &session.herdr,
-                &repo_path,
-                &w.branch,
-                &base,
-                label,
-            )
-            .await
-            .with_context(|| format!("could not create the worktree for {id}"))
-        }
-    }
-}
-
 /// Starts a worker again in its worktree, optionally with another profile.
 pub async fn worker_restart<H: Herdr>(
     ctx: &Ctx<'_>,
@@ -1797,7 +1634,16 @@ pub async fn worker_restart<H: Herdr>(
     profile: Option<&str>,
 ) -> Result<Worker> {
     let (config, run, record) = load_active(ctx, key).await?;
+    ensure!(
+        !record.stopped && !record.finished && record.awaiting_reply.is_none(),
+        "run {key} is stopped or waiting for a reply"
+    );
     let w = worker::load(&run, id)?;
+    ensure!(
+        w.agent.herdr_session.is_empty() || w.agent.herdr_session == session.socket,
+        "worker {id} belongs to a different Herdr session"
+    );
+    let pending = w.operation.clone();
     if w.restarts >= worker::MAX_RESTARTS {
         bail!(
             "worker {id} was restarted {} times; the limit is {}",
@@ -1813,10 +1659,13 @@ pub async fn worker_restart<H: Herdr>(
                 .worker_profile_for(&record.workspace, &record.team_key, name)?
                 .clone(),
         ),
-        None => (
-            w.agent.profile.clone(),
-            config.profile(&w.agent.profile)?.clone(),
-        ),
+        None => {
+            let name = match &pending {
+                Some(WorkerOperation::Restart(op)) => op.profile.clone(),
+                _ => w.agent.profile.clone(),
+            };
+            (name.clone(), config.profile(&name)?.clone())
+        }
     };
     ensure_generated_profile_authorized(
         ctx,
@@ -1829,8 +1678,115 @@ pub async fn worker_restart<H: Herdr>(
     if !w.counts() {
         check_agents(ctx, &config)?;
     }
+    let repo = config.repository(&w.repo)?;
+    ensure!(
+        repo.path.to_string_lossy() == w.repo_path,
+        "repository path changed for worker {id}; restart is unsafe"
+    );
+    if let Some(mut operation) = pending {
+        ensure!(
+            w.agent.status == AgentStatus::Failed,
+            "worker {id} has a pending lifecycle operation; only failed operations can be resumed"
+        );
+        ensure!(
+            w.restarts < worker::MAX_RESTARTS,
+            "worker {id} reached the restart limit"
+        );
+        ensure!(
+            !record.stopped && !record.finished && record.awaiting_reply.is_none(),
+            "run {key} is stopped or waiting for a reply"
+        );
+        let already_placed = match &operation {
+            WorkerOperation::Start(op) => matches!(&op.placement, PlacementIntent::Placed(_)),
+            WorkerOperation::Restart(op) => matches!(&op.placement, PlacementIntent::Placed(_)),
+            WorkerOperation::Cleanup(_) => false,
+        };
+        let previous_profile = match &operation {
+            WorkerOperation::Start(_) => w.agent.profile.as_str(),
+            WorkerOperation::Restart(op) => op.profile.as_str(),
+            WorkerOperation::Cleanup(_) => "",
+        };
+        ensure!(
+            !matches!(&operation, WorkerOperation::Cleanup(_)),
+            "worker {id} has cleanup pending and cannot be restarted"
+        );
+        ensure!(
+            !already_placed || profile_name == previous_profile,
+            "worker {id} is already placed; a profile change cannot be applied while resuming its failed operation"
+        );
+        let new_operation_id = uuid::Uuid::new_v4();
+        match &mut operation {
+            WorkerOperation::Start(op) => {
+                op.id = new_operation_id;
+                op.retry_counted = true;
+                op.instructions = profile.instructions.clone();
+            }
+            WorkerOperation::Restart(op) => {
+                op.id = new_operation_id;
+                op.retry_counted = true;
+                op.profile = profile_name.clone();
+                op.kind = profile.kind.clone();
+                op.instructions = profile.instructions.clone();
+            }
+            WorkerOperation::Cleanup(_) => unreachable!(),
+        }
+        let lock = run.lock()?;
+        let locked_record = run.record()?;
+        ensure!(
+            locked_record.status == Status::Active,
+            "run {key} is no longer active"
+        );
+        ensure!(
+            !locked_record.stopped
+                && !locked_record.finished
+                && locked_record.awaiting_reply.is_none(),
+            "run {key} is stopped or waiting for a reply"
+        );
+        ensure!(
+            locked_record.coordinator_placement.is_none(),
+            "the coordinator is still being placed"
+        );
+        ensure!(
+            locked_record.coordinator.herdr_session.is_empty()
+                || locked_record.coordinator.herdr_session == session.socket,
+            "the coordinator belongs to a different Herdr session"
+        );
+        ensure!(
+            !locked_record.coordinator_misplaced,
+            "the coordinator pane is outside its recorded workspace; move it back before restarting a worker"
+        );
+        let current = worker::load(&run, id)?;
+        ensure!(
+            current.operation == w.operation && current.agent.status == AgentStatus::Failed,
+            "worker {id} changed while restart was being prepared; retry"
+        );
+        let started = worker::update_held(&run, &lock, id, |current| {
+            current.restarts += 1;
+            if matches!(&operation, WorkerOperation::Start(_)) {
+                current.agent.profile = profile_name.clone();
+                current.agent.kind = profile.kind.clone();
+            }
+            current.agent.status = if already_placed {
+                AgentStatus::Open
+            } else {
+                AgentStatus::Pending
+            };
+            current.agent.error.clear();
+            current.agent.prompt_pending = false;
+            current.restarting = matches!(&operation, WorkerOperation::Restart(_));
+            current.cleanup_completed = false;
+            current.operation = Some(operation.clone());
+        })?;
+        drop(lock);
+        ticker::poke(&ctx.state_dir());
+        println!(
+            "{id} failed operation retry is queued in {}",
+            started.worktree_path
+        );
+        return Ok(started);
+    }
     let task_path = worker::task_path(&run, id);
-    let task = std::fs::read_to_string(&task_path).with_context(|| {
+    let _task = std::fs::read_to_string(&task_path).with_context(|| {
         format!(
             "could not read task for worker {id} at {}",
             task_path.display()
@@ -1850,74 +1806,153 @@ pub async fn worker_restart<H: Herdr>(
         eprintln!("{line}");
     }
     outbox::clear_turn_complete(&run)?;
-    // Before the old workspace closes, so a pass woken by the close finds
-    // a worker the watcher leaves alone rather than one whose pane is gone.
-    worker::update(&run, id, |w| {
+    let new_path = if w.worktree_path.is_empty() {
+        crate::worktree::path(ctx, key, id, &w.repo)?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        w.worktree_path.clone()
+    };
+    let create_checkout = !Path::new(&new_path).is_dir();
+    let hooks = if create_checkout {
+        repo.worktree.clone()
+    } else {
+        w.worktree_hooks.clone().unwrap_or_default()
+    };
+    let lock = run.lock()?;
+    let locked_record = run.record()?;
+    ensure!(
+        locked_record.status == Status::Active,
+        "run {key} is no longer active"
+    );
+    ensure!(
+        !locked_record.stopped && !locked_record.finished && locked_record.awaiting_reply.is_none(),
+        "run {key} is stopped or waiting for a reply"
+    );
+    ensure!(
+        locked_record.coordinator_placement.is_none(),
+        "the coordinator is still being placed"
+    );
+    ensure!(
+        locked_record.coordinator.herdr_session.is_empty()
+            || locked_record.coordinator.herdr_session == session.socket,
+        "the coordinator belongs to a different Herdr session"
+    );
+    ensure!(
+        !locked_record.coordinator_misplaced,
+        "the coordinator pane is outside its recorded workspace; move it back before restarting a worker"
+    );
+    let workspace = locked_record.coordinator.workspace_id.clone();
+    ensure!(
+        !workspace.is_empty(),
+        "the run has no coordinator workspace yet"
+    );
+    let current = worker::load(&run, id)?;
+    ensure!(
+        current.operation.is_none(),
+        "worker {id} already has a pending lifecycle operation"
+    );
+    ensure!(
+        current.restarts < worker::MAX_RESTARTS,
+        "worker {id} reached the restart limit"
+    );
+    ensure!(
+        current.agent.pane_id == w.agent.pane_id
+            && current.agent.workspace_id == w.agent.workspace_id
+            && current.agent.cwd == w.agent.cwd,
+        "worker {id} changed while restart was being prepared; retry"
+    );
+    ensure!(
+        current.branch == w.branch && current.repo_path == w.repo_path,
+        "worker {id} checkout identity changed; restart is unsafe"
+    );
+    let requested = worker::update_held(&run, &lock, id, |w| {
         w.agent.recovery = crate::run::Recovery::None;
         w.restarting = true;
+        w.cleanup_completed = false;
         w.gone_reported = false;
         w.agent.status = AgentStatus::Open;
-        w.agent.workspace_id.clear();
-        w.agent.tab_id.clear();
-        w.agent.pane_id.clear();
-        w.agent.prompt_pending = true;
+        w.agent.prompt_pending = false;
         w.agent.last_group.clear();
         w.agent.blocked_reported = false;
+        w.worktree_path = new_path.clone();
+        w.brief_dir = worker::brief_dir(&new_path, key, id);
+        w.operation = Some(WorkerOperation::Restart(RestartOperation {
+            id: uuid::Uuid::new_v4(),
+            retry_counted: false,
+            phase: if create_checkout {
+                RestartPhase::CreateCheckout
+            } else {
+                RestartPhase::CreateTab
+            },
+            previous: PlacementRef {
+                session: session.socket.clone(),
+                workspace: w.agent.workspace_id.clone(),
+                tab: w.agent.tab_id.clone(),
+                pane: w.agent.pane_id.clone(),
+                cwd: w.agent.cwd.clone(),
+            },
+            placement: PlacementIntent::Requested {
+                session: session.socket.clone(),
+                workspace,
+                cwd: new_path.clone(),
+                label: worker::tab_label(id, &w.repo, &w.title),
+            },
+            profile: profile_name.clone(),
+            kind: profile.kind.clone(),
+            repo_path: w.repo_path.clone(),
+            base: w.base.clone(),
+            branch: w.branch.clone(),
+            hooks: hooks.clone(),
+            instructions: profile.instructions.clone(),
+            create_checkout,
+            setup_cursor: 0,
+        }));
     })?;
-    let placed = match reopen(ctx, &config, session, &w, &worker_label(&run, id)).await {
-        Ok(placed) => placed,
-        Err(error) => {
-            let message = format!("{error:#}");
-            worker::update(&run, id, |w| {
-                w.restarting = false;
-                w.agent.status = AgentStatus::Failed;
-                w.agent.error = message;
-            })?;
-            ticker::poke(&ctx.state_dir());
-            return Err(error);
-        }
-    };
-    let reset = worker::update(&run, id, |w| {
-        w.report_hash.clear();
-        w.gone_reported = false;
-        w.agent.profile = profile_name.clone();
-        w.agent.kind = profile.kind.clone();
-        w.agent.last_group.clear();
-        w.agent.last_state.clear();
-        w.agent.last_state_change.clear();
-        w.agent.last_state_seq = 0;
-        w.agent.blocked_reported = false;
-        w.agent.resume = false;
-        w.agent.agent_session.clear();
-    })?;
-    let instructions = profile.instructions.as_slice();
-    let worker = place(
-        ctx,
-        &run,
-        &record,
-        reset,
-        &placed,
-        task.trim(),
-        true,
-        instructions,
-    )
-    .await?;
+    let worker = requested;
     ticker::poke(&ctx.state_dir());
     println!(
-        "{id} restarts in {} with the `{profile_name}` profile",
+        "{id} restart is queued in {} with the `{profile_name}` profile",
         worker.worktree_path
     );
     Ok(worker)
+}
+
+/// Retry a retained cleanup phase after the operator resolves its cause.
+pub fn worker_retry_cleanup(ctx: &Ctx<'_>, key: &str, id: &str) -> Result<()> {
+    let run = Run::load(&ctx.runs_dir(), key)?;
+    let lock = run.lock()?;
+    ensure!(
+        run.record()?.status == Status::Closed,
+        "cleanup can only be retried for a closed run"
+    );
+    let worker = worker::load(&run, id)?;
+    ensure!(
+        matches!(&worker.operation, Some(WorkerOperation::Cleanup(op)) if op.retained_reason.is_some()),
+        "worker {id} has no retained cleanup to retry"
+    );
+    run.update_held(&lock, |r| r.cleanup_pending = true)?;
+    worker::update_held(&run, &lock, id, |w| {
+        if let Some(WorkerOperation::Cleanup(op)) = &mut w.operation {
+            op.id = uuid::Uuid::new_v4();
+            op.retained_reason = None;
+        }
+        w.cleanup_completed = false;
+        w.agent.error.clear();
+    })?;
+    drop(lock);
+    ticker::poke(&ctx.state_dir());
+    println!("{id} cleanup retry is queued");
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::tests::SAMPLE;
-    use crate::herdr::{FakeHerdr, PaneId};
+    use crate::herdr::{FakeHerdr, PaneId, WorkspaceId};
     use crate::paths::Env;
     use crate::process::fake::{FakeRunner, fail, ok};
-    use std::path::PathBuf;
 
     fn pane(record: &crate::run::AgentRecord) -> PaneId {
         PaneId(record.pane_id.clone())
@@ -2194,8 +2229,26 @@ mod tests {
         assert!(String::from_utf8_lossy(&run(&["status", "--porcelain"]).stdout).is_empty());
     }
 
+    #[tokio::test]
+    async fn unreadable_exclude_content_is_preserved() {
+        let repo = tempfile::tempdir().unwrap();
+        let info = repo.path().join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        let original = [0xff, b'\n'];
+        std::fs::write(&exclude, original).unwrap();
+        let runner = FakeRunner::default();
+        runner.on("rev-parse", ok(".git\n"));
+        assert!(
+            exclude_from_git(&runner, repo.path().to_str().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(exclude).unwrap(), original);
+    }
+
     struct Setup {
-        home: tempfile::TempDir,
+        _home: tempfile::TempDir,
         env: Env,
         runner: FakeRunner,
         session: Session<FakeHerdr>,
@@ -2223,7 +2276,7 @@ mod tests {
                 socket: "/work.sock".into(),
             };
             let setup = Setup {
-                home,
+                _home: home,
                 env,
                 runner,
                 session,
@@ -2256,7 +2309,36 @@ mod tests {
             Run::load(&self.ctx().runs_dir(), "acme/DATA-1").unwrap()
         }
 
-        async fn start(&self, repo: &str, profile: &str) -> Result<Worker> {
+        async fn place_coordinator(&self) {
+            if !self
+                .run()
+                .record()
+                .unwrap()
+                .coordinator
+                .workspace_id
+                .is_empty()
+            {
+                return;
+            }
+            let placed = self
+                .session
+                .herdr
+                .workspace_create(self.run().dir.to_str().unwrap(), "coordinator")
+                .await
+                .unwrap();
+            self.run()
+                .update(|r| {
+                    r.coordinator.status = AgentStatus::Open;
+                    r.coordinator.workspace_id = placed.workspace.0;
+                    r.coordinator.tab_id = placed.tab;
+                    r.coordinator.pane_id = placed.pane.0;
+                    r.coordinator.cwd = self.run().dir.to_string_lossy().into_owned();
+                })
+                .unwrap();
+        }
+
+        async fn enqueue(&self, repo: &str, profile: &str) -> Result<Worker> {
+            self.place_coordinator().await;
             let args = WorkerStart {
                 repo: repo.into(),
                 profile: profile.into(),
@@ -2265,404 +2347,190 @@ mod tests {
             };
             worker_start(&self.ctx(), &self.session, "acme/DATA-1", &args).await
         }
-    }
 
-    fn brief_dir(setup: &Setup, branch: &str, id: &str) -> PathBuf {
-        let worktree = setup
-            .home
-            .path()
-            .join("worktrees")
-            .join(branch.replace('/', "-"));
-        PathBuf::from(worker::brief_dir(
-            &worktree.to_string_lossy(),
-            "acme/DATA-1",
-            id,
-        ))
-    }
-
-    fn force_brief_dir_error(path: &std::path::Path) {
-        if path.is_dir() {
-            std::fs::remove_dir_all(path).unwrap();
-        } else if path.exists() {
-            std::fs::remove_file(path).unwrap();
+        // Unrelated command tests use a placed worker fixture; lifecycle
+        // advancement itself is exercised by ticker scenarios.
+        async fn start(&self, repo: &str, profile: &str) -> Result<Worker> {
+            let w = self.enqueue(repo, profile).await?;
+            std::fs::create_dir_all(&w.worktree_path)?;
+            let brief = worker::brief_dir(&w.worktree_path, "acme/DATA-1", &w.id);
+            std::fs::create_dir_all(&brief)?;
+            files::write_atomic(
+                &worker::task_path(&self.run(), &w.id),
+                b"Make the change and open a PR.\n",
+            )?;
+            let placed = self
+                .session
+                .herdr
+                .tab_create(
+                    &WorkspaceId(self.run().record()?.coordinator.workspace_id),
+                    &w.worktree_path,
+                    "worker fixture",
+                )
+                .await?;
+            worker::update(&self.run(), &w.id, |w| {
+                w.operation = None;
+                w.worktree_hooks = Some(crate::config::WorktreeHooks::default());
+                w.brief_dir = brief;
+                w.agent.workspace_id = placed.workspace.0;
+                w.agent.tab_id = placed.tab;
+                w.agent.pane_id = placed.pane.0;
+                w.agent.cwd = w.worktree_path.clone();
+                w.agent.status = AgentStatus::Open;
+                w.agent.prompt_pending = true;
+            })
         }
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "not a directory").unwrap();
     }
 
     #[tokio::test]
-    async fn a_worker_is_placed_in_a_worktree_with_its_brief() {
+    async fn worker_start_persists_the_entire_request_before_external_work() {
         let setup = Setup::new(|c| c);
-        let w = setup.start("api", "standard").await.unwrap();
+        setup.place_coordinator().await;
+        let requests = setup.session.herdr.requests();
+        let w = setup.enqueue("api", "standard").await.unwrap();
         assert_eq!(w.branch, "herdr-linear-agent/acme/data-1/w1-change-api");
-        let root = setup.home.path().to_string_lossy();
         assert_eq!(
-            setup.session.herdr.worktrees(),
-            [(
-                format!("{root}/src/api"),
-                "herdr-linear-agent/acme/data-1/w1-change-api".into(),
-                "origin/main".into()
-            )]
+            w.worktree_path,
+            setup
+                .env
+                .state_dir()
+                .join("worktrees/acme/DATA-1/w1-api")
+                .to_string_lossy()
         );
+        assert_eq!(w.agent.status, AgentStatus::Pending);
+        assert!(!w.agent.prompt_pending);
+        assert!(w.agent.pane_id.is_empty());
+        let Some(WorkerOperation::Start(operation)) = &w.operation else {
+            panic!("missing durable start")
+        };
+        assert_eq!(operation.phase, StartPhase::SaveTask);
         assert_eq!(
-            setup.runner.lines("fetch"),
-            [format!("git -C {root}/src/api fetch origin main")]
+            operation.task.as_deref(),
+            Some("Make the change and open a PR.")
         );
-        // The exclusion failed (not a git repository) and the start went on.
-        assert_eq!(setup.runner.count("rev-parse --git-common-dir"), 1);
-        assert_eq!(w.agent.status, AgentStatus::Open);
-        assert!(w.agent.prompt_pending);
-        assert_eq!(w.agent.agent_name, "acme-data-1-w1");
-        assert_eq!(w.agent.kind, "claude");
-        assert_eq!(
-            (w.agent.pane_id.as_str(), w.agent.workspace_id.as_str()),
-            ("w1:p1", "w1")
-        );
-        assert_eq!(w.agent.cwd, w.worktree_path);
-        assert!(w.brief_dir.ends_with(".herdr-linear-agent/acme-DATA-1-w1"));
-        let brief = std::fs::read_to_string(Path::new(&w.brief_dir).join("brief.md")).unwrap();
-        assert!(brief.contains("Make the change and open a PR."));
-        assert!(!brief.contains("previous attempt"));
-        let task = std::fs::read_to_string(worker::task_path(&setup.run(), "w1")).unwrap();
-        assert_eq!(task, "Make the change and open a PR.\n");
+        assert_eq!(operation.setup_cursor, 0);
         assert!(
-            outbox::pending(&setup.run()).is_empty(),
-            "`Start worker` is queued when the launch prompt goes out"
+            matches!(&operation.placement, PlacementIntent::Requested { workspace, .. } if workspace == "w1")
         );
         assert_eq!(worker::load(&setup.run(), "w1").unwrap(), w);
+        assert!(!Path::new(&w.worktree_path).exists());
+        assert!(!worker::task_path(&setup.run(), "w1").exists());
+        assert!(setup.runner.calls.lock().unwrap().is_empty());
+        assert_eq!(setup.session.herdr.requests(), requests);
+        assert!(outbox::pending(&setup.run()).is_empty());
     }
 
     #[tokio::test]
-    async fn limits_and_names_are_checked_before_anything_is_placed() {
+    async fn limits_and_names_are_checked_before_external_work() {
         let setup =
             Setup::new(|c| c.replace("[herdr]", "[limits]\nmax_workers_per_run = 1\n\n[herdr]"));
-        setup.start("api", "standard").await.unwrap();
-        let error = setup
-            .start("web", "standard")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("max_workers_per_run"), "{error}");
-        let error = setup
-            .start("api", "standard")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("one worker per repository"), "{error}");
-        assert!(setup.start("nope", "standard").await.is_err());
-        let error = setup
-            .start("web", "coordinator")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not a worker profile"), "{error}");
-        assert_eq!(setup.session.herdr.worktrees().len(), 1);
-        assert_eq!(worker::list(&setup.run()).len(), 1);
-
-        // A stopped worker frees its repository and its place.
-        worker::update(&setup.run(), "w1", |w| {
-            w.agent.status = AgentStatus::Stopped
-        })
-        .unwrap();
-        assert_eq!(setup.start("api", "deep").await.unwrap().id, "w2");
-    }
-
-    #[tokio::test]
-    async fn the_agent_limit_counts_every_active_run() {
-        let setup = Setup::new(|c| c.replace("[herdr]", "[limits]\nmax_agents = 2\n\n[herdr]"));
-        setup
-            .run()
-            .update(|r| r.coordinator.status = AgentStatus::Open)
-            .unwrap();
-        setup.start("api", "standard").await.unwrap();
-        let error = setup
-            .start("web", "standard")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "the limit of 2 agents is reached");
-    }
-
-    #[tokio::test]
-    async fn a_failed_fetch_writes_no_worker() {
-        let setup = Setup::new(|c| c);
-        setup.runner.on(
-            "fetch origin",
-            fail(128, "fatal: couldn't find remote ref main\nmore"),
-        );
-        let error = setup
-            .start("api", "standard")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "git fetch failed: fatal: couldn't find remote ref main"
-        );
-        assert!(worker::list(&setup.run()).is_empty());
-        assert!(setup.session.herdr.worktrees().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_failed_placement_leaves_a_failed_worker() {
-        let setup = Setup::new(|c| c);
-        setup.session.herdr.set_down(true);
-        assert!(setup.start("api", "standard").await.is_err());
-        let w = worker::load(&setup.run(), "w1").unwrap();
-        assert_eq!(w.agent.status, AgentStatus::Failed);
-        assert!(
-            w.agent.error.contains("could not create the worktree"),
-            "{}",
-            w.agent.error
-        );
-        assert_eq!(
-            std::fs::read_to_string(worker::task_path(&setup.run(), "w1")).unwrap(),
-            "Make the change and open a PR.\n"
-        );
-        // A restart places it again from its base.
-        setup.session.herdr.set_down(false);
-        let w = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
-            .await
-            .unwrap();
-        assert_eq!((w.agent.status, w.restarts), (AgentStatus::Open, 1));
-        assert_eq!(setup.session.herdr.worktrees().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_worker_task_write_failure_does_not_place_a_worktree() {
-        let setup = Setup::new(|c| c);
-        std::fs::create_dir_all(worker::task_path(&setup.run(), "w1")).unwrap();
-
-        let error = setup.start("api", "standard").await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("could not persist the task for worker w1"),
-            "{error:#}"
-        );
-        let failed = worker::load(&setup.run(), "w1").unwrap();
-        assert_eq!(failed.agent.status, AgentStatus::Stopped);
-        assert!(failed.agent.error.contains("could not write"));
-        assert!(setup.session.herdr.requests().is_empty());
-        assert!(setup.session.herdr.worktrees().is_empty());
-
-        std::fs::remove_dir_all(worker::task_path(&setup.run(), "w1")).unwrap();
-        let retried = setup.start("api", "standard").await.unwrap();
-        assert_eq!(
-            (retried.id.as_str(), retried.agent.status),
-            ("w2", AgentStatus::Open)
-        );
-        assert_eq!(retried.repo, "api");
-        assert_eq!(setup.session.herdr.worktrees().len(), 1);
-        assert_eq!(
-            setup.session.herdr.label("w1").as_deref(),
-            Some("acme/DATA-1 · w2")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_worker_start_brief_failure_persists_placement_for_retry() {
-        let setup = Setup::new(|c| c);
-        let branch = "herdr-linear-agent/acme/data-1/w1-change-api";
-        let worktree = setup
-            .home
-            .path()
-            .join("worktrees")
-            .join(branch.replace('/', "-"));
-        let brief = brief_dir(&setup, branch, "w1");
-        force_brief_dir_error(&brief);
-
-        let error = setup.start("api", "standard").await.unwrap_err();
-        assert!(error.to_string().contains("could not create"), "{error:#}");
+        setup.enqueue("api", "standard").await.unwrap();
         assert!(
             setup
-                .session
-                .herdr
-                .requests()
-                .contains(&"worktree.create".into())
+                .enqueue("web", "standard")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("max_workers_per_run")
         );
-
-        let failed = worker::load(&setup.run(), "w1").unwrap();
-        assert_eq!(failed.agent.status, AgentStatus::Failed);
-        assert!(!failed.restarting);
-        assert!(!failed.agent.prompt_pending);
-        assert_eq!(failed.agent.workspace_id, "w1");
-        assert_eq!(failed.agent.pane_id, "w1:p1");
-        assert_eq!(failed.worktree_path, worktree.to_string_lossy());
-        assert_eq!(failed.brief_dir, brief.to_string_lossy());
-        assert!(failed.agent.error.contains("could not create"));
-
-        std::fs::remove_file(&brief).unwrap();
-        let retried = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            (retried.agent.status, retried.restarts),
-            (AgentStatus::Open, 1)
+        assert!(
+            setup
+                .enqueue("api", "standard")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("one worker per repository")
         );
-        assert_eq!(retried.agent.pane_id, "w2:p1");
-        assert_eq!(retried.worktree_path, worktree.to_string_lossy());
+        assert!(setup.enqueue("nope", "standard").await.is_err());
+        assert!(
+            setup
+                .enqueue("web", "coordinator")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not a worker profile")
+        );
+        assert_eq!(worker::list(&setup.run()).len(), 1);
+        assert!(setup.runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_agent_limit_includes_pending_workers() {
+        let setup = Setup::new(|c| c.replace("[herdr]", "[limits]\nmax_agents = 2\n\n[herdr]"));
+        setup.enqueue("api", "standard").await.unwrap();
         assert_eq!(
-            setup.session.herdr.label("w2").as_deref(),
-            Some("acme/DATA-1 · w1")
+            setup
+                .enqueue("web", "standard")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "the limit of 2 agents is reached"
         );
     }
 
     #[tokio::test]
-    async fn a_worker_restart_brief_failure_persists_placement_for_retry() {
+    async fn worker_start_without_a_run_workspace_writes_nothing() {
         let setup = Setup::new(|c| c);
-        let original = setup.start("api", "standard").await.unwrap();
-        worker::update(&setup.run(), "w1", |w| {
-            w.restarts = worker::MAX_RESTARTS - 1;
-        })
-        .unwrap();
-        let brief = PathBuf::from(&original.brief_dir);
-        force_brief_dir_error(&brief);
-
-        let error = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+        let args = WorkerStart {
+            repo: "api".into(),
+            profile: "standard".into(),
+            title: "Change API".into(),
+            task: "Task".into(),
+        };
+        let error = worker_start(&setup.ctx(), &setup.session, "acme/DATA-1", &args)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("could not create"), "{error:#}");
-        assert!(
-            setup
-                .session
-                .herdr
-                .requests()
-                .contains(&"worktree.open".into())
-        );
-
-        let failed = worker::load(&setup.run(), "w1").unwrap();
-        assert_eq!(failed.agent.status, AgentStatus::Failed);
-        assert!(!failed.restarting);
-        assert!(!failed.agent.prompt_pending);
-        assert_eq!(failed.agent.workspace_id, "w2");
-        assert_eq!(failed.agent.pane_id, "w2:p1");
-        assert_eq!(failed.worktree_path, original.worktree_path);
-        assert_eq!(failed.brief_dir, original.brief_dir);
-        assert!(failed.agent.error.contains("could not create"));
-        assert_eq!(failed.restarts, worker::MAX_RESTARTS - 1);
-
-        std::fs::remove_file(&brief).unwrap();
-        let retried = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            (retried.agent.status, retried.restarts),
-            (AgentStatus::Open, 2)
-        );
-        assert_eq!(retried.agent.pane_id, "w3:p1");
-        assert_eq!(retried.worktree_path, original.worktree_path);
-        assert_eq!(
-            setup.session.herdr.closed(),
-            [WorkspaceId("w1".into()), WorkspaceId("w2".into())]
-        );
+        assert!(error.to_string().contains("workspace"), "{error:#}");
+        assert!(worker::list(&setup.run()).is_empty());
+        assert!(setup.runner.calls.lock().unwrap().is_empty());
+        assert!(setup.session.herdr.requests().is_empty());
     }
 
     #[tokio::test]
-    async fn a_restart_with_a_missing_task_does_not_reopen_the_worker() {
-        let setup = Setup::new(|c| c);
-        let original = setup.start("api", "standard").await.unwrap();
-        std::fs::remove_file(worker::task_path(&setup.run(), "w1")).unwrap();
-        let requests = setup.session.herdr.requests();
-
-        let result = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None).await;
-        assert!(
-            result.is_err(),
-            "a missing task must prevent reopen, got {result:?}"
-        );
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains("could not read task for worker w1"),
-            "{error}"
-        );
-        assert_eq!(setup.session.herdr.requests(), requests);
-        assert_eq!(worker::load(&setup.run(), "w1").unwrap(), original);
-    }
-
-    /// `git worktree list --porcelain` naming the fake's worktree of `branch`.
-    fn listing(setup: &Setup, branch: &str) -> String {
-        let path = setup
-            .home
-            .path()
-            .join("worktrees")
-            .join(branch.replace('/', "-"));
-        format!(
-            "worktree {}/src/api\nHEAD 1111\nbranch refs/heads/main\n\nworktree {}\nHEAD 2222\nbranch refs/heads/{branch}\n\n",
-            setup.home.path().display(),
-            path.display()
-        )
-    }
-
-    #[tokio::test]
-    async fn a_worktree_created_without_an_answer_is_opened_not_failed() {
-        let setup = Setup::new(|c| c);
-        let branch = "herdr-linear-agent/acme/data-1/w1-change-api";
-        setup
-            .runner
-            .on("worktree list --porcelain", ok(&listing(&setup, branch)));
-        setup.session.herdr.next_placement_unknown();
-        let w = setup.start("api", "standard").await.unwrap();
-        assert_eq!(w.agent.status, AgentStatus::Open);
-        assert_eq!(setup.session.herdr.worktrees().len(), 1);
-        assert_eq!(
-            setup.session.herdr.label("w2").as_deref(),
-            Some("acme/DATA-1 · w1")
-        );
-        let opened: Vec<String> = setup
-            .session
-            .herdr
-            .requests()
-            .into_iter()
-            .filter(|m| m.starts_with("worktree."))
-            .collect();
-        assert_eq!(opened, ["worktree.create", "worktree.open"]);
-        assert_eq!(w.agent.pane_id, "w2:p1");
-        assert!(
-            w.worktree_path
-                .ends_with("herdr-linear-agent-acme-data-1-w1-change-api")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_restart_opens_the_worktree_a_lost_answer_left_behind() {
-        let setup = Setup::new(|c| c);
-        setup.session.herdr.next_placement_unknown();
-        assert!(setup.start("api", "standard").await.is_err());
-        let failed = worker::load(&setup.run(), "w1").unwrap();
-        assert_eq!(failed.agent.status, AgentStatus::Failed);
-        assert_eq!(
-            std::fs::read_to_string(worker::task_path(&setup.run(), "w1")).unwrap(),
-            "Make the change and open a PR.\n"
-        );
-        setup.runner.on(
-            "worktree list --porcelain",
-            ok(&listing(&setup, &failed.branch)),
-        );
-        let w = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            setup.session.herdr.worktrees().len(),
-            1,
-            "not created again"
-        );
-        assert_eq!(
-            (w.agent.status, w.agent.pane_id.as_str()),
-            (AgentStatus::Open, "w2:p1")
-        );
-    }
-
-    #[tokio::test]
-    async fn restarts_switch_profiles_and_are_limited() {
-        let setup = Setup::new(|c| c);
-        setup.start("api", "standard").await.unwrap();
-        worker::update(&setup.run(), "w1", |w| {
-            w.report_hash = "h".into();
-            w.announced_report_hash = "h".into();
-            w.agent.last_group = "reported".into();
-            w.agent.launch_attempts = 2;
+    async fn cleanup_retry_preserves_the_failed_phase_and_fences_previous_results() {
+        let setup = Setup::new(|config| config);
+        let worker = setup.start("api", "standard").await.unwrap();
+        let old_id = uuid::Uuid::new_v4();
+        worker::update(&setup.run(), &worker.id, |w| {
+            w.operation = Some(WorkerOperation::Cleanup(crate::worker::CleanupOperation {
+                id: old_id,
+                phase: crate::worker::CleanupPhase::PostRemove,
+                hook_cursor: 2,
+                hooks: Default::default(),
+                placement: None,
+                placements: vec![],
+                placement_intent: None,
+                retained_reason: Some("hook failed".into()),
+            }));
+            w.agent.error = "hook failed".into();
         })
         .unwrap();
+        assert!(worker_retry_cleanup(&setup.ctx(), "acme/DATA-1", &worker.id).is_err());
+        setup.run().update(|r| r.status = Status::Closed).unwrap();
+        setup.run().update(|r| r.cleanup_pending = true).unwrap();
+        let interrupted = worker::load(&setup.run(), &worker.id).unwrap();
+        assert!(
+            matches!(&interrupted.operation, Some(WorkerOperation::Cleanup(op)) if op.id == old_id && op.retained_reason.is_some())
+        );
+        worker_retry_cleanup(&setup.ctx(), "acme/DATA-1", &worker.id).unwrap();
+        let saved = worker::load(&setup.run(), &worker.id).unwrap();
+        let Some(WorkerOperation::Cleanup(operation)) = saved.operation else {
+            panic!("missing cleanup")
+        };
+        assert_ne!(operation.id, old_id);
+        assert_eq!(operation.phase, crate::worker::CleanupPhase::PostRemove);
+        assert_eq!(operation.hook_cursor, 2);
+        assert!(operation.retained_reason.is_none());
+        assert!(saved.agent.error.is_empty());
+        assert!(setup.run().record().unwrap().cleanup_pending);
+        assert!(worker_retry_cleanup(&setup.ctx(), "acme/DATA-1", &worker.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_restart_preserves_the_old_pane_and_captures_the_new_intent() {
+        let setup = Setup::new(|c| c);
+        let original = setup.start("api", "standard").await.unwrap();
+        let requests = setup.session.herdr.requests();
         let restarted = worker_restart(
             &setup.ctx(),
             &setup.session,
@@ -2672,51 +2540,176 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            (restarted.agent.kind.as_str(), restarted.restarts),
-            ("codex", 1)
-        );
-        assert!(restarted.agent.prompt_pending);
-        assert_eq!(restarted.agent.profile, "deep");
-        assert_eq!(restarted.agent.pane_id, "w2:p1");
-        assert_eq!(
-            (
-                restarted.report_hash.as_str(),
-                restarted.announced_report_hash.as_str(),
-                restarted.agent.last_group.as_str(),
-                restarted.agent.launch_attempts
-            ),
-            ("", "h", "", 0)
-        );
-        assert_eq!(
-            setup.session.herdr.closed(),
-            [WorkspaceId("w1".into())],
-            "the old workspace is closed; the checkout stays"
-        );
+        assert!(restarted.restarting);
+        assert!(!restarted.agent.prompt_pending);
+        assert_eq!(restarted.agent.pane_id, original.agent.pane_id);
+        assert_eq!(restarted.restarts, 0, "a queued restart has not completed");
+        let Some(WorkerOperation::Restart(operation)) = &restarted.operation else {
+            panic!("missing durable restart")
+        };
+        assert_eq!(operation.phase, RestartPhase::CreateTab);
+        assert_eq!(operation.previous.pane, original.agent.pane_id);
+        assert_eq!(operation.profile, "deep");
+        assert_eq!(operation.kind, "codex");
+        assert!(!operation.create_checkout);
         assert!(
-            std::fs::read_to_string(Path::new(&restarted.brief_dir).join("brief.md"))
-                .unwrap()
-                .contains("previous attempt")
+            matches!(&operation.placement, PlacementIntent::Requested { workspace, .. } if workspace == "w1")
         );
-        let error = worker_restart(
+        assert_eq!(setup.session.herdr.requests(), requests);
+        assert!(setup.runner.calls.lock().unwrap().is_empty());
+        assert!(
+            worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pending lifecycle")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_start_resumes_the_saved_task_and_cursor_without_a_task_file() {
+        let setup = Setup::new(|c| c);
+        let original = setup.enqueue("api", "standard").await.unwrap();
+        worker::update(&setup.run(), &original.id, |w| {
+            w.agent.status = AgentStatus::Failed;
+            w.agent.error = "disk full".into();
+            let Some(WorkerOperation::Start(op)) = &mut w.operation else {
+                unreachable!()
+            };
+            op.setup_cursor = 2;
+        })
+        .unwrap();
+        let retried = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+            .await
+            .unwrap();
+        let Some(WorkerOperation::Start(op)) = &retried.operation else {
+            panic!("start lost")
+        };
+        let Some(WorkerOperation::Start(old)) = &original.operation else {
+            unreachable!()
+        };
+        assert_ne!(op.id, old.id);
+        assert_eq!(op.phase, StartPhase::SaveTask);
+        assert_eq!(op.task, old.task);
+        assert_eq!(op.setup_cursor, 2);
+        assert_eq!(op.hooks, old.hooks);
+        assert!(op.retry_counted);
+        assert_eq!(retried.restarts, 1);
+        assert!(retried.agent.error.is_empty());
+        assert!(!worker::task_path(&setup.run(), "w1").exists());
+        assert!(
+            worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_restart_keeps_the_old_agent_identity_until_its_pane_is_closed() {
+        let setup = Setup::new(|c| c);
+        let original = setup.start("api", "standard").await.unwrap();
+        let queued = worker_restart(
             &setup.ctx(),
             &setup.session,
             "acme/DATA-1",
             "w1",
-            Some("coordinator"),
+            Some("deep"),
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("not a worker profile"), "{error}");
-        worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+        .unwrap();
+        worker::update(&setup.run(), "w1", |w| {
+            w.agent.status = AgentStatus::Failed;
+            w.agent.error = "close failed".into();
+            let Some(WorkerOperation::Restart(op)) = &mut w.operation else {
+                unreachable!()
+            };
+            op.phase = RestartPhase::ClosePreviousPane;
+            op.setup_cursor = 3;
+        })
+        .unwrap();
+        let retried = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
             .await
             .unwrap();
-        let error = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+        let Some(WorkerOperation::Restart(op)) = &retried.operation else {
+            panic!("restart lost")
+        };
+        let Some(WorkerOperation::Restart(old)) = &queued.operation else {
+            unreachable!()
+        };
+        assert_ne!(op.id, old.id);
+        assert_eq!(op.phase, RestartPhase::ClosePreviousPane);
+        assert_eq!(op.setup_cursor, 3);
+        assert_eq!(op.previous, old.previous);
+        assert_eq!(op.profile, "deep");
+        assert_eq!(op.kind, "codex");
+        assert_eq!(retried.agent.profile, original.agent.profile);
+        assert_eq!(retried.agent.kind, original.agent.kind);
+        assert_eq!(retried.agent.pane_id, original.agent.pane_id);
+        assert_eq!(retried.restarts, 1);
+        assert!(op.retry_counted);
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_the_task_and_limit_checks_before_queuing() {
+        let setup = Setup::new(|c| c);
+        let original = setup.start("api", "standard").await.unwrap();
+        assert!(
+            worker_restart(
+                &setup.ctx(),
+                &setup.session,
+                "acme/DATA-1",
+                "w1",
+                Some("coordinator")
+            )
             .await
             .unwrap_err()
-            .to_string();
-        assert!(error.contains("limit is 2"), "{error}");
+            .to_string()
+            .contains("not a worker profile")
+        );
+        std::fs::remove_file(worker::task_path(&setup.run(), "w1")).unwrap();
+        let requests = setup.session.herdr.requests();
+        assert!(
+            worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("could not read task")
+        );
+        assert_eq!(worker::load(&setup.run(), "w1").unwrap(), original);
+        assert_eq!(setup.session.herdr.requests(), requests);
+        files::write_atomic(&worker::task_path(&setup.run(), "w1"), b"Task").unwrap();
+        worker::update(&setup.run(), "w1", |w| w.restarts = worker::MAX_RESTARTS).unwrap();
+        assert!(
+            worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("limit is 2")
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_targets_the_run_workspace_for_a_legacy_worker() {
+        let setup = Setup::new(|c| c);
+        setup.start("api", "standard").await.unwrap();
+        worker::update(&setup.run(), "w1", |w| {
+            w.agent.workspace_id = "legacy".into();
+            w.agent.pane_id = "legacy:p1".into();
+            w.worktree_hooks = None;
+        })
+        .unwrap();
+        let restarted = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+            .await
+            .unwrap();
+        let Some(WorkerOperation::Restart(operation)) = restarted.operation else {
+            panic!("missing durable restart")
+        };
+        assert_eq!(operation.previous.workspace, "legacy");
+        assert_eq!(operation.previous.pane, "legacy:p1");
+        assert!(
+            matches!(operation.placement, PlacementIntent::Requested { workspace, .. } if workspace == "w1")
+        );
+        assert_eq!(operation.hooks, crate::config::WorktreeHooks::default());
     }
 
     #[tokio::test]
@@ -2752,7 +2745,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(herdr.prompts_to("w1:p1"), ["Also add a test."]);
+        assert_eq!(herdr.prompts_to(&w.agent.pane_id), ["Also add a test."]);
         let task = std::fs::read_to_string(worker::task_path(&setup.run(), "w1")).unwrap();
         assert!(task.contains("## Follow-ups") && task.contains("Also add a test."));
     }

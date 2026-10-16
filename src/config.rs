@@ -230,6 +230,83 @@ pub struct Repository {
     pub base: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub worktree: WorktreeHooks,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorktreeHooks {
+    pub copy: Vec<String>,
+    pub symlink: Vec<String>,
+    pub post_create: Vec<String>,
+    pub post_create_timeout_seconds: u64,
+    pub post_remove: Vec<String>,
+    pub post_remove_timeout_seconds: u64,
+}
+
+impl Default for WorktreeHooks {
+    fn default() -> Self {
+        Self {
+            copy: Vec::new(),
+            symlink: Vec::new(),
+            post_create: Vec::new(),
+            post_create_timeout_seconds: 600,
+            post_remove: Vec::new(),
+            post_remove_timeout_seconds: 600,
+        }
+    }
+}
+
+impl WorktreeHooks {
+    fn validate(&self, repository: &str) -> Result<()> {
+        let mut destinations = Vec::<PathBuf>::new();
+        for (key, entries) in [("copy", &self.copy), ("symlink", &self.symlink)] {
+            for entry in entries {
+                let path = Path::new(entry);
+                ensure!(
+                    !entry.is_empty()
+                        && path.components().next().is_some()
+                        && path
+                            .components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "repositories.{repository}.worktree.{key}: `{entry}` must stay inside the repository"
+                );
+                ensure!(
+                    !destinations
+                        .iter()
+                        .any(|p| path.starts_with(p) || p.starts_with(path)),
+                    "repositories.{repository}.worktree.{key}: `{entry}` conflicts with another destination"
+                );
+                destinations.push(path.to_path_buf());
+            }
+        }
+        for (key, commands) in [
+            ("post_create", &self.post_create),
+            ("post_remove", &self.post_remove),
+        ] {
+            ensure!(
+                commands.iter().all(|s| !s.trim().is_empty()),
+                "repositories.{repository}.worktree.{key}: commands must not be blank"
+            );
+        }
+        for (key, seconds) in [
+            (
+                "post_create_timeout_seconds",
+                self.post_create_timeout_seconds,
+            ),
+            (
+                "post_remove_timeout_seconds",
+                self.post_remove_timeout_seconds,
+            ),
+        ] {
+            ensure!(
+                (1..=86400).contains(&seconds),
+                "repositories.{repository}.worktree.{key} must be between 1 and 86400"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// A profile with its base chain resolved: what launch, routing and validation
@@ -614,6 +691,7 @@ impl Config {
                 !repo.base.trim().is_empty() && !repo.base.starts_with('-'),
                 "repositories.{name}.base is not a branch name"
             );
+            repo.worktree.validate(name)?;
         }
         for (name, profile) in &self.profiles {
             ensure!(
@@ -1004,7 +1082,7 @@ fn resolve(name: &str, files: &BTreeMap<String, (ProfileFile, Option<String>)>) 
     })
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -1016,6 +1094,30 @@ fn valid_name(name: &str) -> bool {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_defaults_and_validation_cover_omitted_fields() {
+        let absent: Repository = toml::from_str("path='/src/api'\nbase='main'").unwrap();
+        let present: Repository =
+            toml::from_str("path='/src/api'\nbase='main'\n[worktree]\ncopy=['.env']").unwrap();
+        assert_eq!(absent.worktree, WorktreeHooks::default());
+        assert_eq!(present.worktree.post_create_timeout_seconds, 600);
+        assert_eq!(present.worktree.post_remove_timeout_seconds, 600);
+        present.worktree.validate("api").unwrap();
+        for text in [
+            "copy=['../x']",
+            "copy=['/x']",
+            "copy=['.']",
+            "copy=['x']\nsymlink=['x/y']",
+            "post_create=[' ']",
+            "post_remove_timeout_seconds=0",
+            "post_create_timeout_seconds=86401",
+        ] {
+            let hooks: WorktreeHooks = toml::from_str(text).unwrap();
+            assert!(hooks.validate("api").is_err(), "{text}");
+        }
+        assert!(toml::from_str::<WorktreeHooks>("post_creat=[]").is_err());
+    }
 
     /// A config with every section, used across the test suite. Its profiles
     /// are [`SAMPLE_PROFILES`].
@@ -1040,6 +1142,14 @@ session = "work"
 path = "/src/api"
 base = "main"
 description = "The API server"
+
+[repositories.api.worktree]
+copy = []
+symlink = []
+post_create = []
+post_create_timeout_seconds = 600
+post_remove = []
+post_remove_timeout_seconds = 600
 
 [repositories.web]
 path = "/src/web"
