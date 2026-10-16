@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update Securefix caller workflows to v0.2.20 (#167)
 - update Securefix caller workflows to v0.2.19 (#165)
 
 ## [0.8.0] - 2026-10-16
