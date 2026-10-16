@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-16
+
+
+### Bug Fixes
+
+- update rust crate rusqlite to 0.40 (#161)
+- recover detached runs with comment approval (#138)
+- respect queued prompts and complete coordinator turns (#115)
+- restore the pull request number for workspace labels (#109)
+- identify tickets in agent workspace labels (#108)
+
+
+### Documentation
+
+- explain the historical PR number repair (#113)
+- document repository development workflow (#101)
+
+
+### Features
+
+- keep issue agents in one Herdr workspace (#163)
+- add postmortem supervisor (#157)
+- add optional merge decision agent (#151)
+- restore the factory workflow and authorize PR merges (#146)
+- add shared runs and authorized workflow completion (#144)
+
+
+### Maintenance
+
+- update dependency rust to v1.99.1 (#162)
+- update dependency jdx/mise to v2026.10.11 (#160)
+- update Securefix caller workflows to v0.2.18 (#159)
+- update Securefix caller workflows to v0.2.17 (#158)
+- update Securefix caller workflows to v0.2.16 (#155)
+- update dependency jdx/mise to v2026.10.10 (#154)
+- update Securefix caller workflows to v0.2.15 (#153)
+- update Securefix caller workflows to v0.2.14 (#152)
+- update rust crate tokio to v1.53.3 (#150)
+- update dependency jdx/mise to v2026.10.9 (#149)
+- update actions/create-github-app-token action to v3.3.0 (#148)
+- update rust crate sha2 to v0.11.1 (#147)
+- update jdx/mise-action action to v5.1.2 (#143)
+- update rust crate serde_json to v1.0.154 (#139)
+- update dependency jdx/mise to v2026.10.8 (#136)
+- update Securefix caller workflows to v0.2.12 (#137)
+- update Securefix caller workflows to v0.2.11 (#135)
+- update Securefix caller workflows to v0.2.10 (#134)
+- update rust crate serde_json to v1.0.152 (#130)
+- update Securefix caller workflows to v0.2.9 (#133)
+- update Securefix caller workflows to v0.2.8 (#132)
+- update rust crate toml to v1.1.8 (#116)
+- update Securefix caller workflows to v0.2.7 (#129)
+- update Securefix caller workflows to v0.2.6 (#128)
+- update Securefix caller workflows (#127)
+- update Securefix caller workflows (#126)
+- update dependency jdx/mise to v2026.10.7 (#114)
+- update rust crate uuid to v1.28.0 (#124)
+- update Securefix caller workflows (#125)
+- update Securefix caller workflows (#123)
+- update Securefix caller workflows (#122)
+- update Securefix caller workflows (#121)
+- update Securefix caller workflows (#118)
+- update rust crate toml to v1.1.7 (#112)
+- route human merge requests through Securefix (#110)
+- update dependency jdx/mise to v2026.10.4 (#111)
+- update rust crate zeroize to v1.9.1 (#107)
+- update rust crate jiff to v0.2.38 (#106)
+- update dependency jdx/mise to v2026.10.3 (#105)
+- update jdx/mise-action action to v5.1.1 (#104)
+- update dependency jdx/mise to v2026.10.2 (#103)
+
+
+### Miscellaneous
+
+- undo merged PR #144 (#145)
+
 ## [0.7.1] - 2026-10-04
 
 
