@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- request merges through Securefix comments (#174)
 - synchronize descendant cancellation test (#168)
 
 
