@@ -202,6 +202,35 @@ url = "https://github.com/suzuki-shunsuke/pinact/releases/download/v5.0.0/pinact
 url_api = "https://api.github.com/repos/suzuki-shunsuke/pinact/releases/assets/558638100"
 provenance = "github-attestations"
 
+[[tools."github:github/gh-actions-lock"]]
+version = "0.2.0"
+backend = "github:github/gh-actions-lock"
+
+[tools."github:github/gh-actions-lock"."platforms.linux-arm64"]
+checksum = "sha256:c79a279d6b0b635dc89ab6d38d0ecf98ff83abcee7bb483cd53353b74cd4f6df"
+url = "https://github.com/github/gh-actions-lock/releases/download/v0.2.0/linux-arm64"
+url_api = "https://api.github.com/repos/github/gh-actions-lock/releases/assets/634768083"
+provenance = "github-attestations"
+
+[tools."github:github/gh-actions-lock"."platforms.linux-x64"]
+checksum = "sha256:79ec84c191667fd935a277e6fd3662cf5d3669cccc9e99998731d8f306f373b6"
+url = "https://github.com/github/gh-actions-lock/releases/download/v0.2.0/linux-amd64"
+url_api = "https://api.github.com/repos/github/gh-actions-lock/releases/assets/634768078"
+provenance = "github-attestations"
+
+[tools."github:github/gh-actions-lock"."platforms.macos-arm64"]
+checksum = "sha256:eef4de166006eeec7d2d1bbb780371f6f34a397a18f0b3638547eb7c8432b512"
+url = "https://github.com/github/gh-actions-lock/releases/download/v0.2.0/darwin-arm64"
+url_api = "https://api.github.com/repos/github/gh-actions-lock/releases/assets/634768051"
+provenance = "github-attestations"
+provenance_verified = true
+
+[tools."github:github/gh-actions-lock"."platforms.macos-x64"]
+checksum = "sha256:23832d88761af62021b75b12a97663483d753a90c4951550874bcb2ce3b7d1c6"
+url = "https://github.com/github/gh-actions-lock/releases/download/v0.2.0/darwin-amd64"
+url_api = "https://api.github.com/repos/github/gh-actions-lock/releases/assets/634768048"
+provenance = "github-attestations"
+
 [[tools.rust]]
 version = "1.99.1"
 backend = "core:rust"

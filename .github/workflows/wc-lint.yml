@@ -37,6 +37,11 @@ jobs:
           PINACT_GITHUB_TOKEN: ${{ github.token }}
         run: pinact run --check --verify-comment
 
+      - name: Verify workflow lockfile
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: mise run actions-lock-verify
+
       - name: Ensure checkout credentials are disabled
         run: |
           disable-checkout-persist-credentials

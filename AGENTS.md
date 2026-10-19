@@ -95,6 +95,7 @@ For local macOS builds that access real Linear credentials, follow [docs/develop
 ## GitHub Actions and credentials
 
 - Pin every GitHub Action to an immutable commit SHA and keep `persist-credentials: false` on checkout steps.
+- After changing workflow or composite action dependencies, run `mise run actions-lock` and commit `.github/workflows/actions.lock` with the workflow changes. Never edit the lockfile by hand. Run `mise run actions-lock-verify` with GitHub authentication before opening a pull request; `mise run lint` includes an offline coverage check.
 - Keep workflow permissions at the least-privilege level.
 - Do not use `secrets: inherit`; pass each secret explicitly.
 - Use Securefix for automated workflow fixes and signed machine commits.
