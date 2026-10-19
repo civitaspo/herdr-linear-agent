@@ -587,7 +587,7 @@ do not automatically accept moved or unreachable commits.
 
 External reusable workflows use the lockfile in their defining repository.
 See [Securefix setup](docs/securefix.md#workflow-dependency-lockfiles) for the
-current coverage and the remaining policy rollout.
+current coverage and the repository's Require lockfile policy.
 
 ### Local macOS development
 

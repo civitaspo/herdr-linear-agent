@@ -48,9 +48,10 @@ must regenerate the lockfile before pushing dependency changes; see the
 Reusable workflows defined in `civitaspo/securefix-server` need a lockfile at
 their referenced server revision to cover their internal dependencies. This
 repository's lockfile does not provide that coverage. Adopt locking in the
-server separately and update the client references to that release before
-enabling the **Require lockfile** policy. Repository-wide lockfile enforcement
-is deferred until that server work and the client workflow checks are complete.
+server separately and update the client references to that release as a follow-up.
+The **Require lockfile** Actions policy is enabled for all workflows in
+`herdr-linear-agent`. It does not add lockfile coverage for the server's internal
+dependencies. The server repository and its settings are managed separately.
 
 ## Dependency updates and repository settings
 
@@ -58,8 +59,8 @@ Renovate owns version updates for GitHub Actions and mise tools. Non-major updat
 
 Renovate regenerates `actions.lock` in GitHub Actions update pull requests. Its
 `ghActionsLock` constraint matches the generator version in `mise.toml`; update
-both pins together when upgrading the generator. Confirm that an actual
-Renovate dependency update includes both its workflow changes and the lockfile
-before enabling the Require lockfile policy.
+both pins together when upgrading the generator. Review actual Renovate
+dependency updates to confirm that they include both workflow changes and the
+lockfile.
 
 Squash-only merges, auto-merge, branch-update suggestions, signed commits, the single required `status-check`, and the `civitaspo-bot` collaborator are reconciled from the `repo-settings/` files in `civitaspo/securefix-server`. See the server's [repository settings documentation](https://github.com/civitaspo/securefix-server/blob/main/docs/repo-settings.md).
