@@ -560,7 +560,38 @@ mise run test
 mise run build
 ```
 
-**Local macOS development only:** if you rebuild and run the plugin against
+### Workflow dependencies
+
+GitHub Actions dependencies are recorded in `.github/workflows/actions.lock`.
+The workflows also keep their full commit SHA pins. mise installs the pinned
+`gh-actions-lock` binary; no GitHub CLI extension installation is needed.
+
+After adding, removing, or changing workflow or composite action dependencies,
+authenticate with `gh auth login` (or set `GH_TOKEN`) and run:
+
+```bash
+mise run actions-lock
+mise run actions-lock-verify
+```
+
+Commit the generated lockfile together with the workflow changes. Never edit it
+by hand. `mise run lint` checks coverage offline; pull request and push CI verify
+the pins against GitHub. Regenerate before pushing: a workflow with missing
+lockfile entries can be rejected before its autofix job starts. Renovate updates
+the lockfile in its GitHub Actions update pull requests.
+
+Review changed commits and investigate changes to `owner_id` or `repo_id`.
+The generator preserves existing pins. If an upstream reference moves, review
+the upstream history before using `mise exec -- gh-actions-lock --relock`;
+do not automatically accept moved or unreachable commits.
+
+External reusable workflows use the lockfile in their defining repository.
+See [Securefix setup](docs/securefix.md#workflow-dependency-lockfiles) for the
+current coverage and the remaining policy rollout.
+
+### Local macOS development
+
+If you rebuild and run the plugin against
 your Linear workspaces, use an Apple Development signing identity to avoid
 repeated Keychain authorization after rebuilds. Follow
 [the development signing guide](docs/development-signing.md) to create the

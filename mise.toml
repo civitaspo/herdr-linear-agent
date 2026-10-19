@@ -5,6 +5,7 @@ rust = { version = "1.99.1", components = ["clippy", "rustfmt"] }
 "aqua:suzuki-shunsuke/disable-checkout-persist-credentials" = "1.0.0"
 "aqua:suzuki-shunsuke/ghalint" = "1.5.6"
 "aqua:suzuki-shunsuke/pinact" = "5.0.0"
+"github:github/gh-actions-lock" = { version = "0.2.0", bin = "gh-actions-lock" }
 
 [tasks.lint]
 description = "Run repository and Rust lint checks"
@@ -12,9 +13,18 @@ run = [
   "shellcheck scripts/*.sh",
   "ghalint run",
   "pinact run --check --verify-comment",
+  "gh-actions-lock --verify-local",
   "cargo fmt --all -- --check",
   "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
 ]
+
+[tasks.actions-lock]
+description = "Regenerate the GitHub Actions dependency lockfile"
+run = "gh-actions-lock --no-interactive --no-narrow --no-migrate-local-actions"
+
+[tasks.actions-lock-verify]
+description = "Verify GitHub Actions dependency pins against GitHub"
+run = "gh-actions-lock --verify"
 
 [tasks.test]
 description = "Run the Rust test suite"

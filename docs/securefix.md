@@ -32,8 +32,34 @@ Strong credentials such as the server app private key, the `civitaspo-bot` appro
 
 No workflow uses `secrets: inherit`; the client private key is passed explicitly to the reusable workflow that needs it.
 
+## Workflow dependency lockfiles
+
+`.github/workflows/actions.lock` onboards this repository's workflows to GitHub
+Actions dependency locking. Full commit SHA pins, `pinact`, checkout credential
+checks, and the existing SHA-pinning policy remain in place. The lockfile also
+records transitive dependencies of composite actions, including the Securefix
+client action. mise pins the generator version and artifact checksums.
+
+Pull request autofix and push lint run `mise run actions-lock-verify` with the
+workflow's read-only GitHub token. Verification never writes files. Contributors
+must regenerate the lockfile before pushing dependency changes; see the
+[development commands](../README.md#workflow-dependencies).
+
+Reusable workflows defined in `civitaspo/securefix-server` need a lockfile at
+their referenced server revision to cover their internal dependencies. This
+repository's lockfile does not provide that coverage. Adopt locking in the
+server separately and update the client references to that release before
+enabling the **Require lockfile** policy. Repository-wide lockfile enforcement
+is deferred until that server work and the client workflow checks are complete.
+
 ## Dependency updates and repository settings
 
 Renovate owns version updates for GitHub Actions and mise tools. Non-major updates may be automerged after approval and green checks. Dependabot version updates are not configured; Dependabot security pull requests remain eligible for approval when enabled in GitHub settings.
+
+Renovate regenerates `actions.lock` in GitHub Actions update pull requests. Its
+`ghActionsLock` constraint matches the generator version in `mise.toml`; update
+both pins together when upgrading the generator. Confirm that an actual
+Renovate dependency update includes both its workflow changes and the lockfile
+before enabling the Require lockfile policy.
 
 Squash-only merges, auto-merge, branch-update suggestions, signed commits, the single required `status-check`, and the `civitaspo-bot` collaborator are reconciled from the `repo-settings/` files in `civitaspo/securefix-server`. See the server's [repository settings documentation](https://github.com/civitaspo/securefix-server/blob/main/docs/repo-settings.md).
