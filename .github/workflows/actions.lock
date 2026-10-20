@@ -10,7 +10,7 @@ workflows:
     '.github/workflows/push.yml': []
     '.github/workflows/release-assets.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7'
+        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
     '.github/workflows/release-pr-sync.yml': []
     '.github/workflows/release-pr.yml': []
     '.github/workflows/release-tag.yml': []
@@ -18,15 +18,15 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510'
         - 'civitaspo/securefix-server@f80196051161fe4161c42cd9cb7530cc7db79882'
-        - 'jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7'
+        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
     '.github/workflows/wc-lint.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7'
+        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
     '.github/workflows/wc-pr-title.yml':
         - 'amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50'
     '.github/workflows/wc-rust.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7'
+        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
     '.github/workflows/workflow_call_pr.yml': []
     '.github/workflows/workflow_call_push.yml': []
 dependencies:
@@ -57,8 +57,8 @@ dependencies:
         repo_id: 1250079425
         uses:
             - 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
-    'jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7':
-        ref: 'v5.2.0'
-        commit: 'sha1-9b200bcecbfd6303e69a4a261b2e09e3757440a7'
+    'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde':
+        ref: 'v5.2.1'
+        commit: 'sha1-fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
         owner_id: 216188
         repo_id: 738284564
