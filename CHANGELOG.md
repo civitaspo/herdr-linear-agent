@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update rust crate tokio to v1.54.0 (#183)
+- update dependency jdx/mise to v2026.10.15 (#181)
 - update Securefix caller workflows to v0.2.36 (#180)
 - adopt GitHub Actions workflow lockfiles (#179)
 - update dependency jdx/mise to v2026.10.14 (#178)
