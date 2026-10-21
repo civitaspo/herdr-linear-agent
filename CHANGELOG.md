@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-10-20
+
+
+### Bug Fixes
+
+- request merges through Securefix comments (#174)
+- synchronize descendant cancellation test (#168)
+
+
+### Maintenance
+
+- update Securefix caller workflows to v0.2.44 (#184)
+- update jdx/mise-action action to v5.2.1 (#182)
+- update rust crate tokio to v1.54.0 (#183)
+- update dependency jdx/mise to v2026.10.15 (#181)
+- update Securefix caller workflows to v0.2.36 (#180)
+- adopt GitHub Actions workflow lockfiles (#179)
+- update dependency jdx/mise to v2026.10.14 (#178)
+- lock file maintenance (#177)
+- update Securefix caller workflows to v0.2.33 (#176)
+- update dependency jdx/mise to v2026.10.13 (#170)
+- update jdx/mise-action action to v5.2.0 (#169)
+- update rust crate libc to v0.2.191 (#171)
+- update Securefix caller workflows to v0.2.32 (#175)
+- update Securefix caller workflows to v0.2.26 (#173)
+- update Securefix caller workflows to v0.2.20 (#167)
+- update Securefix caller workflows to v0.2.19 (#165)
+
 ## [0.8.0] - 2026-10-16
 
 
