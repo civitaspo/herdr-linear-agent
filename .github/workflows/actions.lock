@@ -10,7 +10,7 @@ workflows:
     '.github/workflows/push.yml': []
     '.github/workflows/release-assets.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
+        - 'jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550'
     '.github/workflows/release-pr-sync.yml': []
     '.github/workflows/release-pr.yml': []
     '.github/workflows/release-tag.yml': []
@@ -18,15 +18,15 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510'
         - 'civitaspo/securefix-server@1b35591e74eeae8fe848d16c6fcae0ba8fb75f6c'
-        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
+        - 'jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550'
     '.github/workflows/wc-lint.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
+        - 'jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550'
     '.github/workflows/wc-pr-title.yml':
         - 'amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50'
     '.github/workflows/wc-rust.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
+        - 'jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550'
     '.github/workflows/workflow_call_pr.yml': []
     '.github/workflows/workflow_call_push.yml': []
 dependencies:
@@ -57,8 +57,8 @@ dependencies:
         repo_id: 1250079425
         uses:
             - 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
-    'jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde':
-        ref: 'v5.2.1'
-        commit: 'sha1-fc42bcc7ddbf51124c30f95a877a0c5168a3bfde'
+    'jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550':
+        ref: 'v5.2.2'
+        commit: 'sha1-8418fedb1110381a0d3ba51a7a415d7c1b884550'
         owner_id: 216188
         repo_id: 738284564
