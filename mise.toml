@@ -4,7 +4,7 @@ rust = { version = "1.99.1", components = ["clippy", "rustfmt"] }
 "aqua:orhun/git-cliff" = "2.14.2"
 "aqua:suzuki-shunsuke/disable-checkout-persist-credentials" = "1.0.0"
 "aqua:suzuki-shunsuke/ghalint" = "1.5.6"
-"aqua:suzuki-shunsuke/pinact" = "5.0.0"
+"aqua:suzuki-shunsuke/pinact" = "5.0.1"
 "github:github/gh-actions-lock" = { version = "0.2.0", bin = "gh-actions-lock" }
 
 [tasks.lint]
