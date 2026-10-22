@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update dependency aqua:suzuki-shunsuke/pinact to v5.0.1 (#189)
 - update rust crate tokio to v1.54.1 (#188)
 - update jdx/mise-action action to v5.2.2 (#187)
 - update dependency jdx/mise to v2026.10.17 (#185)
