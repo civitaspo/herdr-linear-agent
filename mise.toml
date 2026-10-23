@@ -5,7 +5,7 @@ rust = { version = "1.99.1", components = ["clippy", "rustfmt"] }
 "aqua:suzuki-shunsuke/disable-checkout-persist-credentials" = "1.0.0"
 "aqua:suzuki-shunsuke/ghalint" = "1.5.6"
 "aqua:suzuki-shunsuke/pinact" = "5.0.1"
-"github:github/gh-actions-lock" = { version = "0.2.0", bin = "gh-actions-lock" }
+"github:github/gh-actions-lock" = { version = "v0.3.0", bin = "gh-actions-lock" }
 
 [tasks.lint]
 description = "Run repository and Rust lint checks"
