@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- update rust crate uuid to v1.29.0 (#192)
+- update dependency jdx/mise to v2026.10.18 (#191)
 - update dependency github:github/gh-actions-lock to v0.3.0 (#190)
 - update dependency aqua:suzuki-shunsuke/pinact to v5.0.1 (#189)
 - update rust crate tokio to v1.54.1 (#188)
