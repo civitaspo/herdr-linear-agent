@@ -12,5 +12,5 @@ jobs:
   release:
     # The reusable workflow accepts the Client App key through inherited secrets.
     # jactionlint ignore=secrets-inherit
-    uses: civitaspo/csm-ci-actions/.github/workflows/client-release-publish.yml@313dac1ce1e5a288fc2f5fe729e8f4ca7ad71180
+    uses: civitaspo/csm-ci-actions/.github/workflows/client-release-publish.yml@2b751e0f2e16bb8e7bdd57994a8d3e13cdb1879e
     secrets: inherit
