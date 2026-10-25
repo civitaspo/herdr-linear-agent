@@ -21,6 +21,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          headerPattern: '^(\w+|release-pr)(?:\((.*)\))?!?: (.+)$'
+          headerPatternCorrespondence: type, scope, subject
           types: |
             feat
             fix
@@ -32,4 +34,5 @@ jobs:
             chore
             perf
             revert
+            ${{ github.head_ref == 'release/next' && github.event.pull_request.head.repo.full_name == github.repository && 'release-pr' || '' }}
           requireScope: false
