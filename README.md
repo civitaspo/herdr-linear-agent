@@ -1,7 +1,7 @@
 # herdr-linear-agent
 
 [![CI](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/pull_request.yml/badge.svg)](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/pull_request.yml)
-[![Release](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/release-tag.yml/badge.svg)](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/release-tag.yml)
+[![Release](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/csm-ci-release.yml/badge.svg)](https://github.com/civitaspo/herdr-linear-agent/actions/workflows/csm-ci-release.yml)
 
 herdr-linear-agent is a [Herdr](https://github.com/herdrdev/herdr) plugin that picks up Linear issues delegated to its Linear app user and works on them with AI coding agents running in Herdr panes.
 
@@ -586,7 +586,7 @@ the upstream history before using `mise exec -- gh-actions-lock --relock`;
 do not automatically accept moved or unreachable commits.
 
 External reusable workflows use the lockfile in their defining repository.
-See [Securefix setup](docs/securefix.md#workflow-dependency-lockfiles) for the
+See [Automation setup](docs/securefix.md#workflow-dependency-lockfiles) for the
 current coverage and the repository's Require lockfile policy.
 
 ### Local macOS development
