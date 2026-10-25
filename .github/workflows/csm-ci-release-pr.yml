@@ -20,7 +20,7 @@ jobs:
       github.event_name == 'workflow_dispatch' || (!startsWith(github.event.head_commit.message, 'chore(release): v') && !startsWith(github.event.head_commit.message, 'release-pr: chore(release): v'))
     permissions:
       contents: read
-    uses: civitaspo/csm-ci-actions/.github/workflows/client-release-prepare.yml@313dac1ce1e5a288fc2f5fe729e8f4ca7ad71180
+    uses: civitaspo/csm-ci-actions/.github/workflows/client-release-prepare.yml@192489747f50f9a8ae156e21be4c51dbe4b927b2
     with:
       version: ${{ inputs.version || '' }}
       update-root-version: false
