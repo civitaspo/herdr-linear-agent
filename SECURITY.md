@@ -8,6 +8,6 @@ Do not open a public issue for security-sensitive reports.
 
 ## Credentials
 
-This repository must never hold strong credentials such as GPG private keys, machine-user personal access tokens, or server application private keys. Those secrets belong only in `civitaspo/securefix-server`.
+This repository must never hold strong credentials such as GPG private keys, machine-user personal access tokens, or server application private keys. Those secrets belong only in the `csm-ci` environment of `civitaspo/csm-ci-server`.
 
 The plugin itself must never store Linear tokens in the repository, in configuration files, or in environment variables. Tokens belong in the macOS Keychain.
