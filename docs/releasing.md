@@ -5,7 +5,7 @@ This repository uses [csm-ci-actions](https://github.com/civitaspo/csm-ci-action
 ## Flow
 
 1. Squash-merge reviewed changes to `main` through `/merge`.
-2. **csm-ci-release-pr** runs git-cliff and asks the server for signed commits on `release/next`. It changes only `.release-version` and `CHANGELOG.md`. The caller sets `update-root-version: false`; releases retain the fixed versions in `Cargo.toml`, `Cargo.lock`, and `herdr-plugin.toml`.
+2. **csm-ci-release-pr** runs git-cliff and asks the server for signed commits on `release/next`. It changes `.release-version`, `CHANGELOG.md`, and the root versions in `Cargo.toml`, `Cargo.lock`, and `herdr-plugin.toml`, which csm-ci-server lists as `version_files`.
 3. Review `release-pr: chore(release): vX.Y.Z`, request `/approve` for its current head, and wait for full CI, policy, and approval before requesting `/merge`. Release PRs are never automerged.
 4. **csm-ci-release** requests publication. The server verifies the merged release PR and creates an annotated tag at its squash merge. It builds all four binaries without credentials, executes each on its native runner to verify its version, and checks its architecture and static musl linkage on Linux.
 5. The publisher generates individual checksums and `SHA256SUMS`, attests all nine assets, uploads them to a draft, and publishes the immutable GitHub Release only after the complete asset set is present.
@@ -23,7 +23,7 @@ Each binary has a `<binary asset>.sha256` sidecar. `scripts/install.sh` retains 
 
 ## Versions and changelog
 
-`.release-version` is the release version reported by the binary. `build.rs` appends its existing git-hash and timestamp build metadata. Cargo and plugin manifest versions are deliberately independent and remain fixed.
+`.release-version` is the release version reported by the binary. `build.rs` appends its existing git-hash and timestamp build metadata. Cargo and plugin manifest versions match the release version.
 
 While major is zero, git-cliff bumps a breaking change or `feat:` to the next minor version; other releasable commits bump the patch version. `cliff.toml` controls that policy. Preparation skips release commits to avoid duplicate PRs before the new tag exists. Do not edit `CHANGELOG.md` in feature PRs.
 
