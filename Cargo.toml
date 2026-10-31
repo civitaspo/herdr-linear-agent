@@ -21,7 +21,7 @@ oauth2 = { version = "5", default-features = false, features = ["reqwest-blockin
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 # The version oauth2 already pulls in, so only one reqwest is compiled.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
