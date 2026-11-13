@@ -1,6 +1,6 @@
 id = "herdr-linear-agent"
 name = "herdr-linear-agent"
-version = "0.8.3"
+version = "0.8.4"
 min_herdr_version = "0.9.1"
 description = "Run coding agents in Herdr for Linear issues delegated to this plugin's Linear app user. Not Linear's built-in Linear Agent."
 platforms = ["macos", "linux"]
