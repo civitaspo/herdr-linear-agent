@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] - 2026-11-13
+
+
+### Bug Fixes
+
+- update rust crate rusqlite to 0.42 (#239)
+- update rust crate rusqlite to 0.41 (#195)
+
+
+### Maintenance
+
+- update dependency jdx/mise to v2026.11.8 (#244)
+- update jdx/mise-action action to v5.2.8 (#242)
+- update dependency rust to v1.100.0 (#243)
+- update dependency jdx/mise to v2026.11.7 (#241)
+- update rust crate jiff to v0.2.43 (#240)
+- update dependency jdx/mise to v2026.11.6 (#238)
+- update rust crate jiff to v0.2.42 (#237)
+- update civitaspo/csm-ci-actions action to v0.7.0 (#235)
+- update dependency jdx/mise to v2026.11.5 (#234)
+- update rust crate uuid to v1.29.2 (#233)
+- update rust crate jiff to v0.2.41 (#232)
+- update rust crate jiff to v0.2.40 (#231)
+- update dependency jdx/mise to v2026.11.4 (#230)
+- update rust crate uuid to v1.29.1 (#229)
+- update jdx/mise-action action to v5.2.7 (#228)
+- update rust crate toml to v1.2.1 (#227)
+- update dependency jdx/mise to v2026.11.3 (#226)
+- update dependency jdx/mise to v2026.11.2 (#225)
+- update amannn/action-semantic-pull-request action to v6.1.2 (#224)
+- update dependency jdx/mise to v2026.11.1 (#223)
+- update rust crate toml to v1.2.0 (#222)
+- update dependency jdx/mise to v2026.11.0 (#221)
+- update rust crate jiff to v0.2.39 (#220)
+- update jdx/mise-action action to v5.2.6 (#219)
+- update dependency github:github/gh-actions-lock to v0.4.1 (#218)
+- lock file maintenance (#217)
+- sync managed files (#214)
+- update jdx/mise-action action to v5.2.5 (#194)
+- update dependency jdx/mise to v2026.10.25 (#196)
+- update dependency aqua:suzuki-shunsuke/disable-checkout-persist-credentials to v1.0.2 (#197)
+- update dependency aqua:suzuki-shunsuke/pinact to v5.0.2 (#198)
+- update civitaspo/csm-ci-actions action to v0.6.0 (#215)
+- update dependency aqua:suzuki-shunsuke/ghalint to v1.6.0 (#216)
+- update civitaspo/csm-ci-actions action to v0.5.0 (#213)
+- sync managed files (#212)
+- update civitaspo/csm-ci-actions action to v0.3.1
+
 ## [0.8.3] - 2026-10-27
 
 
