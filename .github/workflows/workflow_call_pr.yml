@@ -4,11 +4,6 @@ name: PR checks (workflow_call)
 
 on:
   workflow_call:
-    inputs:
-      changed_title_only:
-        description: "True when the pull request event only changed the title."
-        type: boolean
-        required: true
     secrets:
       CSM_CI_CLIENT_APP_PRIVATE_KEY:
         required: false
@@ -21,13 +16,11 @@ defaults:
 
 jobs:
   rust:
-    if: ${{ !inputs.changed_title_only }}
     uses: ./.github/workflows/wc-rust.yml
     permissions:
       contents: read
 
   autofix:
-    if: ${{ !inputs.changed_title_only }}
     uses: ./.github/workflows/wc-autofix.yml
     secrets:
       CSM_CI_CLIENT_APP_PRIVATE_KEY: ${{ secrets.CSM_CI_CLIENT_APP_PRIVATE_KEY }}
